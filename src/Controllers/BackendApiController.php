@@ -96,9 +96,17 @@ class BackendApiController extends Controller
         }
 
         $upstreamUrl = '/' . $cleanPath;
-        $query = $request->getQueryString();
-        if ($query) {
-            $upstreamUrl .= '?' . $query;
+        $rawQuery = $_SERVER['QUERY_STRING'] ?? $request->getQueryString();
+        if (!empty($rawQuery)) {
+            $upstreamUrl .= '?' . $rawQuery;
+        }
+
+        // Dynamically rewrite client Referer to match upstream ChatGPT host and preserve conversation path
+        $clientReferer = $request->header('referer');
+        $upstreamReferer = 'https://chatgpt.com/';
+        if ($clientReferer) {
+            $parsed = parse_url($clientReferer);
+            $upstreamReferer = 'https://chatgpt.com' . ($parsed['path'] ?? '/') . (isset($parsed['query']) ? '?' . $parsed['query'] : '');
         }
 
         $headers = [
@@ -106,7 +114,7 @@ class BackendApiController extends Controller
             'User-Agent' => 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36',
             'Accept-Language' => 'en-US,en;q=0.9',
             'Origin' => 'https://chatgpt.com',
-            'Referer' => 'https://chatgpt.com/',
+            'Referer' => $upstreamReferer,
             'Sec-Ch-Ua' => '"Chromium";v="152", "Not?A_Brand";v="24", "Google Chrome";v="152"',
             'Sec-Ch-Ua-Mobile' => '?0',
             'Sec-Ch-Ua-Platform' => '"macOS"',
@@ -115,8 +123,20 @@ class BackendApiController extends Controller
             'x-openai-target-route' => '/' . $cleanPath,
         ];
 
+        if ($token->session_token) {
+            $headers['Cookie'] = "__Secure-next-auth.session-token={$token->session_token}";
+        }
+
         if ($token->account_id) {
             $headers['chatgpt-account-id'] = $token->account_id;
+        }
+
+        // Forward browser-sent security/context headers (oai-, chatgpt-, openai-)
+        foreach ($request->headers->all() as $key => $vals) {
+            $lower = strtolower($key);
+            if (str_starts_with($lower, 'chatgpt-') || str_starts_with($lower, 'oai-') || str_starts_with($lower, 'openai-') || str_starts_with($lower, 'x-openai-')) {
+                $headers[$key] = implode(', ', $vals);
+            }
         }
 
         if ($request->isMethod('post') || $request->isMethod('put') || $request->isMethod('patch')) {
@@ -160,8 +180,14 @@ class BackendApiController extends Controller
 
             $this->poolManager->release($token, true);
 
-            return response((string) $response->getBody(), $response->getStatusCode())
-                ->header('Content-Type', $response->getHeaderLine('Content-Type'));
+            $resp = response((string) $response->getBody(), $response->getStatusCode());
+            foreach ($response->getHeaders() as $hName => $hVals) {
+                $lowerH = strtolower($hName);
+                if (!in_array($lowerH, ['transfer-encoding', 'content-encoding', 'content-length', 'connection'])) {
+                    $resp->header($hName, implode(', ', $hVals));
+                }
+            }
+            return $resp;
         } catch (GuzzleException $e) {
             $this->poolManager->release($token, false);
             return response()->json(['error' => 'Upstream request failed: ' . $e->getMessage()], 502);

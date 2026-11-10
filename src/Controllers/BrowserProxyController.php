@@ -51,6 +51,33 @@ class BrowserProxyController extends Controller
             $targetPath .= '?' . $query;
         }
 
+        $isStaticAsset = $request->isMethod('get') && (
+            preg_match('/\.(js|css|svg|png|jpg|jpeg|webp|avif|woff2?|ttf|ico)$/i', parse_url($targetPath, PHP_URL_PATH) ?? '') ||
+            str_starts_with($targetPath, '/cdn/') ||
+            str_starts_with($targetPath, '/_next/')
+        );
+
+        // 1. Check local disk cache for static assets to eliminate sequential network latency in PHP-CLI
+        if ($isStaticAsset) {
+            $cleanStaticPath = parse_url($targetPath, PHP_URL_PATH);
+            $cacheDir = storage_path('framework/cache/mirror-assets');
+            $cacheKey = md5($cleanStaticPath);
+            $ext = pathinfo($cleanStaticPath, PATHINFO_EXTENSION) ?: 'bin';
+            $cachedFile = "{$cacheDir}/{$cacheKey}.{$ext}";
+            $metaFile = "{$cacheDir}/{$cacheKey}.meta";
+
+            if (file_exists($cachedFile) && file_exists($metaFile)) {
+                $meta = json_decode((string) file_get_contents($metaFile), true) ?? [];
+                $contentType = $meta['content-type'] ?? $this->guessMimeType($ext);
+
+                return response((string) file_get_contents($cachedFile), 200, [
+                    'Content-Type' => $contentType,
+                    'Cache-Control' => 'public, max-age=31536000, immutable',
+                    'X-Mirror-Cache' => 'HIT',
+                ]);
+            }
+        }
+
         $headers = [
             'Origin' => 'https://chatgpt.com',
             'Referer' => 'https://chatgpt.com/',
@@ -82,6 +109,22 @@ class BrowserProxyController extends Controller
             $contentType = $response->getHeaderLine('Content-Type');
             $body = (string) $response->getBody();
 
+            // Save to disk cache if it's a static asset and upstream succeeded
+            if ($isStaticAsset && $response->getStatusCode() === 200) {
+                $cleanStaticPath = parse_url($targetPath, PHP_URL_PATH);
+                $cacheDir = storage_path('framework/cache/mirror-assets');
+                if (!is_dir($cacheDir)) {
+                    @mkdir($cacheDir, 0755, true);
+                }
+                $cacheKey = md5($cleanStaticPath);
+                $ext = pathinfo($cleanStaticPath, PATHINFO_EXTENSION) ?: 'bin';
+                $cachedFile = "{$cacheDir}/{$cacheKey}.{$ext}";
+                $metaFile = "{$cacheDir}/{$cacheKey}.meta";
+
+                @file_put_contents($cachedFile, $body);
+                @file_put_contents($metaFile, json_encode(['content-type' => $contentType]));
+            }
+
             $laravelResponse = response($body, $response->getStatusCode());
 
             // Forward filtered headers
@@ -104,5 +147,21 @@ class BrowserProxyController extends Controller
         } catch (Throwable $e) {
             return response("Proxy error: " . $e->getMessage(), 500);
         }
+    }
+
+    protected function guessMimeType(string $ext): string
+    {
+        return match (strtolower($ext)) {
+            'js', 'mjs' => 'application/javascript; charset=UTF-8',
+            'css' => 'text/css; charset=UTF-8',
+            'svg' => 'image/svg+xml',
+            'png' => 'image/png',
+            'jpg', 'jpeg' => 'image/jpeg',
+            'woff2' => 'font/woff2',
+            'woff' => 'font/woff',
+            'ttf' => 'font/ttf',
+            'json' => 'application/json',
+            default => 'application/octet-stream',
+        };
     }
 }
