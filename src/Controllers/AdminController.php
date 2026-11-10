@@ -110,6 +110,16 @@ class AdminController extends Controller
     }
 
     /**
+     * Reset stuck in-flight counters.
+     */
+    public function resetCounters()
+    {
+        MirrorToken::query()->update(['active_requests' => 0]);
+
+        return redirect()->back()->with('success', 'In-flight counters reset to 0.');
+    }
+
+    /**
      * Return live pool statistics in JSON.
      */
     public function stats(): JsonResponse
@@ -118,6 +128,144 @@ class AdminController extends Controller
         $stats['strategy'] = config('mirror.pool.strategy', 'least_busy');
 
         return response()->json($stats);
+    }
+
+    /**
+     * Return system health status matching Node.js /api/health.
+     */
+    public function health(): JsonResponse
+    {
+        $all = MirrorToken::all();
+
+        return response()->json([
+            'ok' => true,
+            'storage' => config('mirror.storage.driver', 'database'),
+            'configured' => $all->where('status', 'active')->count() > 0,
+            'active_tokens' => $all->filter->isHealthy()->count(),
+            'in_flight' => (int) $all->sum('active_requests'),
+            'total_served' => (int) $all->sum('total_requests'),
+            'upstream' => config('mirror.upstream', 'https://chatgpt.com'),
+        ]);
+    }
+
+    /**
+     * Return detailed system diagnostics matching Node.js /api/diagnostics.
+     */
+    public function diagnostics(): JsonResponse
+    {
+        $all = MirrorToken::all();
+
+        return response()->json([
+            'schemaVersion' => 1,
+            'build' => [
+                'package' => 'refatbd/laravel-chatgpt-mirror',
+                'version' => '1.0.0',
+                'framework' => 'Laravel ' . app()->version(),
+                'php' => PHP_VERSION,
+            ],
+            'api' => [
+                'reachable' => true,
+                'key_configured' => !empty(config('mirror.api_key')),
+            ],
+            'storage' => [
+                'engine' => 'sqlite',
+                'healthy' => true,
+                'tokens_count' => $all->count(),
+            ],
+            'pool' => $this->poolManager->getPoolStats(),
+            'config' => [
+                'strategy' => config('mirror.pool.strategy'),
+                'cooldown_seconds' => config('mirror.pool.cooldown_seconds'),
+                'openai_prefix' => config('mirror.routes.openai_prefix'),
+                'browser_prefix' => config('mirror.routes.browser_prefix'),
+            ],
+        ]);
+    }
+
+    /**
+     * Return OpenAI capabilities matrix matching Node.js /v1/capabilities.
+     */
+    public function capabilities(): JsonResponse
+    {
+        return response()->json([
+            'schemaVersion' => 1,
+            'routes' => [
+                'GET /v1/models',
+                'POST /v1/chat/completions',
+                'GET /v1/capabilities',
+            ],
+            'fields' => ['model', 'messages', 'stream', 'temperature', 'max_tokens'],
+            'metadataFields' => ['conversation_id'],
+            'supported' => [
+                'text_streaming' => true,
+                'least_busy_pooling' => true,
+                'multi_account_pooling' => true,
+                'direct_gateway' => true,
+                'automatic_429_cooldown' => true,
+            ],
+        ]);
+    }
+
+    /**
+     * Programmatic session status (/api/session).
+     */
+    public function getSession(): JsonResponse
+    {
+        $active = MirrorToken::where('status', 'active')->first();
+
+        return response()->json([
+            'configured' => $active !== null,
+            'total_tokens' => MirrorToken::count(),
+            'active_tokens' => MirrorToken::where('status', 'active')->count(),
+            'account' => $active ? [
+                'id' => $active->id,
+                'email' => $active->email,
+                'name' => $active->name,
+                'plan' => $active->plan_type,
+            ] : null,
+        ]);
+    }
+
+    /**
+     * Programmatic session addition (/api/session).
+     */
+    public function postSession(Request $request): JsonResponse
+    {
+        $raw = trim((string) $request->input('sessionToken', $request->input('session_token', '')));
+        if (empty($raw)) {
+            return response()->json(['error' => 'sessionToken is required'], 422);
+        }
+
+        $token = new MirrorToken([
+            'name' => $request->input('name', 'API Session Account'),
+            'session_token' => $raw,
+            'status' => 'active',
+        ]);
+        $token->save();
+
+        try {
+            $this->refresher->refresh($token);
+            return response()->json([
+                'ok' => true,
+                'id' => $token->id,
+                'email' => $token->email,
+                'name' => $token->name,
+            ]);
+        } catch (Throwable $e) {
+            return response()->json([
+                'ok' => false,
+                'error' => 'Validation error: ' . $e->getMessage(),
+            ], 400);
+        }
+    }
+
+    /**
+     * Programmatic session clear (/api/session).
+     */
+    public function deleteSession(): JsonResponse
+    {
+        MirrorToken::query()->delete();
+        return response()->json(['ok' => true]);
     }
 
     /**
@@ -168,7 +316,7 @@ HTML;
         $apiKey = config('mirror.api_key', 'Not Set');
         $strategy = config('mirror.pool.strategy', 'least_busy');
         $cooldown = config('mirror.pool.cooldown_seconds', 60);
-        $egress = config('mirror.egress.mode', 'direct');
+        $upstream = config('mirror.upstream', 'https://chatgpt.com');
 
         return <<<HTML
 <!DOCTYPE html>
@@ -211,17 +359,26 @@ HTML;
                         Laravel ChatGPT Mirror
                         <span class="text-[10px] font-mono uppercase bg-emerald-500/20 text-emerald-400 border border-emerald-500/30 px-2 py-0.5 rounded-full">v1.0.0</span>
                     </h1>
-                    <p class="text-xs text-zinc-400">High-Concurrency Pool & Direct Egress Gateway</p>
+                    <p class="text-xs text-zinc-400">High-Concurrency Pool & Direct OpenAI Gateway</p>
                 </div>
             </div>
-            <div class="flex items-center space-x-4">
+            <div class="flex items-center space-x-3">
                 <a href="/" target="_blank" class="px-3 py-1.5 text-xs font-medium text-zinc-300 hover:text-white bg-zinc-800 hover:bg-zinc-700 rounded-md transition flex items-center gap-1.5 border border-zinc-700">
                     <span>Open Web UI</span>
                     <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"></path></svg>
                 </a>
+                <a href="/api/health" target="_blank" class="px-2.5 py-1.5 text-xs font-medium text-zinc-400 hover:text-zinc-200 bg-zinc-900 rounded-md transition border border-zinc-800">
+                    Health JSON
+                </a>
+                <a href="/api/diagnostics" target="_blank" class="px-2.5 py-1.5 text-xs font-medium text-zinc-400 hover:text-zinc-200 bg-zinc-900 rounded-md transition border border-zinc-800">
+                    Diagnostics
+                </a>
+                <a href="/v1/capabilities" target="_blank" class="px-2.5 py-1.5 text-xs font-medium text-zinc-400 hover:text-zinc-200 bg-zinc-900 rounded-md transition border border-zinc-800">
+                    Capabilities
+                </a>
                 <div class="flex items-center gap-2 text-xs text-emerald-400 bg-emerald-500/10 border border-emerald-500/20 px-3 py-1.5 rounded-md">
                     <span class="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
-                    <span>Direct Egress (WARP: Off)</span>
+                    <span>Direct OpenAI Gateway &bull; Ready</span>
                 </div>
             </div>
         </div>
@@ -262,7 +419,15 @@ HTML;
                     <h2 class="text-base font-semibold text-white">ChatGPT Accounts &amp; Token Pool</h2>
                     <p class="text-xs text-zinc-400">Tokens are encrypted with AES-256 at rest and rotated dynamically under high traffic.</p>
                 </div>
-                <span class="text-xs font-mono text-zinc-400">Storage: SQLite Encrypted</span>
+                <div class="flex items-center gap-3">
+                    <form method="POST" action="/mirror/admin/tokens/reset-counters" class="inline">
+                        <input type="hidden" name="_token" value="{$csrf}">
+                        <button type="submit" title="Resets any in-flight counters that got stuck" class="px-2.5 py-1 text-xs bg-zinc-800 hover:bg-zinc-700 text-zinc-300 rounded border border-zinc-700 transition">
+                            Reset In-Flight
+                        </button>
+                    </form>
+                    <span class="text-xs font-mono text-zinc-400">Storage: SQLite Encrypted</span>
+                </div>
             </div>
             <div class="overflow-x-auto">
                 <table class="w-full text-left border-collapse">
@@ -327,8 +492,12 @@ HTML;
 
                     <div class="grid grid-cols-2 gap-3">
                         <div class="bg-zinc-950 p-3 rounded-lg border border-zinc-800">
-                            <div class="text-zinc-500 uppercase">Egress Mode</div>
-                            <div class="text-white font-semibold mt-0.5">{$egress} (WARP: Disabled)</div>
+                            <div class="text-zinc-500 uppercase">Upstream Gateway</div>
+                            <div class="text-white font-semibold mt-0.5 truncate">{$upstream}</div>
+                        </div>
+                        <div class="bg-zinc-950 p-3 rounded-lg border border-zinc-800">
+                            <div class="text-zinc-500 uppercase">Token Encryption</div>
+                            <div class="text-white font-semibold mt-0.5">AES-256 (At-Rest)</div>
                         </div>
                         <div class="bg-zinc-950 p-3 rounded-lg border border-zinc-800">
                             <div class="text-zinc-500 uppercase">429 Cooldown</div>
@@ -338,14 +507,18 @@ HTML;
                             <div class="text-zinc-500 uppercase">OpenAI Prefix</div>
                             <div class="text-white font-semibold mt-0.5">/v1/chat/completions</div>
                         </div>
-                        <div class="bg-zinc-950 p-3 rounded-lg border border-zinc-800">
-                            <div class="text-zinc-500 uppercase">Browser Gateway</div>
-                            <div class="text-white font-semibold mt-0.5">/ (Root) &amp; /mirror</div>
+                    </div>
+
+                    <div class="bg-zinc-950 p-3 rounded-lg border border-zinc-800 text-[11px] font-mono">
+                        <div class="text-zinc-400 font-semibold mb-1 flex items-center justify-between">
+                            <span>Integration Snippet (Python):</span>
+                            <button onclick="navigator.clipboard.writeText('from openai import OpenAI\\nclient = OpenAI(base_url=\'http://127.0.0.1:8000/v1\', api_key=\'{$apiKey}\')'); alert('Copied Python snippet!');" class="text-[10px] text-emerald-400 hover:underline">Copy</button>
                         </div>
+                        <div class="text-zinc-500 select-all">from openai import OpenAI<br>client = OpenAI(base_url="http://127.0.0.1:8000/v1", api_key="{$apiKey}")</div>
                     </div>
 
                     <div class="bg-zinc-950/60 p-3 rounded-lg border border-zinc-800/80 text-zinc-400 text-[11px] font-sans">
-                        💡 <strong>High-concurrency Tip:</strong> To serve 200 concurrent users without throttling, add 3 to 5 separate session tokens above. The <code>least_busy</code> load balancer will automatically distribute prompts across healthy accounts.
+                        💡 <strong>High-concurrency Scaling:</strong> To serve 100–200 concurrent users without rate limits, add 3 to 5 separate session tokens above. The <code>least_busy</code> load balancer will automatically rotate prompts across healthy accounts.
                     </div>
                 </div>
             </div>

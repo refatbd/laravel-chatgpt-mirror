@@ -67,17 +67,15 @@ return [
 
     /*
     |--------------------------------------------------------------------------
-    | Network Egress Configuration (Direct Mode - No Cloudflare WARP)
+    | HTTP Transport Configuration
     |--------------------------------------------------------------------------
     |
-    | Direct network connectivity without requiring Cloudflare WARP.
-    | Standard cURL/Guzzle transport with customizable timeouts and browser
-    | impersonation headers.
+    | Direct network connectivity to OpenAI ChatGPT. Standard cURL/Guzzle
+    | transport with customizable timeouts and proxy support.
     |
     */
-    'egress' => [
-        'mode' => env('MIRROR_EGRESS_MODE', 'direct'),
-        'proxy' => env('MIRROR_PROXY', null), // Optional HTTP/SOCKS5 proxy: "socks5://127.0.0.1:1080"
+    'http' => [
+        'proxy' => env('MIRROR_PROXY', null), // Optional outbound HTTP/SOCKS5 proxy: "socks5://127.0.0.1:1080"
         'timeout' => (int) env('MIRROR_TIMEOUT', 90),
         'connect_timeout' => (int) env('MIRROR_CONNECT_TIMEOUT', 10),
         'verify_ssl' => env('MIRROR_VERIFY_SSL', true),

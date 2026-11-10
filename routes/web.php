@@ -12,6 +12,7 @@ Route::prefix('mirror/admin')->group(function () {
     Route::post('/tokens/add', [AdminController::class, 'addToken'])->name('mirror.admin.tokens.add');
     Route::post('/tokens/{id}/refresh', [AdminController::class, 'refreshToken'])->name('mirror.admin.tokens.refresh');
     Route::post('/tokens/{id}/delete', [AdminController::class, 'deleteToken'])->name('mirror.admin.tokens.delete');
+    Route::post('/tokens/reset-counters', [AdminController::class, 'resetCounters'])->name('mirror.admin.tokens.reset');
     Route::get('/api/stats', [AdminController::class, 'stats'])->name('mirror.admin.stats');
 });
 

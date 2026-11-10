@@ -28,7 +28,9 @@ class AdminControllerTest extends TestCase
         $response->assertSee('Test Account Alpha');
         $response->assertSee('test@example.com');
         $response->assertSee('Total Accounts in Pool');
-        $response->assertSee('Project &amp; Gateway Settings', false);
+        $response->assertSee('Direct OpenAI Gateway');
+        $response->assertDontSee('WARP: Off');
+        $response->assertDontSee('WARP: Disabled');
     }
 
     public function test_admin_alias_redirects_to_mirror_admin(): void
@@ -57,6 +59,74 @@ class AdminControllerTest extends TestCase
             'total_in_flight_requests',
             'strategy',
         ]);
+    }
+
+    public function test_reset_in_flight_counters(): void
+    {
+        $token = MirrorToken::create([
+            'name' => 'Stuck Token',
+            'email' => 'stuck@example.com',
+            'session_token' => 'stuck-token',
+            'status' => 'active',
+            'active_requests' => 5,
+        ]);
+
+        $response = $this->post('/mirror/admin/tokens/reset-counters');
+        $response->assertRedirect();
+
+        $token->refresh();
+        $this->assertEquals(0, $token->active_requests);
+    }
+
+    public function test_health_endpoint(): void
+    {
+        MirrorToken::create([
+            'name' => 'Healthy Token',
+            'session_token' => 'token-abc',
+            'status' => 'active',
+        ]);
+
+        $response = $this->getJson('/api/health');
+
+        $response->assertStatus(200);
+        $response->assertJson([
+            'ok' => true,
+            'configured' => true,
+        ]);
+    }
+
+    public function test_diagnostics_endpoint(): void
+    {
+        $response = $this->getJson('/api/diagnostics');
+
+        $response->assertStatus(200);
+        $response->assertJsonStructure([
+            'schemaVersion',
+            'build' => ['package', 'version', 'framework', 'php'],
+            'storage' => ['engine', 'healthy'],
+            'pool',
+            'config',
+        ]);
+    }
+
+    public function test_capabilities_endpoint(): void
+    {
+        $response = $this->getJson('/v1/capabilities');
+
+        $response->assertStatus(200);
+        $response->assertJsonStructure([
+            'schemaVersion',
+            'routes',
+            'fields',
+            'supported',
+        ]);
+    }
+
+    public function test_session_endpoints(): void
+    {
+        $response = $this->getJson('/api/session');
+        $response->assertStatus(200);
+        $response->assertJsonStructure(['configured', 'total_tokens', 'active_tokens']);
     }
 
     public function test_delete_token_from_pool(): void
