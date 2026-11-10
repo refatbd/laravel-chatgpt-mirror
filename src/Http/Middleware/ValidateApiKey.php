@@ -18,6 +18,17 @@ class ValidateApiKey
             return $next($request);
         }
 
+        // Allow same-origin local browser requests (such as Playground and Admin UI)
+        $referer = $request->header('referer', '');
+        $host = $request->header('host', '');
+        if (!empty($referer) && !empty($host)) {
+            $parsedReferer = parse_url($referer);
+            $parsedHost = parse_url('http://' . $host, PHP_URL_HOST);
+            if (($parsedReferer['host'] ?? '') === $parsedHost) {
+                return $next($request);
+            }
+        }
+
         $authHeader = $request->header('Authorization', '');
         $token = str_starts_with($authHeader, 'Bearer ')
             ? substr($authHeader, 7)

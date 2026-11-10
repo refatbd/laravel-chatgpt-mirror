@@ -68,39 +68,6 @@ class BrowserPatchManager
         }
         return originalFetch.apply(this, arguments);
     };
-
-    // Inject native Mirror Controls in ChatGPT Sidebar
-    function injectMirrorControls() {
-        if (document.getElementById('laravel-mirror-launcher')) return;
-        var allProfiles = Array.from(document.querySelectorAll('button[aria-label="Open profile menu"], [data-testid="accounts-profile-button"]'));
-        var anchor = allProfiles.find(function(btn) {
-            var r = btn.getBoundingClientRect();
-            return r.width > 0 && r.height > 0 && window.getComputedStyle(btn).opacity !== '0';
-        });
-
-        if (!anchor) {
-            var buttons = document.querySelectorAll('button');
-            for (var i = 0; i < buttons.length; i++) {
-                if ((buttons[i].textContent || '').trim() === 'Log in' && !buttons[i].closest('#page-header')) {
-                    anchor = buttons[i];
-                    break;
-                }
-            }
-        }
-        if (!anchor) return;
-
-        var container = anchor.closest('.min-w-0.flex-1')?.parentElement || anchor.parentElement?.parentElement;
-        if (!container || !container.parentElement) return;
-
-        var btn = document.createElement('div');
-        btn.id = 'laravel-mirror-launcher';
-        btn.style.margin = '4px 12px 6px 12px';
-        btn.innerHTML = '<a href="/mirror/admin" target="_blank" style="display:flex;align-items:center;gap:8px;padding:8px 12px;background:rgba(16,163,127,0.15);border:1px solid rgba(16,163,127,0.35);border-radius:8px;color:#10a37f;text-decoration:none;font-size:12px;font-weight:600;font-family:sans-serif;box-shadow:0 2px 6px rgba(0,0,0,0.2);"><span style="width:8px;height:8px;border-radius:50%;background:#10a37f;box-shadow:0 0 6px #10a37f;flex:none;"></span><span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">⚡ Mirror Settings &amp; Pool</span></a>';
-
-        container.parentElement.insertBefore(btn, container);
-    }
-
-    setInterval(injectMirrorControls, 1200);
 })();
 </script>
 HTML;

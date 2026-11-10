@@ -5,8 +5,14 @@ declare(strict_types=1);
 use Illuminate\Support\Facades\Route;
 use Refatbd\LaravelChatGptMirror\Controllers\AdminController;
 use Refatbd\LaravelChatGptMirror\Controllers\BrowserProxyController;
+use Refatbd\LaravelChatGptMirror\Controllers\PlaygroundController;
 
-// Admin Dashboard, Settings & Concurrency Pool Manager
+// 1. Mirror API Playground
+Route::get('/mirror/playground', [PlaygroundController::class, 'index'])->name('mirror.playground');
+Route::get('/playground', fn () => redirect('/mirror/playground'));
+Route::get('/mirror/assets/{file}', [PlaygroundController::class, 'asset'])->where('file', '.*');
+
+// 2. Admin Dashboard, Settings & Concurrency Pool Manager
 Route::prefix('mirror/admin')->group(function () {
     Route::get('/', [AdminController::class, 'index'])->name('mirror.admin.index');
     Route::post('/tokens/add', [AdminController::class, 'addToken'])->name('mirror.admin.tokens.add');
