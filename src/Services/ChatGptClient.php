@@ -120,13 +120,20 @@ class ChatGptClient
         string $accessToken,
         callable $onLine,
         ?string $deviceId = null,
-        ?string $accountId = null
+        ?string $accountId = null,
+        ?string $sessionToken = null
     ): void {
         try {
             $headers = [
                 'Authorization' => "Bearer {$accessToken}",
                 'Accept' => 'text/event-stream',
                 'Content-Type' => 'application/json',
+                'Origin' => 'https://chatgpt.com',
+                'Referer' => 'https://chatgpt.com/',
+                'User-Agent' => 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36',
+                'Sec-Ch-Ua' => '"Chromium";v="152", "Not?A_Brand";v="24", "Google Chrome";v="152"',
+                'Sec-Ch-Ua-Mobile' => '?0',
+                'Sec-Ch-Ua-Platform' => '"macOS"',
                 'x-openai-target-path' => '/backend-api/conversation',
                 'x-openai-target-route' => '/backend-api/conversation',
             ];
@@ -137,6 +144,10 @@ class ChatGptClient
 
             if ($accountId) {
                 $headers['chatgpt-account-id'] = $accountId;
+            }
+
+            if ($sessionToken) {
+                $headers['Cookie'] = "__Secure-next-auth.session-token={$sessionToken}";
             }
 
             $response = $this->http->post('/backend-api/conversation', [

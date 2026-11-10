@@ -89,8 +89,9 @@ class OpenAiApiController extends Controller
         $accessToken = $token->access_token;
         $deviceId = $token->getDeviceId();
         $accountId = $token->account_id;
+        $sessionToken = $token->session_token;
 
-        return response()->stream(function () use ($payload, $token, $model, $chatId, $poolManager, $client, $accessToken, $deviceId, $accountId) {
+        return response()->stream(function () use ($payload, $token, $model, $chatId, $poolManager, $client, $accessToken, $deviceId, $accountId, $sessionToken) {
             // Terminate any active output buffering for true real-time SSE chunks
             while (ob_get_level() > 0) {
                 ob_end_clean();
@@ -115,7 +116,8 @@ class OpenAiApiController extends Controller
                         }
                     },
                     $deviceId,
-                    $accountId
+                    $accountId,
+                    $sessionToken
                 );
 
                 // Send termination chunk if not sent
@@ -182,7 +184,8 @@ class OpenAiApiController extends Controller
                     }
                 },
                 $deviceId,
-                $accountId
+                $accountId,
+                $token->session_token
             );
 
             return response()->json([
