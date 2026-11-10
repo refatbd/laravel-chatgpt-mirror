@@ -36,6 +36,10 @@ class BrowserPatchManager
      */
     public function patchHtml(string $html, ?string $sessionToken = null, ?string $customBackendPrefix = null): string
     {
+        // 1. Strip Datadog scripts to prevent console noise and telemetry blocks
+        $datadogPattern = '/<script\b[^>]*\bsrc=["\'][^"\']*datadoghq[^"\']*["\'][^>]*>\s*<\/script>|<script\b[^>]*\bsrc=["\'][^"\']*datadoghq[^"\']*["\'][^>]*\/>/i';
+        $cleanedHtml = preg_replace($datadogPattern, '', $html);
+
         $prefix = $customBackendPrefix;
         if ($prefix === null) {
             $prefix = (function_exists('config') && function_exists('app') && app()->bound('config'))
@@ -68,14 +72,14 @@ class BrowserPatchManager
 </script>
 HTML;
 
-        if (stripos($html, '</head>') !== false) {
-            return str_ireplace('</head>', $script . "\n</head>", $html);
+        if (stripos($cleanedHtml, '</head>') !== false) {
+            return str_ireplace('</head>', $script . "\n</head>", $cleanedHtml);
         }
 
-        if (stripos($html, '<body') !== false) {
-            return preg_replace('/(<body[^>]*>)/i', "$1\n" . $script, $html, 1);
+        if (stripos($cleanedHtml, '<body') !== false) {
+            return preg_replace('/(<body[^>]*>)/i', "$1\n" . $script, $cleanedHtml, 1);
         }
 
-        return $script . "\n" . $html;
+        return $script . "\n" . $cleanedHtml;
     }
 }

@@ -4,3 +4,8 @@ composer.lock
 .env
 .DS_Store
 Thumbs.db
+*.sqlite
+*.sqlite-journal
+test-*.php
+testbench.yaml
+token.txt

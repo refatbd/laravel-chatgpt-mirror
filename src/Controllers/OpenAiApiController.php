@@ -87,8 +87,10 @@ class OpenAiApiController extends Controller
         $poolManager = $this->poolManager;
         $client = $this->client;
         $accessToken = $token->access_token;
+        $deviceId = $token->getDeviceId();
+        $accountId = $token->account_id;
 
-        return response()->stream(function () use ($payload, $token, $model, $chatId, $poolManager, $client, $accessToken) {
+        return response()->stream(function () use ($payload, $token, $model, $chatId, $poolManager, $client, $accessToken, $deviceId, $accountId) {
             // Terminate any active output buffering for true real-time SSE chunks
             while (ob_get_level() > 0) {
                 ob_end_clean();
@@ -98,18 +100,23 @@ class OpenAiApiController extends Controller
             $success = true;
 
             try {
-                $client->streamConversation($payload, $accessToken, function (string $rawLine) use ($transformer, $model, $chatId) {
-                    $chunk = $transformer->transformLine($rawLine, $model, $chatId);
-                    if ($chunk !== null) {
-                        echo $chunk;
-                        if (function_exists('fastcgi_finish_request')) {
-                            // In PHP-FPM flush buffer immediately
-                            flush();
-                        } else {
-                            flush();
+                $client->streamConversation(
+                    $payload,
+                    $accessToken,
+                    function (string $rawLine) use ($transformer, $model, $chatId) {
+                        $chunk = $transformer->transformLine($rawLine, $model, $chatId);
+                        if ($chunk !== null) {
+                            echo $chunk;
+                            if (function_exists('fastcgi_finish_request')) {
+                                flush();
+                            } else {
+                                flush();
+                            }
                         }
-                    }
-                });
+                    },
+                    $deviceId,
+                    $accountId
+                );
 
                 // Send termination chunk if not sent
                 echo $transformer->terminalChunk($model, $chatId);
@@ -158,17 +165,25 @@ class OpenAiApiController extends Controller
     {
         $collectedText = '';
         $success = true;
+        $deviceId = $token->getDeviceId();
+        $accountId = $token->account_id;
 
         try {
-            $this->client->streamConversation($payload, $token->access_token, function (string $rawLine) use (&$collectedText) {
-                $line = trim($rawLine);
-                if (str_starts_with($line, 'data: ') && $line !== 'data: [DONE]') {
-                    $data = json_decode(substr($line, 6), true);
-                    if (isset($data['message']['content']['parts'][0])) {
-                        $collectedText = $data['message']['content']['parts'][0];
+            $this->client->streamConversation(
+                $payload,
+                $token->access_token,
+                function (string $rawLine) use (&$collectedText) {
+                    $line = trim($rawLine);
+                    if (str_starts_with($line, 'data: ') && $line !== 'data: [DONE]') {
+                        $data = json_decode(substr($line, 6), true);
+                        if (isset($data['message']['content']['parts'][0])) {
+                            $collectedText = $data['message']['content']['parts'][0];
+                        }
                     }
-                }
-            });
+                },
+                $deviceId,
+                $accountId
+            );
 
             return response()->json([
                 'id' => $chatId,

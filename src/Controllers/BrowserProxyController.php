@@ -17,16 +17,17 @@ class BrowserProxyController extends Controller
     protected Client $http;
 
     public function __construct(
-        protected BrowserPatchManager $patchManager
+        protected BrowserPatchManager $patchManager,
+        protected \Refatbd\LaravelChatGptMirror\Services\TokenPoolManager $poolManager
     ) {
         $this->http = new Client([
             'base_uri' => config('mirror.upstream', 'https://chatgpt.com'),
-            'timeout' => 30,
+            'timeout' => 45,
             'connect_timeout' => 10,
             'verify' => (bool) config('mirror.egress.verify_ssl', true),
             'proxy' => config('mirror.egress.proxy'),
             'headers' => [
-                'User-Agent' => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36',
+                'User-Agent' => 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36',
                 'Accept' => 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
                 'Accept-Language' => 'en-US,en;q=0.9',
             ],
@@ -38,16 +39,45 @@ class BrowserProxyController extends Controller
      */
     public function proxy(Request $request, ?string $path = null): Response
     {
-        $targetPath = '/' . ltrim($path ?? '', '/');
+        $resolvedPath = $path ?? $request->path();
+        if ($resolvedPath === 'mirror' || $resolvedPath === '/') {
+            $targetPath = '/';
+        } else {
+            $targetPath = '/' . ltrim(preg_replace('#^mirror/?#', '', $resolvedPath), '/');
+        }
+
         $query = $request->getQueryString();
         if ($query) {
             $targetPath .= '?' . $query;
         }
 
+        $headers = [
+            'Origin' => 'https://chatgpt.com',
+            'Referer' => 'https://chatgpt.com/',
+        ];
+
         try {
-            $response = $this->http->get($targetPath, [
+            $token = $this->poolManager->acquire();
+            if ($token && $token->session_token) {
+                $headers['Cookie'] = "__Secure-next-auth.session-token={$token->session_token}";
+            }
+            if ($token) {
+                $this->poolManager->release($token, true);
+            }
+        } catch (Throwable) {}
+
+        try {
+            $options = [
                 'http_errors' => false,
-            ]);
+                'headers' => $headers,
+            ];
+
+            if ($request->isMethod('post') || $request->isMethod('put') || $request->isMethod('patch')) {
+                $options['body'] = $request->getContent();
+                $headers['Content-Type'] = $request->header('Content-Type', 'application/json');
+            }
+
+            $response = $this->http->request($request->method(), $targetPath, $options);
 
             $contentType = $response->getHeaderLine('Content-Type');
             $body = (string) $response->getBody();
@@ -55,8 +85,8 @@ class BrowserProxyController extends Controller
             $laravelResponse = response($body, $response->getStatusCode());
 
             // Forward filtered headers
-            $headers = $this->patchManager->cleanHeaders($response->getHeaders());
-            foreach ($headers as $key => $values) {
+            $respHeaders = $this->patchManager->cleanHeaders($response->getHeaders());
+            foreach ($respHeaders as $key => $values) {
                 if (strtolower($key) !== 'transfer-encoding') {
                     $laravelResponse->header($key, implode(', ', $values));
                 }

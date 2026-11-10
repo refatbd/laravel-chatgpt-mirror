@@ -103,11 +103,21 @@ class BackendApiController extends Controller
 
         $headers = [
             'Authorization' => "Bearer {$token->access_token}",
-            'User-Agent' => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36',
+            'User-Agent' => 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36',
             'Accept-Language' => 'en-US,en;q=0.9',
             'Origin' => 'https://chatgpt.com',
             'Referer' => 'https://chatgpt.com/',
+            'Sec-Ch-Ua' => '"Chromium";v="152", "Not?A_Brand";v="24", "Google Chrome";v="152"',
+            'Sec-Ch-Ua-Mobile' => '?0',
+            'Sec-Ch-Ua-Platform' => '"macOS"',
+            'oai-device-id' => $token->getDeviceId(),
+            'x-openai-target-path' => '/' . $cleanPath,
+            'x-openai-target-route' => '/' . $cleanPath,
         ];
+
+        if ($token->account_id) {
+            $headers['chatgpt-account-id'] = $token->account_id;
+        }
 
         if ($request->isMethod('post') || $request->isMethod('put') || $request->isMethod('patch')) {
             $headers['Content-Type'] = $request->header('Content-Type', 'application/json');

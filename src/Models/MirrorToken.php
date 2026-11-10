@@ -85,6 +85,23 @@ class MirrorToken extends Model
     }
 
     /**
+     * Get or generate a persistent deviceId (UUID) required by OpenAI backend-api.
+     */
+    public function getDeviceId(): string
+    {
+        $meta = $this->meta ?? [];
+        if (!empty($meta['device_id'])) {
+            return $meta['device_id'];
+        }
+
+        $deviceId = (string) \Illuminate\Support\Str::uuid();
+        $meta['device_id'] = $deviceId;
+        $this->update(['meta' => $meta]);
+
+        return $deviceId;
+    }
+
+    /**
      * Check if the token is eligible to receive incoming traffic.
      */
     public function isHealthy(): bool

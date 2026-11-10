@@ -28,6 +28,37 @@ class ImportTokenCommand extends Command
         }
 
         $content = file_get_contents($filePath);
+        $json = json_decode(trim($content), true);
+
+        // If it's a full /api/auth/session JSON dump
+        if (is_array($json) && (isset($json['accessToken']) || isset($json['sessionToken']))) {
+            $this->info("Detected full ChatGPT session dump. Importing account directly...");
+
+            $sessionToken = $json['sessionToken'] ?? ($json['accessToken'] ?? '');
+            $accessToken = $json['accessToken'] ?? null;
+            $email = $json['user']['email'] ?? null;
+            $name = $json['user']['name'] ?? 'Imported Account';
+            $planType = $json['account']['planType'] ?? 'free';
+            $accountId = $json['account']['id'] ?? ($json['user']['id'] ?? null);
+            $expiresAt = isset($json['expires']) ? \Carbon\Carbon::parse($json['expires']) : now()->addDays(7);
+
+            $token = MirrorToken::create([
+                'name' => $name,
+                'email' => $email,
+                'session_token' => $sessionToken,
+                'access_token' => $accessToken,
+                'access_token_expires_at' => $expiresAt,
+                'plan_type' => $planType,
+                'account_id' => $accountId,
+                'status' => 'active',
+                'last_refreshed_at' => now(),
+                'meta' => $json,
+            ]);
+
+            $this->info("🎉 Successfully imported session for {$name} ({$email}) [Plan: {$planType}]!");
+            return self::SUCCESS;
+        }
+
         $extractedTokens = $this->extractTokens($content);
 
         if (empty($extractedTokens)) {
