@@ -16,6 +16,11 @@ class MirrorConversation extends Model
 {
     protected $table = 'mirror_conversations';
 
+    public function getTable(): string
+    {
+        return (string) config('mirror.storage.conversations_table', $this->table);
+    }
+
     protected $fillable = [
         'public_id',
         'conversation_id',

@@ -4,6 +4,28 @@ return [
 
     /*
     |--------------------------------------------------------------------------
+    | Master Package Enable Switch & SaaS Feature Toggles
+    |--------------------------------------------------------------------------
+    | For standalone Mirror deployments, keep everything enabled.
+    | When integrating into a SaaS host application, disable web_proxy and
+    | root_aliases so your SaaS keeps `/`, `/admin`, `/about`, and `/help`.
+    */
+    'enabled' => env('MIRROR_ENABLED', true),
+
+    'features' => [
+        'openai_api' => env('MIRROR_OPENAI_API_ENABLED', true),
+        'mirror_api' => env('MIRROR_NATIVE_API_ENABLED', true),
+        'backend_proxy' => env('MIRROR_BACKEND_PROXY_ENABLED', true),
+        'web_proxy' => env('MIRROR_WEB_PROXY_ENABLED', true),
+        'admin' => env('MIRROR_ADMIN_ENABLED', true),
+        'playground' => env('MIRROR_PLAYGROUND_ENABLED', true),
+        'help' => env('MIRROR_HELP_ENABLED', true),
+        'docs' => env('MIRROR_DOCS_ENABLED', true),
+        'root_aliases' => env('MIRROR_ROOT_ALIASES', true),
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
     | Mirror Upstream Configuration
     |--------------------------------------------------------------------------
     */
@@ -63,6 +85,7 @@ return [
     |--------------------------------------------------------------------------
     */
     'routes' => [
+        'domain' => env('MIRROR_DOMAIN'),
         'openai_prefix' => env('MIRROR_OPENAI_PREFIX', 'v1'),
         'browser_prefix' => env('MIRROR_BROWSER_PREFIX', ''),
         'backend_prefix' => env('MIRROR_BACKEND_PREFIX', 'backend-api'),
@@ -71,7 +94,22 @@ return [
         'help_prefix' => env('MIRROR_HELP_PREFIX', 'mirror/help'),
         'assets_prefix' => env('MIRROR_ASSETS_PREFIX', 'mirror/assets'),
         'docs_prefix' => env('MIRROR_DOCS_PREFIX', 'mirror'),
-        'middleware' => ['api'],
+        'api_middleware' => [],
+        'web_middleware' => [],
+        'admin_middleware' => [],
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | Database Table Names
+    |--------------------------------------------------------------------------
+    */
+    'storage' => [
+        'tokens_table' => env('MIRROR_TOKENS_TABLE', 'mirror_tokens'),
+        'conversations_table' => env('MIRROR_CONVERSATIONS_TABLE', 'mirror_conversations'),
+        'messages_table' => env('MIRROR_MESSAGES_TABLE', 'mirror_messages'),
+        'files_table' => env('MIRROR_FILES_TABLE', 'mirror_files'),
+        'settings_table' => env('MIRROR_SETTINGS_TABLE', 'mirror_settings'),
     ],
 
     /*

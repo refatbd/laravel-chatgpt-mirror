@@ -13,6 +13,11 @@ class MirrorMessage extends Model
 {
     protected $table = 'mirror_messages';
 
+    public function getTable(): string
+    {
+        return (string) config('mirror.storage.messages_table', $this->table);
+    }
+
     public $incrementing = false;
 
     protected $keyType = 'string';

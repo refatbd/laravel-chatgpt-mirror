@@ -10,68 +10,74 @@ return new class extends Migration
 {
     public function up(): void
     {
-        if (Schema::hasTable('mirror_tokens')) {
-            Schema::table('mirror_tokens', function (Blueprint $table): void {
-                if (!Schema::hasColumn('mirror_tokens', 'token_hash')) {
+        $tokensTable = (string) config('mirror.storage.tokens_table', config('mirror.storage.table', 'mirror_tokens'));
+        $conversationsTable = (string) config('mirror.storage.conversations_table', 'mirror_conversations');
+        $messagesTable = (string) config('mirror.storage.messages_table', 'mirror_messages');
+        $filesTable = (string) config('mirror.storage.files_table', 'mirror_files');
+        $settingsTable = (string) config('mirror.storage.settings_table', 'mirror_settings');
+
+        if (Schema::hasTable($tokensTable)) {
+            Schema::table($tokensTable, function (Blueprint $table) use ($tokensTable): void {
+                if (!Schema::hasColumn($tokensTable, 'token_hash')) {
                     $table->string('token_hash', 64)->nullable()->index();
                 }
-                if (!Schema::hasColumn('mirror_tokens', 'last_error')) {
+                if (!Schema::hasColumn($tokensTable, 'last_error')) {
                     $table->text('last_error')->nullable();
                 }
             });
         }
 
-        if (Schema::hasTable('mirror_conversations')) {
-            Schema::table('mirror_conversations', function (Blueprint $table): void {
-                if (!Schema::hasColumn('mirror_conversations', 'public_id')) {
+        if (Schema::hasTable($conversationsTable)) {
+            Schema::table($conversationsTable, function (Blueprint $table) use ($conversationsTable): void {
+                if (!Schema::hasColumn($conversationsTable, 'public_id')) {
                     $table->string('public_id', 128)->nullable()->unique();
                 }
-                if (!Schema::hasColumn('mirror_conversations', 'upstream_conversation_id')) {
+                if (!Schema::hasColumn($conversationsTable, 'upstream_conversation_id')) {
                     $table->string('upstream_conversation_id', 128)->nullable()->index();
                 }
-                if (!Schema::hasColumn('mirror_conversations', 'account_id')) {
+                if (!Schema::hasColumn($conversationsTable, 'account_id')) {
                     $table->string('account_id', 128)->default('default')->index();
                 }
-                if (!Schema::hasColumn('mirror_conversations', 'gizmo_id')) {
+                if (!Schema::hasColumn($conversationsTable, 'gizmo_id')) {
                     $table->string('gizmo_id', 128)->nullable();
                 }
-                if (!Schema::hasColumn('mirror_conversations', 'is_private')) {
+                if (!Schema::hasColumn($conversationsTable, 'is_private')) {
                     $table->boolean('is_private')->default(false);
                 }
-                if (!Schema::hasColumn('mirror_conversations', 'is_branch')) {
+                if (!Schema::hasColumn($conversationsTable, 'is_branch')) {
                     $table->boolean('is_branch')->default(false);
                 }
-                if (!Schema::hasColumn('mirror_conversations', 'branched_from_id')) {
+                if (!Schema::hasColumn($conversationsTable, 'branched_from_id')) {
                     $table->string('branched_from_id', 128)->nullable();
                 }
-                if (!Schema::hasColumn('mirror_conversations', 'branched_from_message_id')) {
+                if (!Schema::hasColumn($conversationsTable, 'branched_from_message_id')) {
                     $table->string('branched_from_message_id', 128)->nullable();
                 }
-                if (!Schema::hasColumn('mirror_conversations', 'initialized')) {
+                if (!Schema::hasColumn($conversationsTable, 'initialized')) {
                     $table->boolean('initialized')->default(false);
                 }
-                if (!Schema::hasColumn('mirror_conversations', 'init_payload')) {
+                if (!Schema::hasColumn($conversationsTable, 'init_payload')) {
                     $table->longText('init_payload')->nullable();
                 }
-                if (!Schema::hasColumn('mirror_conversations', 'instructions_payload')) {
+                if (!Schema::hasColumn($conversationsTable, 'instructions_payload')) {
                     $table->longText('instructions_payload')->nullable();
                 }
-                if (!Schema::hasColumn('mirror_conversations', 'openai_context_hash')) {
+                if (!Schema::hasColumn($conversationsTable, 'openai_context_hash')) {
                     $table->string('openai_context_hash', 64)->nullable();
                 }
-                if (!Schema::hasColumn('mirror_conversations', 'openai_transcript_hash')) {
+                if (!Schema::hasColumn($conversationsTable, 'openai_transcript_hash')) {
                     $table->string('openai_transcript_hash', 64)->nullable()->index();
                 }
             });
         }
 
-        if (!Schema::hasTable('mirror_messages')) {
-            Schema::create('mirror_messages', function (Blueprint $table): void {
+        if (!Schema::hasTable($messagesTable)) {
+            Schema::create($messagesTable, function (Blueprint $table): void {
                 $table->string('id', 64)->primary();
                 $table->string('conversation_public_id', 128)->index();
                 $table->string('upstream_node_id', 128)->nullable()->index();
                 $table->string('role', 32);
-                $table->longText('content')->default('');
+                $table->longText('content')->nullable();
                 $table->string('status', 32)->default('done');
                 $table->longText('events_payload')->nullable();
                 $table->longText('attachments_payload')->nullable();
@@ -79,8 +85,8 @@ return new class extends Migration
             });
         }
 
-        if (!Schema::hasTable('mirror_files')) {
-            Schema::create('mirror_files', function (Blueprint $table): void {
+        if (!Schema::hasTable($filesTable)) {
+            Schema::create($filesTable, function (Blueprint $table): void {
                 $table->id();
                 $table->string('file_id', 128)->unique();
                 $table->string('account_id', 128)->default('default')->index();
@@ -96,8 +102,8 @@ return new class extends Migration
             });
         }
 
-        if (!Schema::hasTable('mirror_settings')) {
-            Schema::create('mirror_settings', function (Blueprint $table): void {
+        if (!Schema::hasTable($settingsTable)) {
+            Schema::create($settingsTable, function (Blueprint $table): void {
                 $table->string('key', 191)->primary();
                 $table->longText('value')->nullable();
                 $table->timestamps();
@@ -107,8 +113,12 @@ return new class extends Migration
 
     public function down(): void
     {
-        Schema::dropIfExists('mirror_settings');
-        Schema::dropIfExists('mirror_files');
-        Schema::dropIfExists('mirror_messages');
+        $settingsTable = (string) config('mirror.storage.settings_table', 'mirror_settings');
+        $filesTable = (string) config('mirror.storage.files_table', 'mirror_files');
+        $messagesTable = (string) config('mirror.storage.messages_table', 'mirror_messages');
+
+        Schema::dropIfExists($settingsTable);
+        Schema::dropIfExists($filesTable);
+        Schema::dropIfExists($messagesTable);
     }
 };

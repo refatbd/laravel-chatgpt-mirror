@@ -90,6 +90,10 @@ class AdminController extends Controller
 
     public function index(Request $request): Response
     {
+        if (!$this->security->authorizeAdmin($request)) {
+            return response('Forbidden: Mirror admin authorization denied.', 403);
+        }
+
         $stats = $this->pool->getPoolStats();
         $tokens = MirrorToken::orderBy('id', 'asc')->get();
         $conversations = MirrorConversation::orderByDesc('last_active_at')->take(25)->get();

@@ -1,0 +1,45 @@
+name: Tests
+
+on:
+  push:
+    branches: [ master, main ]
+  pull_request:
+    branches: [ master, main ]
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix:
+        php: [ '8.2', '8.3', '8.4' ]
+        laravel: [ '10.*', '11.*', '12.*' ]
+        exclude:
+          - php: '8.4'
+            laravel: '10.*'
+          - php: '8.2'
+            laravel: '12.*'
+
+    name: PHP ${{ matrix.php }} - Laravel ${{ matrix.laravel }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php }}
+          extensions: mbstring, openssl, json, gd, pdo_sqlite
+          coverage: none
+
+      - name: Validate composer.json
+        run: composer validate --strict
+
+      - name: Install dependencies
+        run: |
+          composer require "illuminate/support:${{ matrix.laravel }}" "illuminate/http:${{ matrix.laravel }}" "illuminate/routing:${{ matrix.laravel }}" "illuminate/database:${{ matrix.laravel }}" "illuminate/console:${{ matrix.laravel }}" --no-interaction --no-update
+          composer update --prefer-dist --no-interaction --no-progress
+
+      - name: Execute PHPUnit test suite
+        run: vendor/bin/phpunit --testdox

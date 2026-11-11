@@ -17,6 +17,11 @@ class MirrorToken extends Model
 {
     protected $table = 'mirror_tokens';
 
+    public function getTable(): string
+    {
+        return (string) config('mirror.storage.tokens_table', config('mirror.storage.table', $this->table));
+    }
+
     protected $fillable = [
         'name',
         'email',

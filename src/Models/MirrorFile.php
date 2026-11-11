@@ -13,6 +13,11 @@ class MirrorFile extends Model
 {
     protected $table = 'mirror_files';
 
+    public function getTable(): string
+    {
+        return (string) config('mirror.storage.files_table', $this->table);
+    }
+
     protected $fillable = [
         'file_id',
         'account_id',

@@ -7,6 +7,8 @@ namespace Refatbd\LaravelChatGptMirror\Controllers;
 use Illuminate\Http\Request;
 use Illuminate\Routing\Controller;
 use Illuminate\Support\Str;
+use Refatbd\LaravelChatGptMirror\Events\MirrorCompletionCompleted;
+use Refatbd\LaravelChatGptMirror\Events\MirrorCompletionFailed;
 use Refatbd\LaravelChatGptMirror\Exceptions\UpstreamRequestException;
 use Refatbd\LaravelChatGptMirror\Models\MirrorConversation;
 use Refatbd\LaravelChatGptMirror\Models\MirrorToken;
@@ -98,6 +100,8 @@ class OpenAiApiController extends Controller
 
     protected function handleCompletion(Request $request, bool $isResponsesEndpoint): Response
     {
+        $startedAt = microtime(true);
+        $authContext = $request->attributes->get('mirror.auth_context');
         $requestId = (string) ($request->header('x-request-id') ?: Str::uuid());
         $body = $request->all();
 
@@ -160,7 +164,9 @@ class OpenAiApiController extends Controller
                 $requestedModel,
                 $stream,
                 $turnstileToken,
-                $requestId
+                $requestId,
+                $startedAt,
+                $authContext
             );
         }
 
@@ -174,6 +180,17 @@ class OpenAiApiController extends Controller
         $token = $this->pool->acquireForAccount(null, $accountId);
         if (!$token) {
             $this->failures->record('token_pool_exhausted', $requestId, 'no_healthy_token');
+            $this->dispatchCompletionFailure(
+                $requestId,
+                $isResponsesEndpoint ? 'responses' : 'chat.completions',
+                $requestedModel,
+                $stream,
+                503,
+                'no_healthy_token',
+                'No active ChatGPT accounts available in token pool.',
+                $startedAt,
+                $authContext
+            );
             $err = $this->security->apiErrorEnvelope(503, 'No active ChatGPT accounts available in token pool.', $requestId, 'token_pool_exhausted');
             return response()->json($err, 503);
         }
@@ -417,7 +434,9 @@ class OpenAiApiController extends Controller
                 $requestId,
                 $responsesWriter,
                 $continuing,
-                $rebaseState
+                $rebaseState,
+                $startedAt,
+                $authContext
             );
         }
 
@@ -440,7 +459,9 @@ class OpenAiApiController extends Controller
             $requestId,
             $responsesWriter,
             $continuing,
-            $rebaseState
+            $rebaseState,
+            $startedAt,
+            $authContext
         );
     }
 
@@ -468,7 +489,9 @@ class OpenAiApiController extends Controller
         string $requestId,
         ?ResponsesWriter $responsesWriter,
         bool $continuing = false,
-        ?array $rebaseState = null
+        ?array $rebaseState = null,
+        float $startedAt = 0.0,
+        mixed $authContext = null
     ): Response {
         $client = $this->client;
         $transformer = $this->transformer;
@@ -476,6 +499,9 @@ class OpenAiApiController extends Controller
         $conversations = $this->conversations;
         $richOutput = $this->richOutput;
         $failures = $this->failures;
+        $endpointName = $responsesWriter !== null ? 'responses' : 'chat.completions';
+        $promptText = $this->lastUserPrompt($normalizedMessages);
+        $startedAt = $startedAt > 0.0 ? $startedAt : microtime(true);
 
         $transformer->reset();
 
@@ -503,7 +529,11 @@ class OpenAiApiController extends Controller
             $pool,
             $conversations,
             $richOutput,
-            $failures
+            $failures,
+            $endpointName,
+            $promptText,
+            $startedAt,
+            $authContext
         ): void {
             if (!app()->runningUnitTests()) {
                 $execTime = max(0, (int) config('mirror.server.stream_max_execution_time', 0));
@@ -612,6 +642,18 @@ class OpenAiApiController extends Controller
                     echo "data: [DONE]\n\n";
                 }
                 $this->flushBuffers();
+                $this->dispatchCompletionSuccess(
+                    $requestId,
+                    $endpointName,
+                    $requestedModel,
+                    true,
+                    $persistedId,
+                    $token->id ?? null,
+                    $promptText,
+                    $fullText,
+                    $startedAt,
+                    $authContext
+                );
             } catch (\Throwable $e) {
                 if ($rebaseState !== null && $activeConv !== null) {
                     $this->restoreRebaseBackup($activeConv, $rebaseState);
@@ -621,6 +663,18 @@ class OpenAiApiController extends Controller
                 }
                 $cat = $failures->classifyProtocolFailure($e);
                 $failures->record('upstream_stream_error', $requestId, $cat);
+
+                $this->dispatchCompletionFailure(
+                    $requestId,
+                    $endpointName,
+                    $requestedModel,
+                    true,
+                    $e instanceof UpstreamRequestException && $e->getCode() >= 400 ? $e->getCode() : 502,
+                    $cat,
+                    $e->getMessage(),
+                    $startedAt,
+                    $authContext
+                );
 
                 if ($responsesWriter) {
                     echo $responsesWriter->failEvents($e->getMessage(), 'upstream_error');
@@ -662,8 +716,12 @@ class OpenAiApiController extends Controller
         string $requestId,
         ?ResponsesWriter $responsesWriter,
         bool $continuing = false,
-        ?array $rebaseState = null
+        ?array $rebaseState = null,
+        float $startedAt = 0.0,
+        mixed $authContext = null
     ): Response {
+        $startedAt = $startedAt > 0.0 ? $startedAt : microtime(true);
+        $endpointName = $responsesWriter !== null ? 'responses' : 'chat.completions';
         $this->transformer->reset();
         $success = false;
 
@@ -709,16 +767,18 @@ class OpenAiApiController extends Controller
             if ($persistedId) {
                 $extraMeta['conversation_id'] = $persistedId;
             }
+            $promptText = $this->lastUserPrompt($normalizedMessages);
+            $promptTokens = (int) ceil(strlen($promptText) / 4);
+            $completionTokens = (int) ceil(strlen($fullText) / 4);
+
             if ($responsesWriter) {
                 $resp = response()->json($responsesWriter->buildResponseObject($fullText, 'completed', $requestedModel, $extraMeta));
                 if ($persistedId) {
                     $resp->header('x-mirror-conversation-id', $persistedId);
                 }
+                $this->dispatchCompletionSuccess($requestId, $endpointName, $requestedModel, false, $persistedId, $token->id ?? null, $promptText, $fullText, $startedAt, $authContext);
                 return $resp->header('x-request-id', $requestId);
             }
-
-            $promptTokens = (int) ceil(strlen($this->lastUserPrompt($normalizedMessages)) / 4);
-            $completionTokens = (int) ceil(strlen($fullText) / 4);
 
             $responseBody = [
                 'id' => $chatId,
@@ -744,6 +804,7 @@ class OpenAiApiController extends Controller
             if ($persistedId) {
                 $resp->header('x-mirror-conversation-id', $persistedId);
             }
+            $this->dispatchCompletionSuccess($requestId, $endpointName, $requestedModel, false, $persistedId, $token->id ?? null, $promptText, $fullText, $startedAt, $authContext);
             return $resp->header('x-request-id', $requestId);
         } catch (UpstreamRequestException $e) {
             if ($rebaseState !== null && $activeConv !== null) {
@@ -753,13 +814,17 @@ class OpenAiApiController extends Controller
             if ($status === 429) {
                 $this->pool->putInCooldown($token);
             }
-            $this->failures->record('upstream_error_' . $status, $requestId, $this->failures->classifyProtocolFailure($e));
+            $cat = $this->failures->classifyProtocolFailure($e);
+            $this->failures->record('upstream_error_' . $status, $requestId, $cat);
+            $this->dispatchCompletionFailure($requestId, $endpointName, $requestedModel, false, $status, $cat, $e->getMessage(), $startedAt, $authContext);
             return response()->json($this->security->apiErrorEnvelope($status, $e->getMessage(), $requestId), $status);
         } catch (\Throwable $e) {
             if ($rebaseState !== null && $activeConv !== null) {
                 $this->restoreRebaseBackup($activeConv, $rebaseState);
             }
-            $this->failures->record('internal_error', $requestId, $this->failures->classifyProtocolFailure($e));
+            $cat = $this->failures->classifyProtocolFailure($e);
+            $this->failures->record('internal_error', $requestId, $cat);
+            $this->dispatchCompletionFailure($requestId, $endpointName, $requestedModel, false, 502, $cat, $e->getMessage(), $startedAt, $authContext);
             return response()->json($this->security->apiErrorEnvelope(502, $e->getMessage(), $requestId), 502);
         } finally {
             $this->pool->release($token, $success);
@@ -780,12 +845,16 @@ class OpenAiApiController extends Controller
         string $requestedModel,
         bool $stream,
         ?string $turnstileToken,
-        string $requestId
+        string $requestId,
+        float $startedAt = 0.0,
+        mixed $authContext = null
     ): Response {
+        $startedAt = $startedAt > 0.0 ? $startedAt : microtime(true);
         $accountId = $this->pool->primaryAccountId();
         $token = $this->pool->acquireForAccount(null, $accountId);
         if (!$token) {
             $this->failures->record('token_pool_exhausted', $requestId, 'no_healthy_token');
+            $this->dispatchCompletionFailure($requestId, 'tool_bridge', $requestedModel, $stream, 503, 'no_healthy_token', 'No active ChatGPT accounts available in token pool.', $startedAt, $authContext);
             return response()->json(
                 $this->security->apiErrorEnvelope(503, 'No active ChatGPT accounts available in token pool.', $requestId, 'token_pool_exhausted'),
                 503
@@ -824,6 +893,9 @@ class OpenAiApiController extends Controller
                 $toolSpec,
                 $turnstileToken,
                 $requestId,
+                $prompt,
+                $startedAt,
+                $authContext,
                 $client,
                 $transformer,
                 $pool,
@@ -888,11 +960,14 @@ class OpenAiApiController extends Controller
                     ], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE) . "\n\n";
                     echo "data: [DONE]\n\n";
                     $this->flushBuffers();
+                    $this->dispatchCompletionSuccess($requestId, 'tool_bridge', $requestedModel, true, null, $token->id ?? null, $prompt, $fullText, $startedAt, $authContext);
                 } catch (\Throwable $e) {
                     if ($e instanceof UpstreamRequestException && $e->getCode() === 429) {
                         $pool->putInCooldown($token);
                     }
-                    $failures->record('tool_bridge_stream_error', $requestId, $failures->classifyProtocolFailure($e));
+                    $cat = $failures->classifyProtocolFailure($e);
+                    $failures->record('tool_bridge_stream_error', $requestId, $cat);
+                    $this->dispatchCompletionFailure($requestId, 'tool_bridge', $requestedModel, true, $e instanceof UpstreamRequestException && $e->getCode() >= 400 ? $e->getCode() : 502, $cat, $e->getMessage(), $startedAt, $authContext);
                     echo 'data: ' . json_encode(['error' => ['message' => $e->getMessage(), 'type' => 'upstream_error']]) . "\n\n";
                     echo "data: [DONE]\n\n";
                     $this->flushBuffers();
@@ -917,6 +992,8 @@ class OpenAiApiController extends Controller
                 ? ['role' => 'assistant', 'content' => null, 'tool_calls' => $parsed['toolCalls']]
                 : ['role' => 'assistant', 'content' => (string) ($parsed['content'] ?? '')];
 
+            $this->dispatchCompletionSuccess($requestId, 'tool_bridge', $requestedModel, false, null, $token->id ?? null, $prompt, $fullText, $startedAt, $authContext);
+
             return response()->json([
                 'id' => $chatId,
                 'object' => 'chat.completion',
@@ -934,10 +1011,14 @@ class OpenAiApiController extends Controller
             if ($status === 429) {
                 $this->pool->putInCooldown($token);
             }
-            $this->failures->record('tool_bridge_upstream_' . $status, $requestId, $this->failures->classifyProtocolFailure($e));
+            $cat = $this->failures->classifyProtocolFailure($e);
+            $this->failures->record('tool_bridge_upstream_' . $status, $requestId, $cat);
+            $this->dispatchCompletionFailure($requestId, 'tool_bridge', $requestedModel, false, $status, $cat, $e->getMessage(), $startedAt, $authContext);
             return response()->json($this->security->apiErrorEnvelope($status, $e->getMessage(), $requestId), $status);
         } catch (\Throwable $e) {
-            $this->failures->record('tool_bridge_error', $requestId, $this->failures->classifyProtocolFailure($e));
+            $cat = $this->failures->classifyProtocolFailure($e);
+            $this->failures->record('tool_bridge_error', $requestId, $cat);
+            $this->dispatchCompletionFailure($requestId, 'tool_bridge', $requestedModel, false, 502, $cat, $e->getMessage(), $startedAt, $authContext);
             return response()->json($this->security->apiErrorEnvelope(502, $e->getMessage(), $requestId), 502);
         } finally {
             $this->pool->release($token, $success);
@@ -1098,6 +1179,78 @@ class OpenAiApiController extends Controller
             }
         }
         return (string) (end($messages)['content'] ?? '');
+    }
+
+    protected function dispatchCompletionSuccess(
+        string $requestId,
+        string $endpoint,
+        string $model,
+        bool $stream,
+        ?string $conversationId,
+        ?int $tokenId,
+        string $promptText,
+        string $completionText,
+        float $startedAt,
+        mixed $authContext
+    ): void {
+        if (!function_exists('event')) {
+            return;
+        }
+
+        $promptTokens = (int) ceil(strlen($promptText) / 4);
+        $completionTokens = (int) ceil(strlen($completionText) / 4);
+        $durationMs = round(max(0.0, (microtime(true) - $startedAt) * 1000), 2);
+
+        try {
+            event(new MirrorCompletionCompleted(
+                $requestId,
+                $endpoint,
+                $model,
+                $stream,
+                $conversationId,
+                $tokenId,
+                $promptTokens,
+                $completionTokens,
+                $promptTokens + $completionTokens,
+                $durationMs,
+                $authContext
+            ));
+        } catch (\Throwable) {
+            // Listener exceptions must never tear down completed responses or SSE streams.
+        }
+    }
+
+    protected function dispatchCompletionFailure(
+        string $requestId,
+        string $endpoint,
+        string $model,
+        bool $stream,
+        int $statusCode,
+        string $category,
+        string $errorMessage,
+        float $startedAt,
+        mixed $authContext
+    ): void {
+        if (!function_exists('event')) {
+            return;
+        }
+
+        $durationMs = round(max(0.0, (microtime(true) - $startedAt) * 1000), 2);
+
+        try {
+            event(new MirrorCompletionFailed(
+                $requestId,
+                $endpoint,
+                $model,
+                $stream,
+                $statusCode,
+                $category,
+                $errorMessage,
+                $durationMs,
+                $authContext
+            ));
+        } catch (\Throwable) {
+        }
     }
 
     protected function flushBuffers(): void

@@ -6,6 +6,7 @@ namespace Refatbd\LaravelChatGptMirror\Services;
 
 use Illuminate\Http\Request;
 use Illuminate\Support\Str;
+use Refatbd\LaravelChatGptMirror\Mirror;
 use Refatbd\LaravelChatGptMirror\Models\MirrorSetting;
 use Symfony\Component\HttpFoundation\Cookie;
 use Symfony\Component\HttpFoundation\Response;
@@ -301,16 +302,58 @@ class SecurityService
 
     public function authorizePublicApi(Request $request): bool
     {
+        $customAuthenticator = Mirror::resolveApiKeyAuthenticator();
+        if ($customAuthenticator !== null) {
+            $bearer = $this->bearerToken($request);
+            if ($bearer !== null) {
+                $authResult = $customAuthenticator($bearer, $request);
+                if ($authResult !== false && $authResult !== null) {
+                    $request->attributes->set('mirror.auth_context', $authResult);
+                    return true;
+                }
+
+                if ($this->matchesApiKey($bearer)) {
+                    $request->attributes->set('mirror.auth_context', ['type' => 'static_api_key']);
+                    return true;
+                }
+
+                return false;
+            }
+
+            if ($this->hasValidControlCookie($request)) {
+                $request->attributes->set('mirror.auth_context', ['type' => 'control_cookie']);
+                return true;
+            }
+
+            return false;
+        }
+
         if ($this->configuredApiKeys() === []) {
             return true;
         }
 
         if ($this->matchesApiKey($this->bearerToken($request))) {
+            $request->attributes->set('mirror.auth_context', ['type' => 'static_api_key']);
             return true;
         }
 
         // Do NOT trust spoofable Referer headers; allow browser UI calls only via signed HttpOnly cookie.
-        return $this->hasValidControlCookie($request);
+        if ($this->hasValidControlCookie($request)) {
+            $request->attributes->set('mirror.auth_context', ['type' => 'control_cookie']);
+            return true;
+        }
+
+        return false;
+    }
+
+    public function authorizeAdmin(Request $request): bool
+    {
+        $authorizer = Mirror::resolveAdminAuthorizer();
+        if ($authorizer === null) {
+            return true;
+        }
+
+        return (bool) $authorizer($request);
     }
 
     public function authorizeControlEndpoint(Request $request): bool

@@ -10,7 +10,7 @@ return new class extends Migration
 {
     public function up(): void
     {
-        $table = config('mirror.storage.table', 'mirror_tokens');
+        $table = (string) config('mirror.storage.tokens_table', config('mirror.storage.table', 'mirror_tokens'));
 
         if (!Schema::hasTable($table)) {
             Schema::create($table, function (Blueprint $table) {
@@ -38,7 +38,7 @@ return new class extends Migration
 
     public function down(): void
     {
-        $table = config('mirror.storage.table', 'mirror_tokens');
+        $table = (string) config('mirror.storage.tokens_table', config('mirror.storage.table', 'mirror_tokens'));
         Schema::dropIfExists($table);
     }
 };

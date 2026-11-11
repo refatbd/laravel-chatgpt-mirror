@@ -16,6 +16,11 @@ class MirrorSetting extends Model
 
     protected $table = 'mirror_settings';
 
+    public function getTable(): string
+    {
+        return (string) config('mirror.storage.settings_table', $this->table);
+    }
+
     protected $primaryKey = 'key';
 
     public $incrementing = false;

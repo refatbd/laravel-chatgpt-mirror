@@ -15,7 +15,10 @@ use Refatbd\LaravelChatGptMirror\Commands\RefreshTokensCommand;
 use Refatbd\LaravelChatGptMirror\Commands\ServerSetupCommand;
 use Refatbd\LaravelChatGptMirror\Contracts\StreamTransformerInterface;
 use Refatbd\LaravelChatGptMirror\Contracts\TokenPoolInterface;
+use Refatbd\LaravelChatGptMirror\Http\Middleware\AuthorizeAdmin;
 use Refatbd\LaravelChatGptMirror\Http\Middleware\PrepareMirrorRuntime;
+use Refatbd\LaravelChatGptMirror\Http\Middleware\ProtectControlEndpoints;
+use Refatbd\LaravelChatGptMirror\Http\Middleware\ValidateApiKey;
 use Refatbd\LaravelChatGptMirror\Services\AssetTicketService;
 use Refatbd\LaravelChatGptMirror\Services\BrowserPatchManager;
 use Refatbd\LaravelChatGptMirror\Services\ChatGptClient;
@@ -106,8 +109,14 @@ class MirrorServiceProvider extends ServiceProvider
         $this->app->singleton(Mirror::class, fn ($app) => new Mirror(
             $app->make(TokenPoolInterface::class),
             $app->make(ChatGptClient::class),
-            $app->make(TokenRefresher::class)
+            $app->make(TokenRefresher::class),
+            $app->make(StreamTransformerInterface::class),
+            $app->make(ConversationService::class),
+            $app->make(MirrorCache::class),
+            $app->make(SecurityService::class),
+            $app->make(DynamicConfigService::class)
         ));
+        $this->app->alias(Mirror::class, 'laravel-chatgpt-mirror');
     }
 
     public function boot(): void
@@ -115,13 +124,21 @@ class MirrorServiceProvider extends ServiceProvider
         $this->app->make(DynamicConfigService::class)->ensureApplied();
 
         if ($this->app->bound(Router::class)) {
-            $this->app->make(Router::class)->aliasMiddleware('mirror.runtime', PrepareMirrorRuntime::class);
+            $router = $this->app->make(Router::class);
+            $router->aliasMiddleware('mirror.runtime', PrepareMirrorRuntime::class);
+            $router->aliasMiddleware('mirror.api_key', ValidateApiKey::class);
+            $router->aliasMiddleware('mirror.control', ProtectControlEndpoints::class);
+            $router->aliasMiddleware('mirror.admin', AuthorizeAdmin::class);
         }
 
         if ($this->app->runningInConsole()) {
             $this->publishes([
                 __DIR__ . '/../config/mirror.php' => config_path('mirror.php'),
             ], 'mirror-config');
+
+            $this->publishes([
+                __DIR__ . '/../database/migrations' => database_path('migrations'),
+            ], 'mirror-migrations');
 
             $this->publishes([
                 __DIR__ . '/../resources/deploy' => base_path('deploy/mirror'),
@@ -142,8 +159,13 @@ class MirrorServiceProvider extends ServiceProvider
             ]);
         }
 
-        $this->loadMigrationsFrom(__DIR__ . '/../database/migrations');
-        $this->loadRoutesFrom(__DIR__ . '/../routes/api.php');
-        $this->loadRoutesFrom(__DIR__ . '/../routes/web.php');
+        if (Mirror::$runsMigrations) {
+            $this->loadMigrationsFrom(__DIR__ . '/../database/migrations');
+        }
+
+        if (Mirror::$registersRoutes && config('mirror.enabled', true)) {
+            $this->loadRoutesFrom(__DIR__ . '/../routes/api.php');
+            $this->loadRoutesFrom(__DIR__ . '/../routes/web.php');
+        }
     }
 }
