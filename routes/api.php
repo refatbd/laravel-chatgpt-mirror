@@ -39,9 +39,11 @@ Route::get('/api/conversations/{id}', [PlaygroundController::class, 'conversatio
 // 4. Synthesized NextAuth Session for ChatGPT Web UI
 Route::get('/api/auth/session', [BackendApiController::class, 'session']);
 
-// 5. OpenAPI schema & Docs
-Route::get('/mirror/openapi', [AdminController::class, 'capabilities']);
-Route::get('/mirror/api-docs', fn () => redirect('/mirror/openapi'));
+// 5. OpenAPI schema & Interactive Swagger UI Docs
+Route::get('/mirror/openapi', [\Refatbd\LaravelChatGptMirror\Controllers\ApiDocsController::class, 'openapi']);
+Route::get('/mirror/api-docs', [\Refatbd\LaravelChatGptMirror\Controllers\ApiDocsController::class, 'ui']);
+Route::get('/mirror/api-docs/{file}', [\Refatbd\LaravelChatGptMirror\Controllers\ApiDocsController::class, 'asset'])
+    ->where('file', '[A-Za-z0-9._-]+');
 
 // 5. Proxied Backend Endpoints
 Route::any('/' . ltrim($backendPrefix, '/') . '/{path}', [BackendApiController::class, 'proxy'])
