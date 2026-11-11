@@ -194,4 +194,166 @@ class UniversalWebServerSupportTest extends TestCase
             ->expectsOutputToContain('flush_interval -1')
             ->assertSuccessful();
     }
+
+    public function test_runtime_settings_rest_api_and_admin_form_support_live_redis_toggle_and_reset(): void
+    {
+        // 1. Inspect initial runtime settings via API
+        $getRes = $this->withHeaders([
+            'Authorization' => 'Bearer test-mirror-key-12345',
+        ])->getJson('/api/settings/runtime');
+
+        $getRes->assertOk()
+            ->assertJsonPath('ok', true)
+            ->assertJsonPath('runtime_settings.redis.enabled', 'auto');
+
+        // 2. Enable & configure Redis + Webuzo dynamically via PUT /api/settings/runtime
+        $putRes = $this->withHeaders([
+            'Authorization' => 'Bearer test-mirror-key-12345',
+        ])->putJson('/api/settings/runtime', [
+            'redis_enabled' => 'enabled',
+            'redis_client' => 'predis',
+            'redis_host' => '127.0.0.1',
+            'redis_port' => 6388,
+            'redis_database' => 4,
+            'redis_password' => 'secret-auth-pw-789',
+            'server_platform' => 'webuzo',
+            'server_force_https' => 'true',
+        ]);
+
+        $putRes->assertOk()
+            ->assertJsonPath('ok', true)
+            ->assertJsonPath('runtime_settings.redis.enabled', 'enabled')
+            ->assertJsonPath('runtime_settings.redis.host', '127.0.0.1')
+            ->assertJsonPath('runtime_settings.redis.port', 6388)
+            ->assertJsonPath('runtime_settings.redis.database', 4)
+            ->assertJsonPath('runtime_settings.redis.has_password', true)
+            ->assertJsonPath('runtime_settings.server.platform', 'webuzo')
+            ->assertJsonPath('runtime_settings.server.force_https', 'true');
+
+        // Ensure Redis password is never leaked in API JSON
+        $this->assertStringNotContainsString('secret-auth-pw-789', $putRes->getContent());
+
+        // 3. Test Redis endpoint returns structured non-throwing JSON diagnostics
+        $testRes = $this->withHeaders([
+            'Authorization' => 'Bearer test-mirror-key-12345',
+        ])->postJson('/api/settings/runtime/test-redis', [
+            'redis_host' => '127.0.0.1',
+            'redis_port' => 16399,
+            'redis_client' => 'predis',
+        ]);
+        $testRes->assertOk()
+            ->assertJsonStructure(['ok', 'client', 'host', 'port', 'database', 'latency_ms', 'error']);
+
+        // 4. Reset via DELETE /api/settings/runtime restores defaults cleanly
+        $delRes = $this->withHeaders([
+            'Authorization' => 'Bearer test-mirror-key-12345',
+        ])->deleteJson('/api/settings/runtime');
+        $delRes->assertOk()
+            ->assertJsonPath('runtime_settings.overrides_active', 0)
+            ->assertJsonPath('runtime_settings.redis.enabled', 'auto');
+
+        // 5. Exercise Admin HTML UI form POST /mirror/admin/runtime (disable Redis + set Caddy)
+        $postUi = $this->post('/mirror/admin/runtime', [
+            '_runtime_form' => '1',
+            'redis_enabled' => 'disabled',
+            'redis_client' => 'auto',
+            'redis_host' => '127.0.0.1',
+            'redis_port' => 6379,
+            'redis_database' => 0,
+            'server_platform' => 'caddy',
+            'server_force_https' => 'false',
+            'pool_strategy' => 'least_busy',
+            'pool_max_concurrent_per_token' => 4,
+            'pool_cooldown_seconds' => 45,
+        ]);
+        $postUi->assertRedirect();
+
+        $adminHtml = $this->get('/mirror/admin');
+        $adminHtml->assertOk()
+            ->assertSee('Dynamic Server, Proxy &amp; Redis Configuration', false)
+            ->assertSee('Redis Disabled', false)
+            ->assertSee('Live DB Overrides Active', false)
+            ->assertDontSee('WARP');
+
+        // 6. Reset via Admin HTML UI button
+        $this->post('/mirror/admin/runtime/reset')->assertRedirect();
+        $this->get('/mirror/admin')->assertOk()->assertSee('Using .env / Config Defaults', false);
+    }
+
+    public function test_dynamic_subpath_forwarded_prefix_and_custom_route_prefixes_propagate(): void
+    {
+        Config::set('mirror.routes.openai_prefix', 'llm/v2');
+        Config::set('mirror.routes.docs_prefix', 'api-reference');
+        Config::set('mirror.routes.playground_prefix', 'dev/sandbox');
+
+        $headers = [
+            'X-Forwarded-Proto' => 'https',
+            'X-Forwarded-Host' => 'edge.example.org',
+            'X-Forwarded-Prefix' => '/tenant-a',
+        ];
+
+        $openapi = $this->withHeaders($headers)->getJson('/mirror/openapi');
+        $openapi->assertOk();
+        $this->assertSame('https://edge.example.org/tenant-a', $openapi->json('servers.0.url'));
+        $this->assertArrayHasKey('/llm/v2/chat/completions', $openapi->json('paths'));
+
+        $docsUi = $this->withHeaders($headers)->get('/mirror/api-docs');
+        $docsUi->assertOk()
+            ->assertSee('url: "/tenant-a/api-reference/openapi"', false)
+            ->assertSee('/tenant-a/api-reference/api-docs/swagger-ui.css', false);
+
+        $caps = $this->withHeaders($headers)->getJson('/v1/capabilities');
+        $caps->assertOk()
+            ->assertJsonPath('routes.chat_completions', '/tenant-a/llm/v2/chat/completions')
+            ->assertJsonPath('routes.playground', '/tenant-a/dev/sandbox')
+            ->assertJsonPath('routes.api_docs', '/tenant-a/api-reference/api-docs')
+            ->assertJsonPath('routes.runtime_settings', '/tenant-a/api/settings/runtime')
+            ->assertJsonPath('features.dynamic_runtime_config', true);
+    }
+
+    public function test_mirror_server_command_supports_dynamic_domain_root_php_version_and_prefixes(): void
+    {
+        Config::set('mirror.routes.openai_prefix', 'llm/v2');
+        Config::set('mirror.routes.backend_prefix', 'custom-backend');
+
+        $this->artisan('mirror:server', [
+            'target' => 'nginx',
+            '--vhost' => true,
+            '--domain' => 'chat.prod.example',
+            '--root' => '/srv/mirror/public',
+            '--php-version' => '8.4',
+        ])
+            ->expectsOutputToContain('server_name chat.prod.example;')
+            ->expectsOutputToContain('root /srv/mirror/public;')
+            ->expectsOutputToContain('fastcgi_pass unix:/run/php/php8.4-fpm.sock;')
+            ->expectsOutputToContain('^/(llm/v2|api/chat|backend-api|custom-backend)/')
+            ->assertSuccessful();
+
+        $this->artisan('mirror:server', [
+            'target' => 'octane',
+            '--vhost' => true,
+            '--host' => '0.0.0.0',
+            '--port' => '9100',
+        ])
+            ->expectsOutputToContain('--host=0.0.0.0 --port=9100')
+            ->assertSuccessful();
+
+        $tempDir = sys_get_temp_dir() . '/mirror_dynamic_htaccess_' . bin2hex(random_bytes(4));
+        File::ensureDirectoryExists($tempDir);
+        $htaccessPath = $tempDir . '/.htaccess';
+
+        try {
+            $this->artisan('mirror:server', [
+                'target' => 'apache',
+                '--write' => true,
+                '--path' => $htaccessPath,
+            ])->assertSuccessful();
+
+            $content = File::get($htaccessPath);
+            $this->assertStringContainsString('llm/v2|api/chat|backend-api|custom-backend', $content);
+            $this->assertStringContainsString('MIRROR_SSE=1', $content);
+        } finally {
+            File::deleteDirectory($tempDir);
+        }
+    }
 }

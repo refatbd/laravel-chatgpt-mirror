@@ -20,12 +20,13 @@ use Refatbd\LaravelChatGptMirror\Services\AssetTicketService;
 use Refatbd\LaravelChatGptMirror\Services\BrowserPatchManager;
 use Refatbd\LaravelChatGptMirror\Services\ChatGptClient;
 use Refatbd\LaravelChatGptMirror\Services\ConversationService;
-use Refatbd\LaravelChatGptMirror\Services\Convert\ConversionFacade;
+use Refatbd\LaravelChatGptMirror\Services\Conversion\ConversionFacade;
 use Refatbd\LaravelChatGptMirror\Services\Convert\Gif89aCodec;
 use Refatbd\LaravelChatGptMirror\Services\Convert\GptGifCodec;
 use Refatbd\LaravelChatGptMirror\Services\Convert\GptGifV4Codec;
 use Refatbd\LaravelChatGptMirror\Services\Convert\LoafCodec;
 use Refatbd\LaravelChatGptMirror\Services\Convert\PngSpeakCodec;
+use Refatbd\LaravelChatGptMirror\Services\DynamicConfigService;
 use Refatbd\LaravelChatGptMirror\Services\FailureTracker;
 use Refatbd\LaravelChatGptMirror\Services\MirrorCache;
 use Refatbd\LaravelChatGptMirror\Services\ProofOfWorkSolver;
@@ -43,6 +44,7 @@ class MirrorServiceProvider extends ServiceProvider
     {
         $this->mergeConfigFrom(__DIR__ . '/../config/mirror.php', 'mirror');
 
+        $this->app->singleton(DynamicConfigService::class, fn () => new DynamicConfigService());
         $this->app->singleton(MirrorCache::class, fn () => new MirrorCache());
         $this->app->singleton(FailureTracker::class, fn ($app) => new FailureTracker(
             $app->make(MirrorCache::class)
@@ -105,7 +107,7 @@ class MirrorServiceProvider extends ServiceProvider
 
     public function boot(): void
     {
-        $this->configureMirrorRedis();
+        $this->app->make(DynamicConfigService::class)->ensureApplied();
 
         if ($this->app->bound(Router::class)) {
             $this->app->make(Router::class)->aliasMiddleware('mirror.runtime', PrepareMirrorRuntime::class);
@@ -138,42 +140,5 @@ class MirrorServiceProvider extends ServiceProvider
         $this->loadMigrationsFrom(__DIR__ . '/../database/migrations');
         $this->loadRoutesFrom(__DIR__ . '/../routes/api.php');
         $this->loadRoutesFrom(__DIR__ . '/../routes/web.php');
-    }
-
-    protected function configureMirrorRedis(): void
-    {
-        $redisUrl = config('mirror.redis.url');
-        $redisHost = config('mirror.redis.host');
-
-        if (empty($redisUrl) && empty($redisHost)) {
-            return;
-        }
-
-        if (!config('database.redis.mirror')) {
-            $conn = array_filter([
-                'url' => $redisUrl ?: null,
-                'host' => $redisHost ?: '127.0.0.1',
-                'password' => config('mirror.redis.password'),
-                'port' => (int) config('mirror.redis.port', 6379),
-                'database' => (int) config('mirror.redis.database', 0),
-                'persistent' => (bool) config('mirror.redis.persistent', true),
-            ], static fn ($value) => $value !== null && $value !== '');
-
-            config(['database.redis.mirror' => $conn]);
-        }
-
-        if (!config('database.redis.client')) {
-            config(['database.redis.client' => config('mirror.redis.client', 'phpredis')]);
-        }
-
-        if (!config('cache.stores.mirror_redis')) {
-            config([
-                'cache.stores.mirror_redis' => [
-                    'driver' => 'redis',
-                    'connection' => 'mirror',
-                    'lock_connection' => 'mirror',
-                ],
-            ]);
-        }
     }
 }

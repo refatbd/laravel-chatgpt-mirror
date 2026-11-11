@@ -7,6 +7,7 @@ namespace Refatbd\LaravelChatGptMirror\Commands;
 use GuzzleHttp\Client;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\Schema;
+use Refatbd\LaravelChatGptMirror\Services\DynamicConfigService;
 use Refatbd\LaravelChatGptMirror\Services\MirrorCache;
 use Refatbd\LaravelChatGptMirror\Services\TokenPoolManager;
 
@@ -14,10 +15,12 @@ class HealthCheckCommand extends Command
 {
     protected $signature = 'mirror:health';
 
-    protected $description = 'Check connectivity to ChatGPT upstream, SHA3-512 PoW support, Redis cache/locks, PHP runtime, and pool status';
+    protected $description = 'Check connectivity to ChatGPT upstream, SHA3-512 PoW support, Redis cache/locks, dynamic runtime config, and pool status';
 
-    public function handle(TokenPoolManager $pool, MirrorCache $cache): int
+    public function handle(TokenPoolManager $pool, MirrorCache $cache, DynamicConfigService $dynamicConfig): int
     {
+        $dynamicConfig->ensureApplied();
+        $dynState = $dynamicConfig->publicState();
         $this->info('Running ChatGPT Mirror Health Diagnostics...');
 
         $upstream = (string) config('mirror.upstream', 'https://chatgpt.com');
@@ -75,6 +78,9 @@ class HealthCheckCommand extends Command
                 ['Stream Timeout Config', ((int) config('mirror.server.stream_max_execution_time', 0)) . 's (PHP ini: ' . ini_get('max_execution_time') . 's)'],
                 ['SHA3-512 PoW Solver', $powSupported ? 'Supported' : 'Missing PHP sha3-512'],
                 ['GD Image Conversion', $gdSupported ? 'Loaded' : 'Missing PHP GD'],
+                ['Redis Mode', (string) ($cacheDiag['redis_mode'] ?? 'auto') . ' (desired: ' . (($cacheDiag['redis_desired'] ?? false) ? 'yes' : 'no') . ')'],
+                ['Redis Client', (string) ($dynState['redis']['resolved_client'] ?? 'auto') . ' (config: ' . (string) ($dynState['redis']['client'] ?? 'auto') . ')'],
+                ['Dynamic DB Overrides', ((int) ($dynState['overrides_active'] ?? 0)) . ' active'],
                 ['Cache / Redis Status', $redisStatus],
                 ['Distributed Locks', ($cacheDiag['locks_supported'] ?? false) ? 'Supported' : 'Single-node fallback'],
                 ['Database Tables', $tablesOk ? 'OK' : 'Run migrations'],

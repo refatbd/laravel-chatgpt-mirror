@@ -6,19 +6,30 @@ namespace Refatbd\LaravelChatGptMirror\Http\Middleware;
 
 use Closure;
 use Illuminate\Http\Request;
+use Refatbd\LaravelChatGptMirror\Services\DynamicConfigService;
 use Symfony\Component\HttpFoundation\Request as SymfonyRequest;
 use Symfony\Component\HttpFoundation\Response;
 
 /**
- * Prepares Apache + PHP-FPM / Webuzo reverse-proxy requests:
+ * Prepares universal reverse-proxy, FastCGI/Apache/Nginx/LiteSpeed/Caddy/Octane requests:
+ *  - Applies live DB runtime overrides (Redis enable/disable, proxy trust, HTTPS, SSE, Pool)
  *  - Restores Authorization header from REDIRECT_HTTP_AUTHORIZATION (Apache mod_rewrite/FastCGI quirk)
  *  - Temporarily trusts configured reverse-proxy X-Forwarded-* headers per request without leaking static state
- *  - Disables zlib output compression when serving streaming endpoints
+ *  - Disables zlib output compression cleanly outside unit tests
  */
 class PrepareMirrorRuntime
 {
+    public function __construct(
+        protected ?DynamicConfigService $dynamicConfig = null
+    ) {
+        $this->dynamicConfig ??= (function_exists('app') && app()->bound(DynamicConfigService::class))
+            ? app(DynamicConfigService::class)
+            : new DynamicConfigService();
+    }
+
     public function handle(Request $request, Closure $next): Response
     {
+        $this->dynamicConfig?->ensureApplied();
         $this->normalizeApacheAuthorizationHeader($request);
 
         if (!app()->runningUnitTests() && config('mirror.server.disable_output_compression', true)) {

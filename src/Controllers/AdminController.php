@@ -10,6 +10,7 @@ use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Str;
 use Refatbd\LaravelChatGptMirror\Models\MirrorConversation;
 use Refatbd\LaravelChatGptMirror\Models\MirrorToken;
+use Refatbd\LaravelChatGptMirror\Services\DynamicConfigService;
 use Refatbd\LaravelChatGptMirror\Services\FailureTracker;
 use Refatbd\LaravelChatGptMirror\Services\MirrorCache;
 use Refatbd\LaravelChatGptMirror\Services\SecurityService;
@@ -20,7 +21,7 @@ use Symfony\Component\HttpFoundation\Response;
 
 /**
  * Provides Admin UI dashboard, pool metrics, health/diagnostics/capabilities APIs,
- * and programmatic /api/session token lifecycle management.
+ * dynamic server/Redis configuration, and programmatic /api/session token lifecycle management.
  */
 class AdminController extends Controller
 {
@@ -31,14 +32,48 @@ class AdminController extends Controller
         protected TokenRefresher $refresher,
         protected FailureTracker $failures,
         protected SecurityService $security,
-        protected ?MirrorCache $cache = null
+        protected ?MirrorCache $cache = null,
+        protected ?DynamicConfigService $dynamicConfig = null
     ) {
         $this->cache ??= app()->bound(MirrorCache::class) ? app(MirrorCache::class) : new MirrorCache();
+        $this->dynamicConfig ??= app()->bound(DynamicConfigService::class) ? app(DynamicConfigService::class) : new DynamicConfigService();
     }
 
     protected function cache(): MirrorCache
     {
         return $this->cache ??= app()->bound(MirrorCache::class) ? app(MirrorCache::class) : new MirrorCache();
+    }
+
+    protected function dynamicConfig(): DynamicConfigService
+    {
+        return $this->dynamicConfig ??= app()->bound(DynamicConfigService::class)
+            ? app(DynamicConfigService::class)
+            : new DynamicConfigService();
+    }
+
+    /**
+     * Resolve configured route paths dynamically with optional subdirectory base path.
+     *
+     * @return array<string, string>
+     */
+    protected function routePaths(string $basePath = ''): array
+    {
+        $sub = $basePath !== '' ? '/' . trim($basePath, '/') : '';
+        $clean = static fn (string $val, string $fallback): string => '/' . (trim($val, '/') !== '' ? trim($val, '/') : $fallback);
+
+        $docsRaw = trim((string) config('mirror.routes.docs_prefix', 'mirror'), '/');
+        $docsBase = $docsRaw !== '' ? '/' . $docsRaw : '';
+
+        return [
+            'openai' => $sub . $clean((string) config('mirror.routes.openai_prefix', 'v1'), 'v1'),
+            'backend' => $sub . $clean((string) config('mirror.routes.backend_prefix', '__codex-api'), '__codex-api'),
+            'admin' => $sub . $clean((string) config('mirror.routes.admin_prefix', 'mirror/admin'), 'mirror/admin'),
+            'playground' => $sub . $clean((string) config('mirror.routes.playground_prefix', 'mirror/playground'), 'mirror/playground'),
+            'assets' => $sub . $clean((string) config('mirror.routes.assets_prefix', 'mirror/assets'), 'mirror/assets'),
+            'api_docs' => $sub . $docsBase . '/api-docs',
+            'openapi' => $sub . $docsBase . '/openapi',
+            'runtime_settings' => $sub . '/api/settings/runtime',
+        ];
     }
 
     public function index(Request $request): Response
@@ -172,6 +207,8 @@ class AdminController extends Controller
 
     public function health(?Request $request = null): Response
     {
+        $this->dynamicConfig()->ensureApplied();
+
         $dbOk = true;
         try {
             DB::select('SELECT 1');
@@ -199,11 +236,14 @@ class AdminController extends Controller
             'gd_supported' => extension_loaded('gd'),
             'cache' => $cacheDiag,
             'runtime' => $runtimeDiag,
+            'runtime_settings' => $this->dynamicConfig()->publicState(),
         ], $healthy ? 200 : 503);
     }
 
     public function diagnostics(?Request $request = null): Response
     {
+        $this->dynamicConfig()->ensureApplied();
+
         $dbOk = true;
         try {
             DB::select('SELECT 1');
@@ -211,6 +251,8 @@ class AdminController extends Controller
             $dbOk = false;
         }
 
+        $req = $request ?? request();
+        $paths = $this->routePaths($this->security->resolveBasePath($req));
         $cacheDiag = $this->cache()->diagnostics();
         $runtimeDiag = $this->runtimeDiagnostics($request);
 
@@ -231,10 +273,14 @@ class AdminController extends Controller
             ],
             'cache' => $cacheDiag,
             'runtime' => $runtimeDiag,
+            'runtime_settings' => $this->dynamicConfig()->publicState(),
             'config' => [
                 'upstream' => (string) config('mirror.upstream', 'https://chatgpt.com'),
                 'egressMode' => 'direct',
-                'openaiPrefix' => '/' . trim((string) config('mirror.routes.openai_prefix', 'v1'), '/'),
+                'openaiPrefix' => $paths['openai'],
+                'docsPrefix' => $paths['api_docs'],
+                'adminPrefix' => $paths['admin'],
+                'playgroundPrefix' => $paths['playground'],
             ],
             'uptimeSeconds' => (int) (defined('LARAVEL_START') ? max(0, microtime(true) - LARAVEL_START) : 0),
             'database' => $dbOk ? 'ok' : 'error',
@@ -248,23 +294,26 @@ class AdminController extends Controller
 
     public function capabilities(Request $request): Response
     {
-        $openaiPrefix = '/' . trim((string) config('mirror.routes.openai_prefix', 'v1'), '/');
+        $this->dynamicConfig()->ensureApplied();
+
+        $paths = $this->routePaths($this->security->resolveBasePath($request));
 
         $endpoints = [
-            'chat_completions' => "{$openaiPrefix}/chat/completions",
-            'responses' => "{$openaiPrefix}/responses",
-            'models' => "{$openaiPrefix}/models",
-            'capabilities' => "{$openaiPrefix}/capabilities",
-            'playground' => '/mirror/playground',
-            'admin' => '/' . trim((string) config('mirror.routes.admin_prefix', 'mirror/admin'), '/'),
-            'api_docs' => '/mirror/api-docs',
-            'openapi' => '/mirror/openapi',
-            'mirror_chat' => '/api/chat',
-            'mirror_conversations' => '/api/conversations',
-            'mirror_files' => '/api/files',
-            'mirror_assets' => '/api/assets',
-            'mirror_convert' => '/api/convert/formats',
-            'mirror_decoder_challenges' => '/api/decoder-challenges',
+            'chat_completions' => "{$paths['openai']}/chat/completions",
+            'responses' => "{$paths['openai']}/responses",
+            'models' => "{$paths['openai']}/models",
+            'capabilities' => "{$paths['openai']}/capabilities",
+            'playground' => $paths['playground'],
+            'admin' => $paths['admin'],
+            'api_docs' => $paths['api_docs'],
+            'openapi' => $paths['openapi'],
+            'runtime_settings' => $paths['runtime_settings'],
+            'mirror_chat' => ($this->security->resolveBasePath($request) !== '' ? $this->security->resolveBasePath($request) : '') . '/api/chat',
+            'mirror_conversations' => ($this->security->resolveBasePath($request) !== '' ? $this->security->resolveBasePath($request) : '') . '/api/conversations',
+            'mirror_files' => ($this->security->resolveBasePath($request) !== '' ? $this->security->resolveBasePath($request) : '') . '/api/files',
+            'mirror_assets' => ($this->security->resolveBasePath($request) !== '' ? $this->security->resolveBasePath($request) : '') . '/api/assets',
+            'mirror_convert' => ($this->security->resolveBasePath($request) !== '' ? $this->security->resolveBasePath($request) : '') . '/api/convert/formats',
+            'mirror_decoder_challenges' => ($this->security->resolveBasePath($request) !== '' ? $this->security->resolveBasePath($request) : '') . '/api/decoder-challenges',
         ];
 
         $cacheDiag = $this->cache()->diagnostics();
@@ -284,7 +333,9 @@ class AdminController extends Controller
             'decoder_challenges' => true,
             'multi_account_pool' => true,
             'multi_worker_safe' => true,
+            'dynamic_runtime_config' => true,
             'redis_cache' => (bool) ($cacheDiag['redis_active'] ?? false),
+            'redis_mode' => (string) ($cacheDiag['redis_mode'] ?? 'auto'),
             'distributed_locks' => (bool) ($cacheDiag['locks_supported'] ?? false),
             'reverse_proxy_headers' => true,
             'browser_proxy' => true,
@@ -307,10 +358,117 @@ class AdminController extends Controller
             'features' => $features,
             'cache' => $cacheDiag,
             'runtime' => $runtimeDiag,
+            'runtime_settings' => $this->dynamicConfig()->publicState(),
             'notes' => [
                 'websocket_proxy' => 'Standard PHP-FPM/Apache/Nginx servers terminate HTTP SSE natively; raw WebSocket upgrades fall back automatically to HTTP SSE + Conduit.',
             ],
         ]);
+    }
+
+    public function getRuntimeSettings(Request $request): Response
+    {
+        $this->dynamicConfig()->ensureApplied();
+
+        return response()->json([
+            'ok' => true,
+            'runtime_settings' => $this->dynamicConfig()->publicState(),
+            'cache' => $this->cache()->diagnostics(),
+            'runtime' => $this->runtimeDiagnostics($request),
+        ]);
+    }
+
+    public function putRuntimeSettings(Request $request): Response
+    {
+        $input = $this->sanitizeRuntimeInput($request);
+        $this->dynamicConfig()->saveOverrides($input);
+
+        return response()->json([
+            'ok' => true,
+            'message' => 'Runtime settings saved and applied live.',
+            'runtime_settings' => $this->dynamicConfig()->publicState(),
+            'cache' => $this->cache()->diagnostics(),
+            'runtime' => $this->runtimeDiagnostics($request),
+        ]);
+    }
+
+    public function resetRuntimeSettings(Request $request): Response
+    {
+        $this->dynamicConfig()->resetOverrides();
+
+        return response()->json([
+            'ok' => true,
+            'message' => 'Dynamic overrides cleared; reverted to .env / config defaults.',
+            'runtime_settings' => $this->dynamicConfig()->publicState(),
+            'cache' => $this->cache()->diagnostics(),
+            'runtime' => $this->runtimeDiagnostics($request),
+        ]);
+    }
+
+    public function saveRuntime(Request $request): Response
+    {
+        $input = $this->sanitizeRuntimeInput($request, htmlForm: true);
+        $this->dynamicConfig()->saveOverrides($input);
+
+        $state = $this->dynamicConfig()->publicState();
+        $cacheDiag = $this->cache()->diagnostics();
+
+        if (($state['redis']['enabled'] ?? 'auto') === 'enabled' && !($cacheDiag['redis_active'] ?? false)) {
+            $reason = $cacheDiag['redis_error'] ?? 'Redis client/server unavailable';
+            return $this->redirectWithFlash(
+                'success',
+                "Runtime settings saved live. Redis is enabled but currently using fallback store ({$cacheDiag['driver']}): {$reason}",
+                $request
+            );
+        }
+
+        return $this->redirectWithFlash('success', 'Dynamic web server, proxy & Redis settings saved and applied live.', $request);
+    }
+
+    public function resetRuntime(Request $request): Response
+    {
+        $this->dynamicConfig()->resetOverrides();
+
+        return $this->redirectWithFlash('success', 'All dynamic runtime overrides were cleared back to .env / config defaults.', $request);
+    }
+
+    public function testRedis(Request $request): Response
+    {
+        $this->dynamicConfig()->ensureApplied();
+
+        $params = $this->sanitizeRuntimeInput($request);
+        if (empty($params['redis_password']) && empty($params['clear_redis_password'])) {
+            $existingPassword = config('mirror.redis.password');
+            if (is_string($existingPassword) && $existingPassword !== '') {
+                $params['redis_password'] = $existingPassword;
+            }
+        }
+
+        $result = $this->dynamicConfig()->testRedisConnection($params);
+        return response()->json($result, 200);
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    protected function sanitizeRuntimeInput(Request $request, bool $htmlForm = false): array
+    {
+        $input = $request->all();
+
+        foreach (['redis_url', 'redis.url'] as $urlKey) {
+            if (isset($input[$urlKey]) && str_contains((string) $input[$urlKey], '://***@')) {
+                unset($input[$urlKey]);
+            }
+        }
+
+        if ($htmlForm || $request->boolean('_runtime_form')) {
+            $input['redis_persistent'] = $request->boolean('redis_persistent');
+            $input['cache_assets_in_redis'] = $request->boolean('cache_assets_in_redis');
+            $input['server_trust_proxies'] = $request->boolean('server_trust_proxies');
+            $input['server_disable_output_compression'] = $request->boolean('server_disable_output_compression');
+            $input['clear_redis_password'] = $request->boolean('clear_redis_password');
+        }
+
+        return $input;
     }
 
     public function getSession(): Response
@@ -417,10 +575,13 @@ class AdminController extends Controller
      */
     protected function runtimeDiagnostics(?Request $request = null): array
     {
+        $this->dynamicConfig()->ensureApplied();
+
         $req = $request ?? request();
         $serverSoftware = (string) ($req->server('SERVER_SOFTWARE') ?: ($_SERVER['SERVER_SOFTWARE'] ?? PHP_SAPI));
         $configuredPlatform = (string) config('mirror.server.platform', 'auto');
         $detectedPlatform = $this->detectServerPlatform($serverSoftware, $req);
+        $forceHttps = config('mirror.server.force_https');
 
         return [
             'php_version' => PHP_VERSION,
@@ -433,9 +594,11 @@ class AdminController extends Controller
             'max_execution_time' => (int) ini_get('max_execution_time'),
             'stream_max_execution_time' => (int) config('mirror.server.stream_max_execution_time', 0),
             'trust_proxies' => (bool) config('mirror.server.trust_proxies', true),
-            'force_https' => (bool) config('mirror.server.force_https', false),
+            'force_https' => $forceHttps === null ? 'auto' : (bool) $forceHttps,
             'https_detected' => $this->security->isSecureRequest($req),
             'resolved_origin' => $this->security->resolveOrigin($req),
+            'resolved_base_path' => $this->security->resolveBasePath($req),
+            'resolved_base_url' => $this->security->resolveBaseUrl($req),
             'authorization_header_present' => $req->headers->has('Authorization')
                 || (string) $req->server('HTTP_AUTHORIZATION', '') !== ''
                 || (string) $req->server('REDIRECT_HTTP_AUTHORIZATION', '') !== '',
@@ -478,8 +641,8 @@ class AdminController extends Controller
         $sig = hash_hmac('sha256', (string) $payload, $this->security->hmacSecret());
         $encoded = base64_encode(json_encode(['p' => $payload, 's' => $sig]));
 
-        $adminPath = '/' . trim((string) config('mirror.routes.admin_prefix', 'mirror/admin'), '/');
-        $targetUrl = $req instanceof Request ? ($this->security->resolveOrigin($req) . $adminPath) : $adminPath;
+        $adminPath = $this->routePaths()['admin'];
+        $targetUrl = $req instanceof Request ? ($this->security->resolveBaseUrl($req) . $adminPath) : $adminPath;
         $response = redirect($targetUrl);
         $response->headers->setCookie(Cookie::create(
             self::FLASH_COOKIE,
@@ -535,11 +698,17 @@ class AdminController extends Controller
         array $recentFailures,
         ?array $flash
     ): string {
-        $baseUrl = $this->security->resolveOrigin($request);
-        $openaiPrefix = '/' . trim((string) config('mirror.routes.openai_prefix', 'v1'), '/');
-        $adminBase = $baseUrl . '/' . trim((string) config('mirror.routes.admin_prefix', 'mirror/admin'), '/');
+        $this->dynamicConfig()->ensureApplied();
+
+        $originUrl = $this->security->resolveOrigin($request);
+        $basePath = $this->security->resolveBasePath($request);
+        $baseUrl = $this->security->resolveBaseUrl($request);
+        $paths = $this->routePaths($basePath);
+        $adminBase = $originUrl . $paths['admin'];
+        $safeAdminBase = e($adminBase);
         $cacheDiag = $this->cache()->diagnostics();
         $runtimeDiag = $this->runtimeDiagnostics($request);
+        $dynState = $this->dynamicConfig()->publicState();
         $apiKey = (string) config('mirror.api_key', '');
         $maskedKey = $apiKey !== ''
             ? (substr($apiKey, 0, 6) . str_repeat('*', max(4, strlen($apiKey) - 6)))
@@ -577,8 +746,8 @@ class AdminController extends Controller
                 <td>{$t->active_requests} / {$t->total_requests}</td>
                 <td>{$tExpires}</td>
                 <td style='display:flex;gap:6px'>
-                    <form method='POST' action='{$adminBase}/tokens/{$t->id}/refresh'><button type='submit' class='btn btn-sm'>Refresh</button></form>
-                    <form method='POST' action='{$adminBase}/tokens/{$t->id}/delete' onsubmit='return confirm(\"Delete account?\")'><button type='submit' class='btn btn-sm btn-danger'>Delete</button></form>
+                    <form method='POST' action='{$safeAdminBase}/tokens/{$t->id}/refresh'><button type='submit' class='btn btn-sm'>Refresh</button></form>
+                    <form method='POST' action='{$safeAdminBase}/tokens/{$t->id}/delete' onsubmit='return confirm(\"Delete account?\")'><button type='submit' class='btn btn-sm btn-danger'>Delete</button></form>
                 </td>
             </tr>";
         }
@@ -608,20 +777,95 @@ class AdminController extends Controller
 
         $safeKey = e($maskedKey);
         $safeBase = e($baseUrl);
-        $safePrefix = e($openaiPrefix);
-        $safePlaygroundUrl = e($baseUrl . '/mirror/playground');
-        $safeDocsUrl = e($baseUrl . '/mirror/api-docs');
+        $safePrefix = e($paths['openai']);
+        $safePlaygroundUrl = e($originUrl . $paths['playground']);
+        $safeDocsUrl = e($originUrl . $paths['api_docs']);
         $safeHomeUrl = e($baseUrl . '/');
+        $safeDiagnosticsUrl = e($baseUrl . '/api/diagnostics');
 
-        $redisBadge = ($cacheDiag['redis_active'] ?? false)
-            ? '<span style="padding:2px 8px;border-radius:99px;background:#ecfdf5;color:#047857;font-size:11px;font-weight:600">Redis Active (' . e((string) ($cacheDiag['redis_ping'] ?? 'PONG')) . ($cacheDiag['latency_ms'] !== null ? ', ' . e((string) $cacheDiag['latency_ms']) . 'ms' : '') . ')</span>'
-            : '<span style="padding:2px 8px;border-radius:99px;background:#eff6ff;color:#1d4ed8;font-size:11px;font-weight:600">Fallback Store (' . e((string) ($cacheDiag['driver'] ?? 'array')) . ')</span>';
+        $redisMode = (string) ($cacheDiag['redis_mode'] ?? 'auto');
+        if ($redisMode === 'disabled') {
+            $redisBadge = '<span style="padding:2px 8px;border-radius:99px;background:#f3f4f6;color:#374151;font-size:11px;font-weight:600">Redis Disabled (Using ' . e((string) ($cacheDiag['driver'] ?? 'database')) . ' store)</span>';
+        } elseif ($cacheDiag['redis_active'] ?? false) {
+            $redisBadge = '<span style="padding:2px 8px;border-radius:99px;background:#ecfdf5;color:#047857;font-size:11px;font-weight:600">Redis Active (' . e((string) ($cacheDiag['redis_ping'] ?? 'PONG')) . ($cacheDiag['latency_ms'] !== null ? ', ' . e((string) $cacheDiag['latency_ms']) . 'ms' : '') . ')</span>';
+        } else {
+            $redisBadge = '<span style="padding:2px 8px;border-radius:99px;background:#eff6ff;color:#1d4ed8;font-size:11px;font-weight:600">Fallback Store (' . e((string) ($cacheDiag['driver'] ?? 'array')) . ')</span>';
+        }
+
         $safeServerPlatform = e((string) $runtimeDiag['detected_platform'] . ' (config: ' . (string) $runtimeDiag['configured_platform'] . ')');
         $safePhpSapi = e(PHP_VERSION . ' / ' . PHP_SAPI);
         $safeHttpsState = ($runtimeDiag['https_detected'] ?? false) ? 'HTTPS (Origin: ' . $safeBase . ')' : 'HTTP (Origin: ' . $safeBase . ')';
         $safeZlibState = ($runtimeDiag['zlib_output_compression'] ?? false) ? 'Enabled (Auto-disabled during SSE)' : 'Off (Unbuffered SSE Ready)';
         $safeLocksState = ($cacheDiag['locks_supported'] ?? false) ? 'Distributed Atomic Locks Ready' : 'Single-node Lock Fallback';
         $safeRedisExt = (($cacheDiag['phpredis_loaded'] ?? false) ? 'phpredis loaded' : 'no phpredis') . ' · ' . (($cacheDiag['predis_installed'] ?? false) ? 'predis installed' : 'no predis');
+
+        $opt = static function (string $current, array $choices): string {
+            $out = '';
+            foreach ($choices as $val => $label) {
+                $sel = $current === (string) $val ? ' selected' : '';
+                $out .= '<option value="' . e((string) $val) . '"' . $sel . '>' . e($label) . '</option>';
+            }
+            return $out;
+        };
+
+        $redisState = $dynState['redis'] ?? [];
+        $cacheState = $dynState['cache'] ?? [];
+        $serverState = $dynState['server'] ?? [];
+        $poolState = $dynState['pool'] ?? [];
+
+        $redisModeOptions = $opt((string) ($redisState['enabled'] ?? 'auto'), [
+            'auto' => 'Auto (Use Redis if configured & available)',
+            'enabled' => 'Enabled (Activate Redis dynamically)',
+            'disabled' => 'Disabled (Run cleanly without Redis)',
+        ]);
+        $redisClientOptions = $opt((string) ($redisState['client'] ?? 'auto'), [
+            'auto' => 'Auto (Detect phpredis or predis)',
+            'phpredis' => 'phpredis (PHP Extension)',
+            'predis' => 'predis (Pure PHP)',
+        ]);
+        $platformOptions = $opt((string) ($serverState['platform'] ?? 'auto'), [
+            'auto' => 'Auto-detect any server',
+            'apache' => 'Apache (mod_php / PHP-FPM)',
+            'webuzo' => 'Webuzo Panel (Apache + PHP-FPM)',
+            'nginx' => 'Nginx + PHP-FPM',
+            'litespeed' => 'LiteSpeed Enterprise',
+            'openlitespeed' => 'OpenLiteSpeed',
+            'caddy' => 'Caddy Web Server',
+            'frankenphp' => 'FrankenPHP',
+            'octane' => 'Laravel Octane (Swoole / RoadRunner)',
+        ]);
+        $forceHttpsOptions = $opt((string) ($serverState['force_https'] ?? 'auto'), [
+            'auto' => 'Auto (Detect from TLS / X-Forwarded-Proto)',
+            'true' => 'Force HTTPS URLs',
+            'false' => 'Force HTTP URLs',
+        ]);
+        $poolStrategyOptions = $opt((string) ($poolState['strategy'] ?? 'least_busy'), [
+            'least_busy' => 'least_busy',
+            'round_robin' => 'round_robin',
+            'random' => 'random',
+        ]);
+
+        $safeRedisHost = e((string) ($redisState['host'] ?? ''));
+        $safeRedisPort = e((string) ($redisState['port'] ?? 6379));
+        $safeRedisDb = e((string) ($redisState['database'] ?? 0));
+        $safeRedisUrl = e((string) ($redisState['url'] ?? ''));
+        $redisPwPlaceholder = ($redisState['has_password'] ?? false)
+            ? 'Saved securely (leave blank to keep)'
+            : 'Optional Redis AUTH password';
+        $safeCacheStore = e((string) ($cacheState['store'] ?? ''));
+        $safeModelsTtl = e((string) ($cacheState['models_ttl'] ?? 60));
+        $safeTrustedProxies = e((string) ($serverState['trusted_proxies'] ?? '*'));
+        $safeStreamTimeout = e((string) ($serverState['stream_max_execution_time'] ?? 300));
+        $safeMaxConcurrent = e((string) ($poolState['max_concurrent_per_token'] ?? 5));
+        $safeCooldownSec = e((string) ($poolState['cooldown_seconds'] ?? 60));
+
+        $chkPersist = ($redisState['persistent'] ?? true) ? ' checked' : '';
+        $chkAssetsRedis = ($cacheState['assets_in_redis'] ?? true) ? ' checked' : '';
+        $chkTrustProxies = ($serverState['trust_proxies'] ?? true) ? ' checked' : '';
+        $chkDisableZlib = ($serverState['disable_output_compression'] ?? true) ? ' checked' : '';
+        $overridesBadge = ((int) ($dynState['overrides_active'] ?? 0)) > 0
+            ? '<span style="padding:2px 8px;border-radius:99px;background:#fef3c7;color:#92400e;font-size:11px;font-weight:600">' . (int) $dynState['overrides_active'] . ' Live DB Overrides Active</span>'
+            : '<span style="padding:2px 8px;border-radius:99px;background:#f3f4f6;color:#374151;font-size:11px;font-weight:600">Using .env / Config Defaults</span>';
 
         return <<<HTML
 <!doctype html>
@@ -644,7 +888,7 @@ class AdminController extends Controller
   .card { background:var(--card); border:1px solid var(--border); border-radius:12px; padding:18px; margin-bottom:18px; }
   .stat-val { font-size:26px; font-weight:700; margin-top:4px; }
   .stat-lbl { font-size:12px; color:var(--muted); text-transform:uppercase; letter-spacing:.04em; }
-  h2 { font-size:16px; margin:0 0 12px 0; display:flex; align-items:center; justify-content:space-between; }
+  h2 { font-size:16px; margin:0 0 12px 0; display:flex; align-items:center; justify-content:space-between; gap:8px; flex-wrap:wrap; }
   table { width:100%; border-collapse:collapse; font-size:13px; }
   th,td { text-align:left; padding:10px 12px; border-bottom:1px solid var(--border); vertical-align:middle; }
   th { font-size:11px; text-transform:uppercase; color:var(--muted); background:#f9fafb; }
@@ -652,10 +896,13 @@ class AdminController extends Controller
   .btn-sm { padding:4px 9px; font-size:11px; }
   .btn-danger { background:#dc2626; border-color:#dc2626; }
   .btn-light { background:#fff; color:#111827; }
-  .input { width:100%; padding:9px 11px; border:1px solid var(--border); border-radius:8px; font-size:13px; margin-bottom:10px; }
+  .input { width:100%; padding:9px 11px; border:1px solid var(--border); border-radius:8px; font-size:13px; margin-bottom:10px; background:#fff; color:var(--text); }
+  .field-label { display:block; font-size:11px; font-weight:600; color:var(--muted); margin-bottom:4px; text-transform:uppercase; letter-spacing:.03em; }
+  .chk-row { display:flex; align-items:center; gap:8px; font-size:13px; margin:6px 0; cursor:pointer; }
   .grid-2 { display:grid; grid-template-columns:1fr 1fr; gap:18px; }
+  .grid-3 { display:grid; grid-template-columns:repeat(3,1fr); gap:14px; }
   pre { background:#0f172a; color:#f8fafc; padding:12px; border-radius:8px; font-size:12px; overflow:auto; margin:0; }
-  @media(max-width:768px) { .stats,.grid-2 { grid-template-columns:1fr; } }
+  @media(max-width:768px) { .stats,.grid-2,.grid-3 { grid-template-columns:1fr; } }
 </style>
 </head>
 <body>
@@ -665,7 +912,7 @@ class AdminController extends Controller
     <a href="{$safeHomeUrl}">ChatGPT Web</a>
     <a href="{$safePlaygroundUrl}">Playground</a>
     <a href="{$safeDocsUrl}">API Docs</a>
-    <a href="{$adminBase}" class="active">Settings &amp; Admin Dashboard</a>
+    <a href="{$safeAdminBase}" class="active">Settings &amp; Admin Dashboard</a>
   </div>
 </nav>
 <div class="container">
@@ -680,7 +927,7 @@ class AdminController extends Controller
   <div class="grid-2">
     <div class="card">
       <h2>Add ChatGPT Account Token</h2>
-      <form method="POST" action="{$adminBase}/tokens">
+      <form method="POST" action="{$safeAdminBase}/tokens">
         <input type="text" name="name" class="input" placeholder="Account label (optional, auto-detected if empty)" />
         <textarea name="session_token" rows="3" class="input" placeholder="Paste __Secure-next-auth.session-token value here..." required></textarea>
         <input type="text" name="turnstile_token" class="input" placeholder="Optional Turnstile token (if Sentinel requires it)" />
@@ -693,9 +940,9 @@ class AdminController extends Controller
       <pre>Base URL: {$safeBase}{$safePrefix}
 API Key:  {$safeKey}
 Routes:   {$safePrefix}/chat/completions, {$safePrefix}/responses, {$safePrefix}/models</pre>
-      <div style="margin-top:12px;display:flex;gap:8px">
-        <form method="POST" action="{$adminBase}/tokens/reset-counters"><button type="submit" class="btn btn-light">Reset Pool Counters</button></form>
-        <a href="{$safeBase}/api/diagnostics" class="btn btn-light" style="text-decoration:none;display:inline-flex;align-items:center">JSON Diagnostics</a>
+      <div style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap">
+        <form method="POST" action="{$safeAdminBase}/tokens/reset-counters"><button type="submit" class="btn btn-light">Reset Pool Counters</button></form>
+        <a href="{$safeDiagnosticsUrl}" class="btn btn-light" style="text-decoration:none;display:inline-flex;align-items:center">JSON Diagnostics</a>
       </div>
     </div>
   </div>
@@ -709,6 +956,91 @@ Routes:   {$safePrefix}/chat/completions, {$safePrefix}/responses, {$safePrefix}
         <tr><th>Redis Extensions</th><td>{$safeRedisExt}</td><th>Production Setup CLI</th><td><code>php artisan mirror:server --write</code> / <code>--vhost</code></td></tr>
       </tbody>
     </table>
+  </div>
+
+  <div class="card">
+    <h2>Dynamic Server, Proxy &amp; Redis Configuration {$overridesBadge}</h2>
+    <p style="font-size:13px;color:var(--muted);margin-top:0">Adjust web server behavior, Redis caching, or pool routing dynamically from the database—nothing stays hardcoded, and if Redis is unavailable or disabled the app runs seamlessly on fallback storage.</p>
+    <form method="POST" action="{$safeAdminBase}/runtime" id="dynamic-runtime-form">
+      <input type="hidden" name="_runtime_form" value="1" />
+      <div class="grid-3">
+        <div>
+          <label class="field-label" for="rt_redis_enabled">Redis Mode</label>
+          <select id="rt_redis_enabled" name="redis_enabled" class="input">{$redisModeOptions}</select>
+
+          <label class="field-label" for="rt_redis_client">Redis Client Driver</label>
+          <select id="rt_redis_client" name="redis_client" class="input">{$redisClientOptions}</select>
+
+          <label class="field-label" for="rt_redis_host">Redis Host / Socket</label>
+          <input id="rt_redis_host" type="text" name="redis_host" class="input" value="{$safeRedisHost}" placeholder="127.0.0.1 or /var/run/redis/redis.sock" />
+
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
+            <div>
+              <label class="field-label" for="rt_redis_port">Redis Port</label>
+              <input id="rt_redis_port" type="number" name="redis_port" class="input" value="{$safeRedisPort}" min="1" max="65535" />
+            </div>
+            <div>
+              <label class="field-label" for="rt_redis_db">Redis DB</label>
+              <input id="rt_redis_db" type="number" name="redis_database" class="input" value="{$safeRedisDb}" min="0" max="15" />
+            </div>
+          </div>
+
+          <label class="field-label" for="rt_redis_url">Redis URL (Optional DSN)</label>
+          <input id="rt_redis_url" type="text" name="redis_url" class="input" value="{$safeRedisUrl}" placeholder="redis://127.0.0.1:6379/0" />
+
+          <label class="field-label" for="rt_redis_pw">Redis Password</label>
+          <input id="rt_redis_pw" type="password" name="redis_password" class="input" value="" placeholder="{$redisPwPlaceholder}" autocomplete="new-password" />
+          <label class="chk-row"><input type="checkbox" name="clear_redis_password" value="1" /> Clear saved Redis password</label>
+        </div>
+
+        <div>
+          <label class="field-label" for="rt_server_platform">Web Server Platform</label>
+          <select id="rt_server_platform" name="server_platform" class="input">{$platformOptions}</select>
+
+          <label class="field-label" for="rt_force_https">HTTPS Scheme Handling</label>
+          <select id="rt_force_https" name="server_force_https" class="input">{$forceHttpsOptions}</select>
+
+          <label class="field-label" for="rt_trusted_proxies">Trusted Proxies (* or CIDRs)</label>
+          <input id="rt_trusted_proxies" type="text" name="server_trusted_proxies" class="input" value="{$safeTrustedProxies}" placeholder="*" />
+
+          <label class="field-label" for="rt_stream_timeout">SSE Stream Max Execution (sec, 0=unlimited)</label>
+          <input id="rt_stream_timeout" type="number" name="server_stream_max_execution_time" class="input" value="{$safeStreamTimeout}" min="0" max="3600" />
+
+          <label class="field-label" for="rt_cache_store">Laravel Cache Store Override</label>
+          <input id="rt_cache_store" type="text" name="cache_store" class="input" value="{$safeCacheStore}" placeholder="Auto (leave blank unless pinning store)" />
+
+          <label class="field-label" for="rt_models_ttl">Models Cache TTL (seconds)</label>
+          <input id="rt_models_ttl" type="number" name="cache_models_ttl" class="input" value="{$safeModelsTtl}" min="0" max="86400" />
+        </div>
+
+        <div>
+          <label class="field-label" for="rt_pool_strategy">Token Pool Strategy</label>
+          <select id="rt_pool_strategy" name="pool_strategy" class="input">{$poolStrategyOptions}</select>
+
+          <label class="field-label" for="rt_pool_conc">Max Concurrent Requests / Account</label>
+          <input id="rt_pool_conc" type="number" name="pool_max_concurrent_per_token" class="input" value="{$safeMaxConcurrent}" min="1" max="100" />
+
+          <label class="field-label" for="rt_pool_cool">Rate-Limit Cooldown (seconds)</label>
+          <input id="rt_pool_cool" type="number" name="pool_cooldown_seconds" class="input" value="{$safeCooldownSec}" min="1" max="3600" />
+
+          <div style="margin-top:10px;padding-top:10px;border-top:1px solid var(--border)">
+            <label class="chk-row"><input type="checkbox" name="redis_persistent" value="1"{$chkPersist} /> Persistent Redis connections</label>
+            <label class="chk-row"><input type="checkbox" name="cache_assets_in_redis" value="1"{$chkAssetsRedis} /> Store generated media in Redis when active</label>
+            <label class="chk-row"><input type="checkbox" name="server_trust_proxies" value="1"{$chkTrustProxies} /> Trust reverse-proxy headers (X-Forwarded-*)</label>
+            <label class="chk-row"><input type="checkbox" name="server_disable_output_compression" value="1"{$chkDisableZlib} /> Disable zlib output compression during SSE</label>
+          </div>
+        </div>
+      </div>
+
+      <div style="margin-top:14px;display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+        <button type="submit" class="btn">Save &amp; Apply Live Settings</button>
+        <button type="button" id="test-redis-btn" class="btn btn-light">Test Redis Connection</button>
+        <span id="redis-test-result" style="font-size:12px;color:var(--muted)"></span>
+      </div>
+    </form>
+    <form method="POST" action="{$safeAdminBase}/runtime/reset" style="margin-top:10px">
+      <button type="submit" class="btn btn-light btn-sm">Reset Overrides to .env Defaults</button>
+    </form>
   </div>
 
   <div class="card">
@@ -736,6 +1068,44 @@ Routes:   {$safePrefix}/chat/completions, {$safePrefix}/responses, {$safePrefix}
     </div>
   </div>
 </div>
+<script>
+(function () {
+  var btn = document.getElementById('test-redis-btn');
+  var out = document.getElementById('redis-test-result');
+  if (!btn || !out) return;
+  btn.addEventListener('click', async function () {
+    out.style.color = '#6b7280';
+    out.textContent = 'Testing Redis connection...';
+    var payload = {
+      redis_client: document.getElementById('rt_redis_client').value,
+      redis_host: document.getElementById('rt_redis_host').value,
+      redis_port: parseInt(document.getElementById('rt_redis_port').value || '6379', 10),
+      redis_database: parseInt(document.getElementById('rt_redis_db').value || '0', 10),
+      redis_url: document.getElementById('rt_redis_url').value
+    };
+    var pw = document.getElementById('rt_redis_pw').value;
+    if (pw) payload.redis_password = pw;
+    try {
+      var res = await fetch('{$safeAdminBase}/runtime/test-redis', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      var data = await res.json();
+      if (data && data.ok) {
+        out.style.color = '#047857';
+        out.textContent = 'Connected (' + (data.client || 'auto') + '): ' + (data.ping || 'PONG') + ' in ' + data.latency_ms + 'ms';
+      } else {
+        out.style.color = '#b91c1c';
+        out.textContent = 'Failed (' + ((data && data.client) || 'auto') + '): ' + ((data && data.error) || 'Connection refused');
+      }
+    } catch (e) {
+      out.style.color = '#b91c1c';
+      out.textContent = 'Request failed: ' + (e && e.message ? e.message : 'network error');
+    }
+  });
+})();
+</script>
 </body>
 </html>
 HTML;

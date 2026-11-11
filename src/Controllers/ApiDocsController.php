@@ -39,7 +39,7 @@ class ApiDocsController extends Controller
             ], 400);
         }
 
-        $doc = $this->buildOpenApiDocument($this->security()->resolveOrigin($request));
+        $doc = $this->buildOpenApiDocument($this->security()->resolveBaseUrl($request));
 
         if ($format === 'yaml') {
             $yaml = class_exists(Yaml::class)
@@ -55,29 +55,34 @@ class ApiDocsController extends Controller
         return response()->json($doc, 200, ['Cache-Control' => 'no-store'], JSON_UNESCAPED_SLASHES | JSON_PRETTY_PRINT);
     }
 
-    public function ui(): Response
+    public function ui(Request $request): Response
     {
-        $html = <<<'HTML'
+        $basePath = rtrim($this->security()->resolveBasePath($request), '/');
+        $docsPrefix = trim((string) config('mirror.routes.docs_prefix', 'mirror'), '/');
+        $docsBase = $basePath . ($docsPrefix !== '' ? '/' . $docsPrefix : '');
+        $openApiUrl = json_encode($docsBase . '/openapi', JSON_UNESCAPED_SLASHES);
+
+        $html = <<<HTML
 <!DOCTYPE html>
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
     <title>Laravel ChatGPT Mirror API Docs</title>
-    <link rel="stylesheet" type="text/css" href="/mirror/api-docs/swagger-ui.css" />
-    <link rel="stylesheet" type="text/css" href="/mirror/api-docs/index.css" />
-    <link rel="icon" type="image/png" href="/mirror/api-docs/favicon-32x32.png" sizes="32x32" />
+    <link rel="stylesheet" type="text/css" href="{$docsBase}/api-docs/swagger-ui.css" />
+    <link rel="stylesheet" type="text/css" href="{$docsBase}/api-docs/index.css" />
+    <link rel="icon" type="image/png" href="{$docsBase}/api-docs/favicon-32x32.png" sizes="32x32" />
     <style>
       .swagger-ui .topbar { display: none; }
     </style>
   </head>
   <body>
     <div id="swagger-ui"></div>
-    <script src="/mirror/api-docs/swagger-ui-bundle.js" charset="UTF-8"></script>
-    <script src="/mirror/api-docs/swagger-ui-standalone-preset.js" charset="UTF-8"></script>
+    <script src="{$docsBase}/api-docs/swagger-ui-bundle.js" charset="UTF-8"></script>
+    <script src="{$docsBase}/api-docs/swagger-ui-standalone-preset.js" charset="UTF-8"></script>
     <script>
       window.onload = function () {
         window.ui = SwaggerUIBundle({
-          url: '/mirror/openapi',
+          url: {$openApiUrl},
           dom_id: '#swagger-ui',
           deepLinking: true,
           presets: [
@@ -134,17 +139,19 @@ HTML;
     {
         $openaiPrefix = '/' . trim((string) config('mirror.routes.openai_prefix', 'v1'), '/');
         $adminPrefix = '/' . trim((string) config('mirror.routes.admin_prefix', 'mirror/admin'), '/');
+        $docsPrefix = trim((string) config('mirror.routes.docs_prefix', 'mirror'), '/');
+        $docsBase = $docsPrefix !== '' ? ('/' . $docsPrefix) : '';
 
         return [
             'openapi' => '3.1.0',
             'info' => [
                 'title' => 'Mirror API',
                 'version' => '2.1.0',
-                'description' => 'Local ChatGPT Web Mirror in Laravel: OpenAI-compatible gateway (/v1/chat/completions, /v1/responses, /v1/models), Sentinel PoW + Conduit, native /api/chat & /api/conversations/*, file uploads & signed /api/asset-content links, binary codecs (/api/convert/*), decoder challenges, and transparent ChatGPT web proxy.',
+                'description' => "Dynamic ChatGPT Web Mirror in Laravel: OpenAI-compatible gateway ({$openaiPrefix}/chat/completions, {$openaiPrefix}/responses, {$openaiPrefix}/models), Sentinel PoW + Conduit, native /api/chat & /api/conversations/*, file uploads & signed /api/asset-content links, binary codecs (/api/convert/*), decoder challenges, dynamic Redis/runtime control ({$adminPrefix}), and transparent ChatGPT web proxy.",
             ],
             'servers' => [['url' => $serverUrl, 'description' => 'Active Laravel Mirror instance']],
             'tags' => [
-                ['name' => 'OpenAI Gateway', 'description' => 'Drop-in OpenAI-compatible endpoints (/v1/*)'],
+                ['name' => 'OpenAI Gateway', 'description' => "Drop-in OpenAI-compatible endpoints ({$openaiPrefix}/*)"],
                 ['name' => 'Mirror Chat & Models', 'description' => 'Native Playground & UI APIs (/api/chat, /api/models, /api/gpts)'],
                 ['name' => 'Conversations & Assets', 'description' => 'History search, branching, export, file uploads, signed asset tickets'],
                 ['name' => 'Conversions & Challenges', 'description' => 'LoaF, PngSpeak, gptgif, gptgif-v4, GIF89a & decoder challenges'],
@@ -246,7 +253,11 @@ HTML;
                 '/api/convert/gauntlet' => ['post' => ['tags' => ['Conversions & Challenges'], 'summary' => 'Run round-trip across all codecs', 'responses' => ['200' => ['description' => 'Results']]]],
                 '/api/convert/gpt-prompt' => ['post' => ['tags' => ['Conversions & Challenges'], 'summary' => 'Generate ChatGPT decoding prompt', 'responses' => ['200' => ['description' => 'Prompt payload']]]],
                 '/api/decoder-challenges' => ['post' => ['tags' => ['Conversions & Challenges'], 'summary' => 'Create ephemeral decoder challenge', 'responses' => ['200' => ['description' => 'Challenge']]]],
-                '/mirror/openapi' => ['get' => ['tags' => ['Health & Sessions'], 'summary' => 'OpenAPI 3.1.0 specification (json|yaml)', 'responses' => ['200' => ['description' => 'OpenAPI document']]]],
+                "{$docsBase}/openapi" => ['get' => ['tags' => ['Health & Sessions'], 'summary' => 'OpenAPI 3.1.0 specification (json|yaml)', 'responses' => ['200' => ['description' => 'OpenAPI document']]]],
+                '/api/settings/runtime' => [
+                    'get' => ['tags' => ['Health & Sessions'], 'summary' => 'Inspect active dynamic Redis, proxy, and server settings (sanitized)', 'responses' => ['200' => ['description' => 'Runtime settings JSON']]],
+                    'put' => ['tags' => ['Health & Sessions'], 'summary' => 'Dynamically update Redis, proxy, server, and pool settings at runtime', 'responses' => ['200' => ['description' => 'Updated settings JSON']]],
+                ],
                 "{$adminPrefix}/api/stats" => ['get' => ['tags' => ['Health & Sessions'], 'summary' => 'Pool & request statistics', 'security' => [['mirrorApiKey' => []]], 'responses' => ['200' => ['description' => 'Pool stats']]]],
             ],
         ];

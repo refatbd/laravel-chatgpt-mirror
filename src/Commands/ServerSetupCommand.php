@@ -6,6 +6,7 @@ namespace Refatbd\LaravelChatGptMirror\Commands;
 
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\File;
+use Refatbd\LaravelChatGptMirror\Services\DynamicConfigService;
 use Refatbd\LaravelChatGptMirror\Services\MirrorCache;
 use Symfony\Component\Console\Output\OutputInterface;
 
@@ -18,15 +19,23 @@ class ServerSetupCommand extends Command
         {target=auto : Web server target (auto, apache, webuzo, nginx, litespeed, caddy, octane)}
         {--write : Idempotently update public/.htaccess with Apache/LiteSpeed Bearer Auth & unbuffered SSE rules}
         {--vhost : Print the production VirtualHost / Server block / Caddyfile / Octane configuration}
-        {--path= : Custom .htaccess path (defaults to public/.htaccess)}';
+        {--path= : Custom .htaccess path (defaults to public/.htaccess)}
+        {--domain= : Server domain name (defaults to APP_URL host or example.com)}
+        {--root= : Public document root path (defaults to public_path())}
+        {--php-version= : Target PHP version for FPM socket paths (defaults to running PHP major.minor)}
+        {--socket= : Custom PHP-FPM Unix socket or host:port (overrides default FPM socket)}
+        {--host= : Bind host for Octane server output (defaults to 127.0.0.1)}
+        {--port= : Bind port for Octane server output (defaults to 8000)}';
 
     /** @var array<int, string> */
     protected $aliases = ['mirror:apache'];
 
     protected $description = 'Configure web server rewrites, Bearer Authorization forwarding, unbuffered SSE streaming, and Redis deployment templates';
 
-    public function handle(MirrorCache $cache): int
+    public function handle(MirrorCache $cache, DynamicConfigService $dynamicConfig): int
     {
+        $dynamicConfig->ensureApplied();
+
         $rawTarget = strtolower(trim((string) $this->argument('target')));
         $invokedAs = strtolower((string) ($this->input?->getFirstArgument() ?? 'mirror:server'));
         if ($rawTarget === 'auto' && str_contains($invokedAs, 'apache')) {
@@ -54,18 +63,26 @@ class ServerSetupCommand extends Command
         }
 
         $cacheDiag = $cache->diagnostics();
+        $dynState = $dynamicConfig->publicState();
+        $redisHost = (string) (($dynState['redis']['host'] ?? '') !== '' ? $dynState['redis']['host'] : '127.0.0.1');
+        $redisPort = (int) ($dynState['redis']['port'] ?? 6379);
+        $redisMode = (string) ($dynState['redis']['enabled'] ?? 'auto');
+        $redisClient = (string) ($dynState['redis']['client'] ?? 'auto');
+        $trustProxies = ($dynState['server']['trust_proxies'] ?? true) ? 'true' : 'false';
+        $adminRoute = '/' . trim((string) config('mirror.routes.admin_prefix', 'mirror/admin'), '/');
+
         $this->newLine();
-        $this->line('<comment>Recommended .env for Multi-Worker Production + Redis:</comment>');
+        $this->line('<comment>Dynamic Environment Baseline (.env or override live in ' . $adminRoute . '):</comment>');
         $this->line("  MIRROR_SERVER_PLATFORM={$target}");
-        $this->line('  MIRROR_TRUST_PROXIES=true');
-        $this->line('  MIRROR_CACHE_STORE=mirror_redis');
-        $this->line('  MIRROR_REDIS_CLIENT=' . (($cacheDiag['phpredis_loaded'] ?? false) ? 'phpredis' : (($cacheDiag['predis_installed'] ?? false) ? 'predis' : 'phpredis')));
-        $this->line('  MIRROR_REDIS_HOST=127.0.0.1');
-        $this->line('  MIRROR_REDIS_PORT=6379');
+        $this->line("  MIRROR_TRUST_PROXIES={$trustProxies}");
+        $this->line("  MIRROR_REDIS_ENABLED={$redisMode}   # auto | enabled | disabled");
+        $this->line("  MIRROR_REDIS_CLIENT={$redisClient}    # auto | phpredis | predis");
+        $this->line("  MIRROR_REDIS_HOST={$redisHost}");
+        $this->line("  MIRROR_REDIS_PORT={$redisPort}");
         $this->newLine();
         $this->line('Redis Status Now: ' . (($cacheDiag['redis_active'] ?? false)
             ? '<info>ACTIVE (' . ($cacheDiag['redis_ping'] ?? 'PONG') . ')</info>'
-            : 'Fallback (' . ($cacheDiag['driver'] ?? 'array') . ') — set MIRROR_REDIS_HOST and ensure phpredis/predis is installed.'));
+            : 'Fallback (' . ($cacheDiag['driver'] ?? 'array') . ', mode: ' . $redisMode . ') — app runs normally without Redis; enable anytime via .env or Admin Dashboard.'));
 
         return self::SUCCESS;
     }
@@ -119,11 +136,12 @@ class ServerSetupCommand extends Command
     protected function writeHtaccessRules(string $htaccessPath): void
     {
         File::ensureDirectoryExists(dirname($htaccessPath));
+        $sseAlternation = $this->ssePathAlternation();
 
         $mirrorBlock = implode("\n", [
             self::BLOCK_START,
             '<IfModule mod_env.c>',
-            '    SetEnvIfNoCase Request_URI "^/?(v1|api/chat|backend-api|__codex-api)/" no-gzip=1 no-brotli=1 dont-vary=1 MIRROR_SSE=1',
+            "    SetEnvIfNoCase Request_URI \"^/?({$sseAlternation})/\" no-gzip=1 no-brotli=1 dont-vary=1 MIRROR_SSE=1",
             '</IfModule>',
             '',
             '<IfModule mod_headers.c>',
@@ -183,10 +201,36 @@ class ServerSetupCommand extends Command
             default => $base . '/apache/webuzo-vhost.conf',
         };
 
+        $domain = $this->resolvedDomain();
+        $docRoot = $this->resolvedRoot();
+        $phpVersion = $this->resolvedPhpVersion();
+        $nginxSocket = $this->resolvedSocket("unix:/run/php/php{$phpVersion}-fpm.sock");
+        $caddyFastcgi = $this->resolvedSocket('127.0.0.1:9000');
+        $sseAlternation = $this->ssePathAlternation();
+        $caddyPaths = $this->caddySsePaths();
+        $streamTimeout = max(60, (int) config('mirror.server.stream_max_execution_time', 300));
+        $octaneHost = trim((string) ($this->option('host') ?? '')) ?: '127.0.0.1';
+        $octanePort = trim((string) ($this->option('port') ?? '')) ?: '8000';
+
         $this->newLine();
         if (File::exists($templateFile)) {
-            $this->line("<comment>--- Template ({$target}): {$templateFile} ---</comment>");
-            $lines = preg_split('/\r\n|\r|\n/', trim((string) File::get($templateFile))) ?: [];
+            $this->line("<comment>--- Template ({$target} | domain: {$domain} | root: {$docRoot}) ---</comment>");
+            $raw = trim((string) File::get($templateFile));
+            $rendered = strtr($raw, [
+                'YOUR_DOMAIN.COM' => $domain,
+                '/home/USERNAME/public_html/public' => $docRoot,
+                '/var/www/YOUR_APP/public' => $docRoot,
+                'unix:/run/php/php8.3-fpm.sock' => $nginxSocket,
+                '127.0.0.1:9000' => $caddyFastcgi,
+                '^/(v1|api/chat|backend-api|__codex-api)/' => "^/({$sseAlternation})/",
+                '/v1/* /api/chat* /backend-api/* /__codex-api/*' => $caddyPaths,
+                'Timeout 300' => "Timeout {$streamTimeout}",
+                'ProxyTimeout 300' => "ProxyTimeout {$streamTimeout}",
+                'fastcgi_read_timeout 300s;' => "fastcgi_read_timeout {$streamTimeout}s;",
+                'fastcgi_send_timeout 300s;' => "fastcgi_send_timeout {$streamTimeout}s;",
+            ]);
+
+            $lines = preg_split('/\r\n|\r|\n/', $rendered) ?: [];
             foreach ($lines as $line) {
                 $this->output->writeln($line, OutputInterface::OUTPUT_RAW);
             }
@@ -195,7 +239,7 @@ class ServerSetupCommand extends Command
         if ($target === 'octane') {
             $this->newLine();
             $this->line('<comment>--- Laravel Octane / Swoole / FrankenPHP Notes ---</comment>');
-            $this->line('  php artisan octane:start --host=127.0.0.1 --port=8000 --workers=4 --max-requests=500');
+            $this->line("  php artisan octane:start --host={$octaneHost} --port={$octanePort} --workers=4 --max-requests=500");
             $this->line('  Place Nginx/Caddy in front with proxy_buffering off / flush_interval -1 for SSE routes.');
         }
 
@@ -203,7 +247,84 @@ class ServerSetupCommand extends Command
             $this->newLine();
             $this->line('<comment>Webuzo Apache Checklist:</comment>');
             $this->line('  1. Run `php artisan mirror:server apache --write` (or `mirror:apache --write`) to update `public/.htaccess`.');
-            $this->line('  2. Add `AllowEncodedSlashes NoDecode`, `CGIPassAuth On`, and `Timeout 300` in Webuzo Apache Extra Configuration.');
+            $this->line("  2. Add `AllowEncodedSlashes NoDecode`, `CGIPassAuth On`, and `Timeout {$streamTimeout}` in Webuzo Apache Extra Configuration.");
         }
+    }
+
+    /**
+     * @return array<int, string>
+     */
+    protected function ssePathSegments(): array
+    {
+        $openai = trim((string) config('mirror.routes.openai_prefix', 'v1'), '/');
+        $backend = trim((string) config('mirror.routes.backend_prefix', '__codex-api'), '/');
+
+        $segments = array_filter([
+            $openai !== '' ? $openai : 'v1',
+            'api/chat',
+            'backend-api',
+            $backend !== '' ? $backend : '__codex-api',
+        ], static fn (string $s): bool => $s !== '');
+
+        return array_values(array_unique($segments));
+    }
+
+    protected function ssePathAlternation(): string
+    {
+        return implode('|', array_map(
+            static fn (string $seg): string => (string) preg_replace('/([.+*?^$()\[\]{}|\\\\])/', '\\\\$1', $seg),
+            $this->ssePathSegments()
+        ));
+    }
+
+    protected function caddySsePaths(): string
+    {
+        return implode(' ', array_map(
+            static fn (string $seg): string => '/' . $seg . '/*',
+            $this->ssePathSegments()
+        ));
+    }
+
+    protected function resolvedDomain(): string
+    {
+        $opt = trim((string) ($this->option('domain') ?? ''));
+        if ($opt !== '') {
+            return $opt;
+        }
+
+        $appUrl = trim((string) config('app.url', ''));
+        $host = $appUrl !== '' ? (string) (parse_url($appUrl, PHP_URL_HOST) ?? '') : '';
+
+        return $host !== '' ? $host : 'example.com';
+    }
+
+    protected function resolvedRoot(): string
+    {
+        $opt = trim((string) ($this->option('root') ?? ''));
+        if ($opt !== '') {
+            return $opt;
+        }
+
+        if (function_exists('public_path')) {
+            return public_path();
+        }
+
+        return base_path('public');
+    }
+
+    protected function resolvedPhpVersion(): string
+    {
+        $opt = trim((string) ($this->option('php-version') ?? ''));
+        if ($opt !== '' && preg_match('/^\d+\.\d+/', $opt, $m)) {
+            return $m[0];
+        }
+
+        return PHP_MAJOR_VERSION . '.' . PHP_MINOR_VERSION;
+    }
+
+    protected function resolvedSocket(string $default): string
+    {
+        $opt = trim((string) ($this->option('socket') ?? ''));
+        return $opt !== '' ? $opt : $default;
     }
 }

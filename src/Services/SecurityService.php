@@ -120,6 +120,9 @@ class SecurityService
         if ($forced === true || $forced === 'true' || $forced === '1' || $forced === 1) {
             return true;
         }
+        if ($forced === false || $forced === 'false' || $forced === '0' || $forced === 0) {
+            return false;
+        }
 
         if ($request->isSecure()) {
             return true;
@@ -171,8 +174,8 @@ class SecurityService
         $host = $forwardedHost !== '' ? $forwardedHost : $request->getHttpHost();
 
         if ($host === '') {
-            $appUrl = rtrim((string) config('app.url', 'http://127.0.0.1:8000'), '/');
-            return $appUrl !== '' ? $appUrl : 'http://127.0.0.1:8000';
+            $appUrl = rtrim((string) config('app.url', ''), '/');
+            return $appUrl !== '' ? $appUrl : ($scheme . '://localhost');
         }
 
         if ($trustProxies && !str_contains($host, ':')) {
@@ -186,6 +189,32 @@ class SecurityService
         }
 
         return $scheme . '://' . $host;
+    }
+
+    /**
+     * Resolve sub-path prefix when hosted under a subdirectory or behind X-Forwarded-Prefix.
+     */
+    public function resolveBasePath(Request $request): string
+    {
+        $trustProxies = (bool) config('mirror.server.trust_proxies', true);
+        if ($trustProxies) {
+            $forwardedPrefix = trim(explode(',', (string) $request->header('X-Forwarded-Prefix', ''))[0]);
+            if ($forwardedPrefix !== '' && $forwardedPrefix !== '/') {
+                return '/' . trim($forwardedPrefix, '/');
+            }
+        }
+
+        $baseUrl = rtrim($request->getBaseUrl(), '/');
+        if ($baseUrl !== '' && str_ends_with($baseUrl, '/index.php')) {
+            $baseUrl = rtrim(substr($baseUrl, 0, -strlen('/index.php')), '/');
+        }
+
+        return $baseUrl;
+    }
+
+    public function resolveBaseUrl(Request $request): string
+    {
+        return rtrim($this->resolveOrigin($request) . $this->resolveBasePath($request), '/');
     }
 
     /**

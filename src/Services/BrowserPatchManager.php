@@ -76,17 +76,19 @@ class BrowserPatchManager
     protected function buildEarlyPatchScript(string $localOrigin): string
     {
         $jsonOrigin = json_encode(rtrim($localOrigin, '/'), JSON_UNESCAPED_SLASHES);
+        $backendPrefix = json_encode('/' . trim((string) config('mirror.routes.backend_prefix', 'backend-api'), '/') . '/', JSON_UNESCAPED_SLASHES);
 
         return <<<HTML
 <script data-mirror-patch="early">
 (function(){
   try {
     var localOrigin = {$jsonOrigin} || window.location.origin;
+    var backendPrefix = {$backendPrefix};
     var localWs = localOrigin.replace(/^http/i, 'ws');
     function rewriteUrl(u) {
       if (typeof u !== 'string') return u;
       if (u.indexOf('/__codex-api/') !== -1) {
-        u = u.replace(/\/__codex-api\//g, '/backend-api/');
+        u = u.replace(/\/__codex-api\//g, backendPrefix);
       }
       u = u.replace(/^https:\/\/(?:chat\.openai\.com|chatgpt\.com)/i, localOrigin);
       u = u.replace(/^https:\/\/cdn\.oaistatic\.com/i, localOrigin + '/cdn');

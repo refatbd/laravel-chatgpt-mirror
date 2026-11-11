@@ -30,7 +30,12 @@ class PlaygroundController extends Controller
         }
 
         $html = (string) file_get_contents($htmlPath);
-        $html = str_replace('src="/mirror/assets/', 'src="/mirror/assets/', $html);
+        $basePath = rtrim($this->security->resolveBasePath($request), '/');
+        $assetsPrefix = trim((string) config('mirror.routes.assets_prefix', 'mirror/assets'), '/');
+        $targetAssetBase = $basePath . '/' . $assetsPrefix . '/';
+        if ($targetAssetBase !== '/mirror/assets/') {
+            $html = str_replace('"/mirror/assets/', '"' . $targetAssetBase, $html);
+        }
 
         $response = response($html, 200, [
             'Content-Type' => 'text/html; charset=utf-8',

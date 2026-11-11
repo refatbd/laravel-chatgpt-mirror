@@ -80,23 +80,28 @@ MIRROR_COOLDOWN_SECONDS=60
 MIRROR_TIMEOUT=90
 MIRROR_CONNECT_TIMEOUT=10
 
-# Route Prefixes
+# Route Prefixes (Everything configurable; never hardcoded)
 MIRROR_OPENAI_PREFIX=v1
 MIRROR_ADMIN_PREFIX=mirror/admin
+MIRROR_PLAYGROUND_PREFIX=mirror/playground
+MIRROR_ASSETS_PREFIX=mirror/assets
+MIRROR_DOCS_PREFIX=mirror
 MIRROR_BROWSER_PREFIX=
-MIRROR_BACKEND_PREFIX=backend-api
+MIRROR_BACKEND_PREFIX=__codex-api
 
-# Universal Web Server & Reverse Proxy Settings
+# Universal Web Server & Reverse Proxy Settings (Live-editable in /mirror/admin)
 MIRROR_SERVER_PLATFORM=auto
 MIRROR_TRUST_PROXIES=true
 MIRROR_TRUSTED_PROXIES=*
-MIRROR_FORCE_HTTPS=false
+MIRROR_FORCE_HTTPS=auto
 MIRROR_STREAM_MAX_EXECUTION_TIME=0
 MIRROR_DISABLE_OUTPUT_COMPRESSION=true
 
-# Redis Cache & Distributed Locks (Recommended for multi-worker PHP-FPM / Octane)
-MIRROR_CACHE_STORE=mirror_redis
-MIRROR_REDIS_CLIENT=phpredis
+# Dynamic Redis Configuration (Optional — auto-detects or toggle live in /mirror/admin)
+# Modes: auto (use when available) | enabled (prefer Redis, fallback if down) | disabled (no Redis)
+MIRROR_REDIS_ENABLED=auto
+MIRROR_CACHE_STORE=
+MIRROR_REDIS_CLIENT=auto
 MIRROR_REDIS_HOST=127.0.0.1
 MIRROR_REDIS_PORT=6379
 MIRROR_REDIS_PASSWORD=
@@ -107,41 +112,41 @@ MIRROR_REDIS_DB=0
 
 ## 🌐 Universal Production Deployment & Redis
 
-`laravel-chatgpt-mirror` automatically adapts to whichever web server and PHP runtime you run in production, and gracefully falls back to your default cache store if Redis is absent locally:
+`laravel-chatgpt-mirror` automatically adapts to whichever web server and PHP runtime you run in production, and dynamically adjusts at runtime via `.env` or the **Dynamic Server, Proxy & Redis Configuration** panel inside `/mirror/admin` (REST API: `GET/PUT/DELETE /api/settings/runtime` & `POST /api/settings/runtime/test-redis`):
 
 * **Bearer Auth Header Normalization (`PrepareMirrorRuntime`):** Automatically restores `Authorization` from `REDIRECT_HTTP_AUTHORIZATION` / `HTTP_AUTHORIZATION` under Apache CGI / FastCGI / PHP-FPM, plus `X-API-Key` and `?api_key=`.
-* **Reverse Proxy & HTTPS Detection:** Detects TLS and public origin cleanly behind Cloudflare, Nginx, Caddy, Load Balancers, and Webuzo Apache via `X-Forwarded-Proto`, `X-Forwarded-Host`, `Front-End-Https`, `CF-Visitor`, and RFC 7239 `Forwarded` without leaking static Symfony trusted-proxy state in Octane/FrankenPHP workers.
+* **Reverse Proxy, Subdirectory & HTTPS Detection:** Detects TLS, `X-Forwarded-Prefix` subpaths, and public origin cleanly behind Cloudflare, Nginx, Caddy, Load Balancers, and Webuzo Apache via `X-Forwarded-Proto`, `X-Forwarded-Host`, `Front-End-Https`, `CF-Visitor`, and RFC 7239 `Forwarded` without leaking static Symfony trusted-proxy state in Octane/FrankenPHP workers.
 * **Unbuffered SSE Across All Servers:** Sends `X-Accel-Buffering: no`, `X-LiteSpeed-Cache-Control: no-cache`, `Content-Encoding: none`, `Cache-Control: no-cache, no-store, must-revalidate, no-transform`, disables `zlib.output_compression` on stream routes, and lifts `max_execution_time` cleanly for long reasoning responses.
-* **Multi-Worker Concurrency & Redis:**
-  * Atomic SQL `tryAcquireSlot()` prevents concurrency overshoot across parallel PHP-FPM/Octane workers.
-  * Redis-backed distributed locks guard `ensureTokenFreshness()` and static `.env` bootstrap inserts so parallel workers do not stampede upstream token refreshes.
-  * Redis caches `/v1/models`, `/api/models`, `/api/gpts`, runtime settings, decoder challenges, and origin-scoped static proxy assets (`storage` fallback preserved).
+* **Optional / Dynamic Redis & Multi-Worker Concurrency:**
+  * Enable, disable, or test Redis (`auto`, `enabled`, `disabled`, host/port/url/password/DB, `auto`/`phpredis`/`predis`) live from `/mirror/admin` without touching `.env` or restarting PHP-FPM.
+  * When Redis is absent, disabled, or temporarily unreachable, the app runs seamlessly using Laravel's fallback cache store and atomic SQL `tryAcquireSlot()`.
+  * When Redis is active, distributed locks guard `ensureTokenFreshness()` and cache `/v1/models`, `/api/models`, `/api/gpts`, runtime settings, decoder challenges, and origin-scoped static proxy assets.
 
 ### Server-Specific Setup CLI
 
-Run the built-in server setup assistant at any time:
+Run the built-in server setup assistant with dynamic flags at any time:
 
 ```bash
 # Publish Apache/Webuzo, Nginx, and Caddy templates to deploy/mirror/
 php artisan vendor:publish --tag=mirror-deploy
 
 # Webuzo / Apache / LiteSpeed: idempotently update public/.htaccess + inspect VirtualHost directives
-php artisan mirror:server apache --write --vhost
+php artisan mirror:server apache --write --vhost --domain=api.example.com --root=/home/user/public_html/public
 # (Or using the alias:)
 php artisan mirror:apache --write --vhost
 
-# Nginx / Caddy / FrankenPHP / Octane: print production server snippet
-php artisan mirror:server nginx --vhost
-php artisan mirror:server caddy --vhost
-php artisan mirror:server octane --vhost
+# Nginx / Caddy / FrankenPHP / Octane: print production server snippet with your domain, root & PHP version
+php artisan mirror:server nginx --vhost --domain=api.example.com --root=/var/www/app/public --php-version=8.4
+php artisan mirror:server caddy --vhost --domain=api.example.com --root=/var/www/app/public
+php artisan mirror:server octane --vhost --host=0.0.0.0 --port=8000
 
-# Verify Redis ping, locks, PHP runtime flags, and upstream reachability
+# Verify Redis mode/ping, dynamic overrides, locks, PHP runtime flags, and upstream reachability
 php artisan mirror:health
 ```
 
 > **Webuzo Panel + Apache Quick Note:** After running `php artisan mirror:server apache --write`, also paste the printed directives (`AllowEncodedSlashes NoDecode`, `CGIPassAuth On`, `Timeout 300`) into **Webuzo → Apache Extra Configuration / Custom VirtualHost Include** so `%2F` URLs and long SSE streams work cleanly.
 >
-> **Redis Client:** Install either PHP's `redis` extension (`phpredis`, enabled in PHP extensions in Webuzo/cPanel) or `composer require predis/predis`. Even before Redis is configured, the package stays operational using Laravel's configured cache store.
+> **Redis Client:** Install either PHP's `redis` extension (`phpredis`, enabled in PHP extensions in Webuzo/cPanel) or `composer require predis/predis`, then toggle Redis live in **Admin Dashboard (`/mirror/admin`) → Dynamic Server, Proxy & Redis Configuration** (`Save & Apply Live Settings` / `Test Redis Connection`). Even without Redis installed, the project runs cleanly out of the box.
 
 ---
 

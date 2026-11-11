@@ -8,6 +8,7 @@ use Illuminate\Support\Facades\Config;
 use Mockery;
 use Refatbd\LaravelChatGptMirror\Models\MirrorSetting;
 use Refatbd\LaravelChatGptMirror\Models\MirrorToken;
+use Refatbd\LaravelChatGptMirror\Services\DynamicConfigService;
 use Refatbd\LaravelChatGptMirror\Services\MirrorCache;
 use Refatbd\LaravelChatGptMirror\Services\TokenPoolManager;
 use Refatbd\LaravelChatGptMirror\Services\TokenRefresher;
@@ -163,5 +164,78 @@ class RedisAndConcurrencySupportTest extends TestCase
 
         MirrorSetting::setValue('pool.notice', 'updated');
         $this->assertSame('updated', MirrorSetting::getValue('pool.notice'));
+    }
+
+    public function test_dynamic_config_service_toggles_redis_without_env_masks_secrets_and_resets_cleanly(): void
+    {
+        $dynamic = $this->app->make(DynamicConfigService::class);
+        $cache = $this->app->make(MirrorCache::class);
+
+        $dynamic->ensureApplied();
+        $initial = $dynamic->publicState();
+        $this->assertSame('auto', $initial['redis']['enabled']);
+        $this->assertSame('auto', $initial['redis']['client']);
+
+        // 1. Disabling Redis must force non-Redis operation even when host/URL are provided,
+        // and publicState() must mask Redis URL credentials cleanly.
+        $dynamic->saveOverrides([
+            'redis_enabled' => 'disabled',
+            'redis_host' => '10.10.0.5',
+            'redis_password' => 'super-secret-pw-123',
+            'redis_url' => 'redis://default:urlsecret99@10.10.0.5:6379/1',
+        ]);
+
+        $this->assertFalse($cache->isRedisDesired());
+        $disabledDiag = $cache->diagnostics();
+        $this->assertSame('disabled', $disabledDiag['redis_mode']);
+        $this->assertFalse($disabledDiag['redis_desired']);
+        $this->assertFalse($disabledDiag['redis_active']);
+
+        $maskedState = $dynamic->publicState();
+        $this->assertTrue($maskedState['redis']['has_password']);
+        $this->assertStringContainsString('://***@', $maskedState['redis']['url']);
+        $this->assertStringNotContainsString('urlsecret99', $maskedState['redis']['url']);
+        $this->assertStringNotContainsString('super-secret-pw-123', json_encode($maskedState) ?: '');
+
+        // 2. Enabling Redis dynamically via DB configures mirror_redis + database.redis.mirror live without .env.
+        $dynamic->saveOverrides([
+            'redis_enabled' => 'enabled',
+            'redis_client' => 'predis',
+            'redis_host' => '127.0.0.1',
+            'redis_port' => 6385,
+            'redis_database' => 3,
+            'server_platform' => 'nginx',
+            'pool_strategy' => 'round_robin',
+        ]);
+
+        $this->assertTrue($cache->isRedisDesired());
+        $this->assertSame('enabled', config('mirror.redis.enabled'));
+        $this->assertSame('mirror_redis', $cache->configuredStoreName());
+        $this->assertSame('mirror', config('cache.stores.mirror_redis.connection'));
+        $this->assertSame('predis', config('database.redis.client'));
+        $this->assertSame('127.0.0.1', config('database.redis.mirror.host'));
+        $this->assertSame(6385, config('database.redis.mirror.port'));
+        $this->assertSame(3, config('database.redis.mirror.database'));
+        $this->assertSame('nginx', config('mirror.server.platform'));
+        $this->assertSame('round_robin', config('mirror.pool.strategy'));
+
+        // 3. Test Redis connection never crashes with uncaught exceptions when unreachable/missing driver.
+        $probe = $dynamic->testRedisConnection([
+            'redis_host' => '127.0.0.1',
+            'redis_port' => 16399,
+            'redis_client' => 'predis',
+        ]);
+        $this->assertIsArray($probe);
+        $this->assertArrayHasKey('ok', $probe);
+        $this->assertArrayHasKey('latency_ms', $probe);
+        $this->assertArrayHasKey('error', $probe);
+        $this->assertSame(16399, $probe['port']);
+
+        // 4. Resetting overrides restores original .env / config baseline cleanly.
+        $dynamic->resetOverrides();
+        $resetState = $dynamic->publicState();
+        $this->assertSame(0, $resetState['overrides_active']);
+        $this->assertSame('auto', config('mirror.redis.enabled'));
+        $this->assertSame('least_busy', config('mirror.pool.strategy'));
     }
 }

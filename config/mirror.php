@@ -65,6 +65,9 @@ return [
         'browser_prefix' => env('MIRROR_BROWSER_PREFIX', ''),
         'backend_prefix' => env('MIRROR_BACKEND_PREFIX', 'backend-api'),
         'admin_prefix' => env('MIRROR_ADMIN_PREFIX', 'mirror/admin'),
+        'playground_prefix' => env('MIRROR_PLAYGROUND_PREFIX', 'mirror/playground'),
+        'assets_prefix' => env('MIRROR_ASSETS_PREFIX', 'mirror/assets'),
+        'docs_prefix' => env('MIRROR_DOCS_PREFIX', 'mirror'),
         'middleware' => ['api'],
     ],
 
@@ -96,12 +99,13 @@ return [
     ],
 
     'redis' => [
-        'client' => env('MIRROR_REDIS_CLIENT', env('REDIS_CLIENT', extension_loaded('redis') ? 'phpredis' : 'predis')),
+        'enabled' => env('MIRROR_REDIS_ENABLED', 'auto'), // auto | enabled | disabled
+        'client' => env('MIRROR_REDIS_CLIENT', 'auto'), // auto | phpredis | predis
         'url' => env('MIRROR_REDIS_URL'),
         'host' => env('MIRROR_REDIS_HOST'),
         'port' => (int) env('MIRROR_REDIS_PORT', 6379),
         'password' => env('MIRROR_REDIS_PASSWORD'),
-        'database' => (int) env('MIRROR_REDIS_DB', 1),
+        'database' => (int) env('MIRROR_REDIS_DB', 0),
         'persistent' => env('MIRROR_REDIS_PERSISTENT', true),
     ],
 

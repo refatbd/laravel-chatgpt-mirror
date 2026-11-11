@@ -17,8 +17,9 @@ use Refatbd\LaravelChatGptMirror\Http\Middleware\ValidateApiKey;
 
 $openaiPrefix = trim((string) config('mirror.routes.openai_prefix', 'v1'), '/');
 $backendPrefix = trim((string) config('mirror.routes.backend_prefix', 'backend-api'), '/');
+$docsPrefix = trim((string) config('mirror.routes.docs_prefix', 'mirror'), '/');
 
-Route::middleware([PrepareMirrorRuntime::class])->group(function () use ($openaiPrefix, $backendPrefix): void {
+Route::middleware([PrepareMirrorRuntime::class])->group(function () use ($openaiPrefix, $backendPrefix, $docsPrefix): void {
 
 // 1. OpenAI-compatible Gateway (/v1/*)
 Route::prefix($openaiPrefix)->group(function () {
@@ -46,6 +47,10 @@ Route::middleware([ProtectControlEndpoints::class])->group(function () {
     Route::put('/api/settings/default-system-instructions', [PlaygroundController::class, 'saveDefaultInstructions']);
     Route::get('/api/settings/hotkeys', [PlaygroundController::class, 'getHotkeys']);
     Route::put('/api/settings/hotkeys', [PlaygroundController::class, 'saveHotkeys']);
+    Route::get('/api/settings/runtime', [AdminController::class, 'getRuntimeSettings']);
+    Route::put('/api/settings/runtime', [AdminController::class, 'putRuntimeSettings']);
+    Route::post('/api/settings/runtime/test-redis', [AdminController::class, 'testRedis']);
+    Route::delete('/api/settings/runtime', [AdminController::class, 'resetRuntimeSettings']);
 
     Route::get('/api/models', [MirrorApiController::class, 'models']);
     Route::get('/api/gpts', [MirrorApiController::class, 'gpts']);
@@ -101,9 +106,10 @@ Route::middleware([ProtectControlEndpoints::class])->group(function () {
 });
 
 // 5. OpenAPI Schema & Interactive Swagger UI Docs
-Route::get('/mirror/openapi', [ApiDocsController::class, 'openapi']);
-Route::get('/mirror/api-docs', [ApiDocsController::class, 'ui']);
-Route::get('/mirror/api-docs/{file}', [ApiDocsController::class, 'asset'])
+$docsBase = $docsPrefix !== '' ? ('/' . $docsPrefix) : '';
+Route::get($docsBase . '/openapi', [ApiDocsController::class, 'openapi']);
+Route::get($docsBase . '/api-docs', [ApiDocsController::class, 'ui']);
+Route::get($docsBase . '/api-docs/{file}', [ApiDocsController::class, 'asset'])
     ->where('file', '[A-Za-z0-9._-]+');
 
 // 6. Proxied ChatGPT Backend Endpoints

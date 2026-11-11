@@ -15,14 +15,50 @@ use Illuminate\Support\Facades\Redis;
  */
 class MirrorCache
 {
+    public function isRedisDesired(): bool
+    {
+        $raw = config('mirror.redis.enabled', 'auto');
+        if (is_bool($raw)) {
+            $mode = $raw ? 'enabled' : 'disabled';
+        } else {
+            $val = strtolower(trim((string) $raw));
+            $mode = match ($val) {
+                '1', 'true', 'yes', 'on', 'enabled', 'enable' => 'enabled',
+                '0', 'false', 'no', 'off', 'disabled', 'disable' => 'disabled',
+                default => 'auto',
+            };
+        }
+
+        if ($mode === 'disabled') {
+            return false;
+        }
+
+        if ($mode === 'enabled') {
+            return true;
+        }
+
+        $explicitStore = is_string(config('mirror.cache.store')) ? trim((string) config('mirror.cache.store')) : '';
+        if ($explicitStore === 'mirror_redis' || $explicitStore === 'redis') {
+            return true;
+        }
+
+        return !empty(config('mirror.redis.host')) || !empty(config('mirror.redis.url'));
+    }
+
     public function configuredStoreName(): string
     {
         $configured = config('mirror.cache.store');
-        if (is_string($configured) && trim($configured) !== '') {
-            return trim($configured);
+        $configuredStr = is_string($configured) ? trim($configured) : '';
+
+        if (!$this->isRedisDesired() && ($configuredStr === 'mirror_redis' || $configuredStr === 'redis')) {
+            return (string) config('cache.default', 'array');
         }
 
-        if (config('mirror.redis.host') || config('mirror.redis.url')) {
+        if ($configuredStr !== '') {
+            return $configuredStr;
+        }
+
+        if ($this->isRedisDesired()) {
             return 'mirror_redis';
         }
 
@@ -206,6 +242,10 @@ class MirrorCache
         return [
             'configured_store' => $configured,
             'driver' => $driver,
+            'redis_mode' => is_bool(config('mirror.redis.enabled', 'auto'))
+                ? (config('mirror.redis.enabled') ? 'enabled' : 'disabled')
+                : (string) config('mirror.redis.enabled', 'auto'),
+            'redis_desired' => $this->isRedisDesired(),
             'redis_active' => $this->isRedisActive() && $connected,
             'redis_reachable' => $this->isRedisActive() ? $connected : false,
             'redis_ping' => $redisPing,
