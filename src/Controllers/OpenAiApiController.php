@@ -11,6 +11,7 @@ use Refatbd\LaravelChatGptMirror\Exceptions\UpstreamRequestException;
 use Refatbd\LaravelChatGptMirror\Services\ChatGptClient;
 use Refatbd\LaravelChatGptMirror\Services\ConversationService;
 use Refatbd\LaravelChatGptMirror\Services\FailureTracker;
+use Refatbd\LaravelChatGptMirror\Services\MirrorCache;
 use Refatbd\LaravelChatGptMirror\Services\ResponsesWriter;
 use Refatbd\LaravelChatGptMirror\Services\RichOutputService;
 use Refatbd\LaravelChatGptMirror\Services\SecurityService;
@@ -34,8 +35,16 @@ class OpenAiApiController extends Controller
         protected RichOutputService $richOutput,
         protected ToolBridgeService $toolBridge,
         protected FailureTracker $failures,
-        protected SecurityService $security
-    ) {}
+        protected SecurityService $security,
+        protected ?MirrorCache $cache = null
+    ) {
+        $this->cache ??= app()->bound(MirrorCache::class) ? app(MirrorCache::class) : new MirrorCache();
+    }
+
+    protected function cache(): MirrorCache
+    {
+        return $this->cache ??= app()->bound(MirrorCache::class) ? app(MirrorCache::class) : new MirrorCache();
+    }
 
     public function models(): Response
     {
@@ -52,14 +61,19 @@ class OpenAiApiController extends Controller
         }
 
         try {
-            $models = $this->client->getModels($token);
+            $ttl = max(0, (int) config('mirror.cache.models_ttl', 300));
+            $cacheKey = 'models:' . $token->getEffectiveAccountId();
+            $models = $ttl > 0
+                ? $this->cache()->remember($cacheKey, $ttl, fn (): array => $this->client->getModels($token))
+                : $this->client->getModels($token);
+
             $data = array_map(fn (array $m) => [
                 'id' => (string) ($m['slug'] ?? 'auto'),
                 'object' => 'model',
                 'created' => 1715367049,
                 'owned_by' => 'openai',
                 'title' => $m['title'] ?? $m['slug'],
-            ], $models);
+            ], is_array($models) ? $models : []);
 
             return response()->json([
                 'object' => 'list',
@@ -163,7 +177,7 @@ class OpenAiApiController extends Controller
         );
 
         $chatId = 'chatcmpl-' . Str::random(24);
-        $baseUrl = $request->getSchemeAndHttpHost();
+        $baseUrl = $this->security->resolveOrigin($request);
 
         if ($stream) {
             return $this->handleStreamResponse(
@@ -264,6 +278,16 @@ class OpenAiApiController extends Controller
             $richOutput,
             $failures
         ): void {
+            if (!app()->runningUnitTests()) {
+                $execTime = max(0, (int) config('mirror.server.stream_max_execution_time', 0));
+                if (function_exists('set_time_limit')) {
+                    @set_time_limit($execTime);
+                }
+                if (config('mirror.server.disable_output_compression', true)) {
+                    @ini_set('zlib.output_compression', '0');
+                }
+            }
+
             if ($responsesWriter) {
                 echo $responsesWriter->openStreamEvents();
                 $this->flushBuffers();
@@ -380,12 +404,7 @@ class OpenAiApiController extends Controller
             } finally {
                 $pool->release($token, $success);
             }
-        }, 200, [
-            'Content-Type' => 'text/event-stream; charset=utf-8',
-            'Cache-Control' => 'no-cache, no-transform',
-            'X-Accel-Buffering' => 'no',
-            'X-Request-Id' => $requestId,
-        ]);
+        }, 200, $this->security->streamingHeaders($requestId));
     }
 
     /**

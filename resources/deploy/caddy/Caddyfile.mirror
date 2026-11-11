@@ -1,0 +1,19 @@
+# ==============================================================================
+# Laravel ChatGPT Mirror — Caddy / FrankenPHP Snippet
+# ==============================================================================
+
+YOUR_DOMAIN.COM {
+    root * /var/www/YOUR_APP/public
+    encode zstd gzip
+
+    # Reverse proxy / PHP-FPM unbuffered handling for SSE & ChatGPT endpoints
+    @sse_paths path /v1/* /api/chat* /backend-api/* /__codex-api/*
+    handle @sse_paths {
+        php_fastcgi 127.0.0.1:9000 {
+            flush_interval -1
+        }
+    }
+
+    php_fastcgi 127.0.0.1:9000
+    file_server
+}

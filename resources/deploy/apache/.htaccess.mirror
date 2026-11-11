@@ -1,0 +1,47 @@
+# ==============================================================================
+# Laravel ChatGPT Mirror — Production Apache (.htaccess) Rules for Webuzo
+# Place these directives inside your Laravel `public/.htaccess` (or run
+# `php artisan mirror:apache --write`) so Apache + PHP-FPM handles:
+#   1. Bearer Authorization header forwarding (/v1/*, /api/*)
+#   2. Unbuffered real-time SSE streaming (disables mod_deflate / mod_brotli)
+#   3. Laravel front-controller routing
+# ==============================================================================
+
+# 1. Disable Apache gzip/brotli buffering on Server-Sent Events (SSE) & gateway routes
+<IfModule mod_env.c>
+    SetEnvIfNoCase Request_URI "^/?(v1|api/chat|backend-api|__codex-api)/" no-gzip=1 dont-vary=1 MIRROR_SSE=1
+</IfModule>
+
+<IfModule mod_headers.c>
+    <FilesMatch "^index\.php$">
+        Header unset ETag
+    </FilesMatch>
+    # Ensure Apache/upstream proxies never buffer SSE frames
+    Header always set X-Accel-Buffering "no" env=MIRROR_SSE
+</IfModule>
+
+<IfModule mod_rewrite.c>
+    <IfModule mod_negotiation.c>
+        Options -MultiViews -Indexes
+    </IfModule>
+
+    RewriteEngine On
+
+    # 2. Preserve Authorization Header under Webuzo Apache + PHP-FPM / FastCGI
+    RewriteCond %{HTTP:Authorization} .
+    RewriteRule .* - [E=HTTP_AUTHORIZATION:%{HTTP:Authorization}]
+
+    <IfModule mod_setenvif.c>
+        SetEnvIfNoCase ^Authorization$ "(.+)" HTTP_AUTHORIZATION=$1
+    </IfModule>
+
+    # 3. Redirect Trailing Slashes if not a folder
+    RewriteCond %{REQUEST_FILENAME} !-d
+    RewriteCond %{REQUEST_URI} (.+)/$
+    RewriteRule ^ %1 [L,R=301]
+
+    # 4. Route all application requests cleanly to Laravel Front Controller
+    RewriteCond %{REQUEST_FILENAME} !-d
+    RewriteCond %{REQUEST_FILENAME} !-f
+    RewriteRule ^ index.php [L]
+</IfModule>

@@ -6,6 +6,7 @@ namespace Refatbd\LaravelChatGptMirror\Controllers;
 
 use Illuminate\Http\Request;
 use Illuminate\Routing\Controller;
+use Refatbd\LaravelChatGptMirror\Services\SecurityService;
 use Symfony\Component\HttpFoundation\Response;
 use Symfony\Component\Yaml\Yaml;
 
@@ -14,6 +15,17 @@ use Symfony\Component\Yaml\Yaml;
  */
 class ApiDocsController extends Controller
 {
+    public function __construct(
+        protected ?SecurityService $security = null
+    ) {
+        $this->security ??= app()->bound(SecurityService::class) ? app(SecurityService::class) : new SecurityService();
+    }
+
+    protected function security(): SecurityService
+    {
+        return $this->security ??= app()->bound(SecurityService::class) ? app(SecurityService::class) : new SecurityService();
+    }
+
     public function openapi(Request $request): Response
     {
         $format = strtolower((string) $request->query('format', 'json'));
@@ -27,7 +39,7 @@ class ApiDocsController extends Controller
             ], 400);
         }
 
-        $doc = $this->buildOpenApiDocument($request->getSchemeAndHttpHost());
+        $doc = $this->buildOpenApiDocument($this->security()->resolveOrigin($request));
 
         if ($format === 'yaml') {
             $yaml = class_exists(Yaml::class)

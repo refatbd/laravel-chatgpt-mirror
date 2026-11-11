@@ -6,10 +6,13 @@ use Illuminate\Support\Facades\Route;
 use Refatbd\LaravelChatGptMirror\Controllers\AdminController;
 use Refatbd\LaravelChatGptMirror\Controllers\BrowserProxyController;
 use Refatbd\LaravelChatGptMirror\Controllers\PlaygroundController;
+use Refatbd\LaravelChatGptMirror\Http\Middleware\PrepareMirrorRuntime;
 use Refatbd\LaravelChatGptMirror\Http\Middleware\ProtectControlEndpoints;
 
 $browserPrefix = trim((string) config('mirror.routes.browser_prefix', ''), '/');
 $adminPrefix = trim((string) config('mirror.routes.admin_prefix', 'mirror/admin'), '/');
+
+Route::middleware([PrepareMirrorRuntime::class])->group(function () use ($browserPrefix, $adminPrefix): void {
 
 // 1. Built-in Playground UI & Static Assets
 Route::get('/mirror/playground', [PlaygroundController::class, 'index']);
@@ -49,3 +52,5 @@ Route::prefix($browserPrefix)->group(function () {
 // 4. Catch-All Browser Proxy Fallback (for /sentinel/*, /g/*, /share/*, /realtime/*, unknown ChatGPT frontend routes)
 Route::any('/{path}', [BrowserProxyController::class, 'proxy'])
     ->where('path', '^(?!api(?:/|$)|v1(?:/|$)|mirror(?:/|$)|backend-api(?:/|$)|__codex-api(?:/|$)).+');
+
+});

@@ -11,11 +11,14 @@ use Refatbd\LaravelChatGptMirror\Controllers\DecoderChallengeController;
 use Refatbd\LaravelChatGptMirror\Controllers\MirrorApiController;
 use Refatbd\LaravelChatGptMirror\Controllers\OpenAiApiController;
 use Refatbd\LaravelChatGptMirror\Controllers\PlaygroundController;
+use Refatbd\LaravelChatGptMirror\Http\Middleware\PrepareMirrorRuntime;
 use Refatbd\LaravelChatGptMirror\Http\Middleware\ProtectControlEndpoints;
 use Refatbd\LaravelChatGptMirror\Http\Middleware\ValidateApiKey;
 
 $openaiPrefix = trim((string) config('mirror.routes.openai_prefix', 'v1'), '/');
 $backendPrefix = trim((string) config('mirror.routes.backend_prefix', 'backend-api'), '/');
+
+Route::middleware([PrepareMirrorRuntime::class])->group(function () use ($openaiPrefix, $backendPrefix): void {
 
 // 1. OpenAI-compatible Gateway (/v1/*)
 Route::prefix($openaiPrefix)->group(function () {
@@ -109,3 +112,5 @@ Route::any('/' . $backendPrefix . '/{path}', [BackendApiController::class, 'prox
 
 Route::any('/__codex-api/{path}', [BackendApiController::class, 'proxy'])
     ->where('path', '.*');
+
+});

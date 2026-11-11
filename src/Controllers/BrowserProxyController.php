@@ -7,9 +7,9 @@ namespace Refatbd\LaravelChatGptMirror\Controllers;
 use GuzzleHttp\Client;
 use Illuminate\Http\Request;
 use Illuminate\Routing\Controller;
-use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\File;
 use Refatbd\LaravelChatGptMirror\Services\BrowserPatchManager;
+use Refatbd\LaravelChatGptMirror\Services\MirrorCache;
 use Refatbd\LaravelChatGptMirror\Services\SecurityService;
 use Refatbd\LaravelChatGptMirror\Services\TokenPoolManager;
 use Refatbd\LaravelChatGptMirror\Services\UrlRewriter;
@@ -27,17 +27,20 @@ class BrowserProxyController extends Controller
     protected UrlRewriter $rewriter;
     protected TokenPoolManager $pool;
     protected SecurityService $security;
+    protected MirrorCache $cache;
 
     public function __construct(
         BrowserPatchManager $patcher,
         UrlRewriter $rewriter,
         TokenPoolManager $pool,
-        SecurityService $security
+        SecurityService $security,
+        ?MirrorCache $cache = null
     ) {
         $this->patcher = $patcher;
         $this->rewriter = $rewriter;
         $this->pool = $pool;
         $this->security = $security;
+        $this->cache = $cache ?? (app()->bound(MirrorCache::class) ? app(MirrorCache::class) : new MirrorCache());
 
         $this->http = new Client([
             'base_uri' => rtrim((string) config('mirror.upstream', 'https://chatgpt.com'), '/'),
@@ -70,23 +73,43 @@ class BrowserProxyController extends Controller
 
         $query = $request->getQueryString();
         $fullPath = $targetPath . ($query ? '?' . $query : '');
-        $localOrigin = $request->getSchemeAndHttpHost();
+        $localOrigin = $this->security->resolveOrigin($request);
 
-        // Disk cache for immutable static bundles (including query string in cache key!)
+        // Origin-scoped Redis + disk cache for immutable static bundles so HTTP/HTTPS/multi-host rewrites never collide.
         $isStaticAsset = preg_match('#\.(js|css|woff2?|png|jpg|jpeg|gif|svg|ico|json|webp)$#i', $targetPath) === 1;
+        $assetsInRedis = (bool) config('mirror.cache.assets_in_redis', true);
+        $assetsTtl = max(60, (int) config('mirror.cache.assets_ttl', 86400));
+        $assetsMaxBytes = max(1024, (int) config('mirror.cache.assets_redis_max_bytes', 262144));
+
         if ($request->isMethod('get') && $isStaticAsset && !str_starts_with($targetPath, '/api/')) {
-            $cacheKey = md5(($baseOverride ?: '') . $fullPath);
+            $cacheKey = md5($localOrigin . '|' . ($baseOverride ?: '') . $fullPath);
+            $redisKey = 'asset:' . $cacheKey;
+
+            if ($assetsInRedis) {
+                $cached = $this->cache->get($redisKey);
+                if (is_array($cached) && isset($cached['body_b64']) && is_string($cached['body_b64'])) {
+                    $decoded = base64_decode($cached['body_b64'], true);
+                    if (is_string($decoded)) {
+                        $ct = (string) ($cached['content_type'] ?? $this->guessMimeType($targetPath));
+                        return response($decoded, 200, [
+                            'Content-Type' => $ct,
+                            'Cache-Control' => str_contains($ct, 'javascript') ? 'no-store' : 'public, max-age=86400',
+                            'Alt-Svc' => 'clear',
+                        ]);
+                    }
+                }
+            }
+
             $cacheDir = storage_path('framework/mirror-assets');
             $cacheFile = $cacheDir . '/' . $cacheKey;
             $metaFile = $cacheDir . '/' . $cacheKey . '.meta.json';
 
             if (File::exists($cacheFile) && File::exists($metaFile)) {
                 $meta = json_decode((string) File::get($metaFile), true) ?: [];
+                $ct = (string) ($meta['content_type'] ?? $this->guessMimeType($targetPath));
                 return response(File::get($cacheFile), 200, [
-                    'Content-Type' => $meta['content_type'] ?? $this->guessMimeType($targetPath),
-                    'Cache-Control' => str_contains((string) ($meta['content_type'] ?? ''), 'javascript')
-                        ? 'no-store'
-                        : 'public, max-age=86400',
+                    'Content-Type' => $ct,
+                    'Cache-Control' => str_contains($ct, 'javascript') ? 'no-store' : 'public, max-age=86400',
                     'Alt-Svc' => 'clear',
                 ]);
             }
@@ -169,7 +192,14 @@ class BrowserProxyController extends Controller
                 $cleanedHeaders['Cache-Control'] = 'no-store';
             }
 
-            if ($status === 200 && $request->isMethod('get') && $isStaticAsset && isset($cacheFile, $metaFile)) {
+            if ($status === 200 && $request->isMethod('get') && $isStaticAsset && isset($cacheKey, $cacheFile, $metaFile)) {
+                if ($assetsInRedis && strlen($body) <= $assetsMaxBytes) {
+                    $this->cache->put('asset:' . $cacheKey, [
+                        'body_b64' => base64_encode($body),
+                        'content_type' => $contentType,
+                    ], $assetsTtl);
+                }
+
                 try {
                     File::ensureDirectoryExists(dirname($cacheFile));
                     File::put($cacheFile, $body);

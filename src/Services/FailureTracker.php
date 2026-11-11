@@ -16,7 +16,15 @@ use Refatbd\LaravelChatGptMirror\Models\MirrorSetting;
 class FailureTracker
 {
     private const STORAGE_KEY = 'failure_tracker_recent';
+    private const CACHE_KEY = 'failures:recent';
     private const MAX_ENTRIES = 10;
+
+    protected MirrorCache $cache;
+
+    public function __construct(?MirrorCache $cache = null)
+    {
+        $this->cache = $cache ?? new MirrorCache();
+    }
 
     public function record(string $code, ?string $requestId = null, ?string $protocolCategory = null): void
     {
@@ -28,7 +36,9 @@ class FailureTracker
                 'requestId' => $requestId ?: (string) Str::uuid(),
                 'protocolCategory' => $protocolCategory,
             ]);
-            MirrorSetting::setJson(self::STORAGE_KEY, array_slice($entries, 0, self::MAX_ENTRIES));
+            $trimmed = array_slice($entries, 0, self::MAX_ENTRIES);
+            $this->cache->put(self::CACHE_KEY, $trimmed, 3600);
+            MirrorSetting::setJson(self::STORAGE_KEY, $trimmed);
         } catch (\Throwable) {
             // Never let diagnostic persistence crash an API response.
         }
@@ -39,12 +49,20 @@ class FailureTracker
      */
     public function recent(): array
     {
+        $cached = $this->cache->get(self::CACHE_KEY);
+        if (is_array($cached)) {
+            return array_values(array_filter($cached, fn ($row) => is_array($row) && isset($row['code'])));
+        }
+
         $raw = MirrorSetting::getJson(self::STORAGE_KEY, []);
-        return array_values(array_filter($raw, fn ($row) => is_array($row) && isset($row['code'])));
+        $filtered = array_values(array_filter($raw, fn ($row) => is_array($row) && isset($row['code'])));
+        $this->cache->put(self::CACHE_KEY, $filtered, 3600);
+        return $filtered;
     }
 
     public function clear(): void
     {
+        $this->cache->forget(self::CACHE_KEY);
         MirrorSetting::setJson(self::STORAGE_KEY, []);
     }
 

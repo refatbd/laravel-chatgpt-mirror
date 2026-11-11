@@ -6,9 +6,9 @@ namespace Refatbd\LaravelChatGptMirror\Controllers;
 
 use Illuminate\Http\Request;
 use Illuminate\Routing\Controller;
-use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Str;
 use Refatbd\LaravelChatGptMirror\Services\Convert\ConversionFacade;
+use Refatbd\LaravelChatGptMirror\Services\MirrorCache;
 use Refatbd\LaravelChatGptMirror\Services\TokenPoolManager;
 use Symfony\Component\HttpFoundation\Response;
 
@@ -18,7 +18,7 @@ use Symfony\Component\HttpFoundation\Response;
  */
 class DecoderChallengeController extends Controller
 {
-    private const CACHE_PREFIX = 'mirror:decoder_challenge:';
+    private const CACHE_PREFIX = 'decoder_challenge:';
 
     /** @var array<string, string> */
     private const GUIDES = [
@@ -30,8 +30,16 @@ class DecoderChallengeController extends Controller
 
     public function __construct(
         protected ConversionFacade $codecs,
-        protected TokenPoolManager $pool
-    ) {}
+        protected TokenPoolManager $pool,
+        protected ?MirrorCache $cache = null
+    ) {
+        $this->cache ??= app()->bound(MirrorCache::class) ? app(MirrorCache::class) : new MirrorCache();
+    }
+
+    protected function cache(): MirrorCache
+    {
+        return $this->cache ??= app()->bound(MirrorCache::class) ? app(MirrorCache::class) : new MirrorCache();
+    }
 
     public function create(Request $request): Response
     {
@@ -69,14 +77,14 @@ class DecoderChallengeController extends Controller
         $expiresAtMs = (time() + 86400) * 1000;
         $scope = $this->pool->primaryAccountId();
 
-        Cache::put(self::CACHE_PREFIX . $id, [
+        $this->cache()->put(self::CACHE_PREFIX . $id, [
             'scope' => $scope,
             'expectedBase64' => base64_encode($expected),
             'artifactBase64' => base64_encode($artifact),
             'format' => $format,
             'prompt' => $prompt,
             'expiresAtMs' => $expiresAtMs,
-        ], now()->addHours(24));
+        ], 86400);
 
         return response()->json([
             'id' => $id,
@@ -102,7 +110,7 @@ class DecoderChallengeController extends Controller
         $entries = [];
 
         foreach ($ids as $id) {
-            $challenge = Cache::get(self::CACHE_PREFIX . (string) $id);
+            $challenge = $this->cache()->get(self::CACHE_PREFIX . (string) $id);
             if (!is_array($challenge) || ($challenge['scope'] ?? '') !== $scope) {
                 return response()->json(['error' => 'Challenge expired or unavailable. Generate a new one.'], 404);
             }
@@ -129,7 +137,7 @@ class DecoderChallengeController extends Controller
 
     public function artifact(string $id): Response
     {
-        $challenge = Cache::get(self::CACHE_PREFIX . $id);
+        $challenge = $this->cache()->get(self::CACHE_PREFIX . $id);
         if (!is_array($challenge) || ($challenge['scope'] ?? '') !== $this->pool->primaryAccountId()) {
             return response()->json(['error' => 'Challenge expired or unavailable. Generate a new one.'], 404);
         }
@@ -146,7 +154,7 @@ class DecoderChallengeController extends Controller
 
     public function verify(Request $request, string $id): Response
     {
-        $challenge = Cache::get(self::CACHE_PREFIX . $id);
+        $challenge = $this->cache()->get(self::CACHE_PREFIX . $id);
         if (!is_array($challenge) || ($challenge['scope'] ?? '') !== $this->pool->primaryAccountId()) {
             return response()->json(['error' => 'Challenge expired or unavailable. Generate a new one.'], 404);
         }

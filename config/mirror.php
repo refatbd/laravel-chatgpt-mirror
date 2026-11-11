@@ -78,4 +78,46 @@ return [
         'channel' => env('MIRROR_LOG_CHANNEL', 'stack'),
     ],
 
+    /*
+    |--------------------------------------------------------------------------
+    | Redis & High-Concurrency Cache Configuration
+    |--------------------------------------------------------------------------
+    */
+    'cache' => [
+        'store' => env('MIRROR_CACHE_STORE'),
+        'prefix' => env('MIRROR_CACHE_PREFIX', 'mirror:'),
+        'models_ttl' => (int) env('MIRROR_MODELS_CACHE_TTL', 60),
+        'settings_ttl' => (int) env('MIRROR_SETTINGS_CACHE_TTL', 300),
+        'assets_ttl' => (int) env('MIRROR_ASSETS_CACHE_TTL', 3600),
+        'assets_in_redis' => env('MIRROR_CACHE_ASSETS_IN_REDIS', true),
+        'assets_redis_max_bytes' => (int) env('MIRROR_ASSETS_REDIS_MAX_BYTES', 1048576),
+        'lock_ttl' => (int) env('MIRROR_LOCK_TTL', 15),
+        'lock_wait' => (int) env('MIRROR_LOCK_WAIT', 10),
+    ],
+
+    'redis' => [
+        'client' => env('MIRROR_REDIS_CLIENT', env('REDIS_CLIENT', extension_loaded('redis') ? 'phpredis' : 'predis')),
+        'url' => env('MIRROR_REDIS_URL'),
+        'host' => env('MIRROR_REDIS_HOST'),
+        'port' => (int) env('MIRROR_REDIS_PORT', 6379),
+        'password' => env('MIRROR_REDIS_PASSWORD'),
+        'database' => (int) env('MIRROR_REDIS_DB', 1),
+        'persistent' => env('MIRROR_REDIS_PERSISTENT', true),
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | Universal Web Server & Reverse Proxy Runtime Settings
+    | (Supports Apache, Nginx, LiteSpeed/OpenLiteSpeed, Caddy, Octane)
+    |--------------------------------------------------------------------------
+    */
+    'server' => [
+        'platform' => env('MIRROR_SERVER_PLATFORM', 'auto'),
+        'trust_proxies' => env('MIRROR_TRUST_PROXIES', true),
+        'trusted_proxies' => env('MIRROR_TRUSTED_PROXIES', '*'),
+        'force_https' => env('MIRROR_FORCE_HTTPS', null),
+        'stream_max_execution_time' => (int) env('MIRROR_STREAM_MAX_EXECUTION_TIME', 300),
+        'disable_output_compression' => env('MIRROR_DISABLE_OUTPUT_COMPRESSION', true),
+    ],
+
 ];

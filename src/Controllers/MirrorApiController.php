@@ -13,6 +13,8 @@ use Refatbd\LaravelChatGptMirror\Services\AssetTicketService;
 use Refatbd\LaravelChatGptMirror\Services\ChatGptClient;
 use Refatbd\LaravelChatGptMirror\Services\ConversationService;
 use Refatbd\LaravelChatGptMirror\Services\FailureTracker;
+use Refatbd\LaravelChatGptMirror\Services\MirrorCache;
+use Refatbd\LaravelChatGptMirror\Services\SecurityService;
 use Refatbd\LaravelChatGptMirror\Services\StreamTransformer;
 use Refatbd\LaravelChatGptMirror\Services\TokenPoolManager;
 use Symfony\Component\HttpFoundation\Response;
@@ -32,8 +34,23 @@ class MirrorApiController extends Controller
         protected ConversationService $conversations,
         protected StreamTransformer $transformer,
         protected AssetTicketService $tickets,
-        protected FailureTracker $failures
-    ) {}
+        protected FailureTracker $failures,
+        protected ?SecurityService $security = null,
+        protected ?MirrorCache $cache = null
+    ) {
+        $this->security ??= app()->bound(SecurityService::class) ? app(SecurityService::class) : new SecurityService();
+        $this->cache ??= app()->bound(MirrorCache::class) ? app(MirrorCache::class) : new MirrorCache();
+    }
+
+    protected function security(): SecurityService
+    {
+        return $this->security ??= app()->bound(SecurityService::class) ? app(SecurityService::class) : new SecurityService();
+    }
+
+    protected function cache(): MirrorCache
+    {
+        return $this->cache ??= app()->bound(MirrorCache::class) ? app(MirrorCache::class) : new MirrorCache();
+    }
 
     public function models(): Response
     {
@@ -43,7 +60,13 @@ class MirrorApiController extends Controller
         }
 
         try {
-            return response()->json($this->client->getModels($token));
+            $ttl = max(0, (int) config('mirror.cache.models_ttl', 300));
+            $cacheKey = 'models:' . $token->getEffectiveAccountId();
+            $models = $ttl > 0
+                ? $this->cache()->remember($cacheKey, $ttl, fn (): array => $this->client->getModels($token))
+                : $this->client->getModels($token);
+
+            return response()->json($models);
         } finally {
             $this->pool->release($token, true);
         }
@@ -57,7 +80,13 @@ class MirrorApiController extends Controller
         }
 
         try {
-            return response()->json($this->client->getGpts($token));
+            $ttl = max(0, (int) config('mirror.cache.models_ttl', 300));
+            $cacheKey = 'gpts:' . $token->getEffectiveAccountId();
+            $gpts = $ttl > 0
+                ? $this->cache()->remember($cacheKey, $ttl, fn (): array => $this->client->getGpts($token))
+                : $this->client->getGpts($token);
+
+            return response()->json($gpts);
         } finally {
             $this->pool->release($token, true);
         }
@@ -291,6 +320,16 @@ class MirrorApiController extends Controller
             $pool,
             $failures
         ): void {
+            if (!app()->runningUnitTests()) {
+                $execTime = max(0, (int) config('mirror.server.stream_max_execution_time', 0));
+                if (function_exists('set_time_limit')) {
+                    @set_time_limit($execTime);
+                }
+                if (config('mirror.server.disable_output_compression', true)) {
+                    @ini_set('zlib.output_compression', '0');
+                }
+            }
+
             $send = function (string $event, array $data): void {
                 echo "event: {$event}\ndata: " . json_encode($data, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE) . "\n\n";
                 if (ob_get_level() > 0) {
@@ -391,11 +430,7 @@ class MirrorApiController extends Controller
                 $conversations->clearStop($publicId);
                 $pool->release($token, $success);
             }
-        }, 200, [
-            'Content-Type' => 'text/event-stream; charset=utf-8',
-            'Cache-Control' => 'no-cache, no-transform',
-            'X-Accel-Buffering' => 'no',
-        ]);
+        }, 200, $this->security()->streamingHeaders());
     }
 
     public function uploadFile(Request $request): Response

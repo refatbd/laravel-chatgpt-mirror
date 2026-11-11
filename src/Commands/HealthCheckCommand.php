@@ -7,15 +7,16 @@ namespace Refatbd\LaravelChatGptMirror\Commands;
 use GuzzleHttp\Client;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\Schema;
+use Refatbd\LaravelChatGptMirror\Services\MirrorCache;
 use Refatbd\LaravelChatGptMirror\Services\TokenPoolManager;
 
 class HealthCheckCommand extends Command
 {
     protected $signature = 'mirror:health';
 
-    protected $description = 'Check connectivity to ChatGPT upstream, SHA3-512 PoW support, database schema, and pool status';
+    protected $description = 'Check connectivity to ChatGPT upstream, SHA3-512 PoW support, Redis cache/locks, PHP runtime, and pool status';
 
-    public function handle(TokenPoolManager $pool): int
+    public function handle(TokenPoolManager $pool, MirrorCache $cache): int
     {
         $this->info('Running ChatGPT Mirror Health Diagnostics...');
 
@@ -55,6 +56,11 @@ class HealthCheckCommand extends Command
             && Schema::hasTable('mirror_messages');
 
         $stats = $pool->getPoolStats();
+        $cacheDiag = $cache->diagnostics();
+        $zlibOn = filter_var((string) ini_get('zlib.output_compression'), FILTER_VALIDATE_BOOLEAN);
+        $redisStatus = ($cacheDiag['redis_active'] ?? false)
+            ? ('Active (' . ($cacheDiag['redis_ping'] ?? 'PONG') . ', ' . ($cacheDiag['latency_ms'] ?? '?') . 'ms)')
+            : ('Fallback: ' . ($cacheDiag['driver'] ?? 'array') . ' (' . (($cacheDiag['phpredis_loaded'] ?? false) ? 'phpredis loaded' : (($cacheDiag['predis_installed'] ?? false) ? 'predis installed' : 'no redis client')) . ')');
 
         $this->table(
             ['Check', 'Result'],
@@ -63,8 +69,14 @@ class HealthCheckCommand extends Command
                 ['Egress Mode', 'Direct Egress'],
                 ['Public Egress IP', $egressIp],
                 ['Upstream Reachability', $upstreamStatus],
+                ['PHP Runtime / SAPI', PHP_VERSION . ' (' . PHP_SAPI . ')'],
+                ['Server Platform Config', (string) config('mirror.server.platform', 'auto')],
+                ['zlib Output Compression', $zlibOn ? 'Enabled (Auto-disabled during SSE)' : 'Off (SSE Ready)'],
+                ['Stream Timeout Config', ((int) config('mirror.server.stream_max_execution_time', 0)) . 's (PHP ini: ' . ini_get('max_execution_time') . 's)'],
                 ['SHA3-512 PoW Solver', $powSupported ? 'Supported' : 'Missing PHP sha3-512'],
                 ['GD Image Conversion', $gdSupported ? 'Loaded' : 'Missing PHP GD'],
+                ['Cache / Redis Status', $redisStatus],
+                ['Distributed Locks', ($cacheDiag['locks_supported'] ?? false) ? 'Supported' : 'Single-node fallback'],
                 ['Database Tables', $tablesOk ? 'OK' : 'Run migrations'],
                 ['Active Tokens in Pool', "{$stats['active_tokens']} / {$stats['total_tokens']}"],
                 ['Cooldown Tokens', (string) $stats['cooldown_tokens']],

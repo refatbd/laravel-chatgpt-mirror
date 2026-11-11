@@ -2,9 +2,9 @@
 
 [![Latest Version on Packagist](https://img.shields.io/packagist/v/refatbd/laravel-chatgpt-mirror.svg?style=flat-square)](https://packagist.org/packages/refatbd/laravel-chatgpt-mirror)
 [![Software License](https://img.shields.io/badge/license-MIT-brightgreen.svg?style=flat-square)](LICENSE)
-[![Tests Passing](https://img.shields.io/badge/tests-59%20passed-brightgreen.svg?style=flat-square)]()
+[![Tests Passing](https://img.shields.io/badge/tests-passing-brightgreen.svg?style=flat-square)]()
 
-A high-performance **OpenAI-compatible API Gateway**, **Interactive Developer Playground**, and **ChatGPT Web UI Reverse Proxy** for Laravel applications. Designed for **high-concurrency production workloads (100–200+ simultaneous users)** with multi-token pooling, automated load balancing, and **100% Direct Gateway connectivity (No Cloudflare WARP required)**.
+A high-performance **OpenAI-compatible API Gateway**, **Interactive Developer Playground**, and **ChatGPT Web UI Reverse Proxy** for Laravel applications. Designed for **high-concurrency production workloads (100–200+ simultaneous users)** with multi-token pooling, **Redis distributed locks & caching**, **universal web server support (Apache/Webuzo, Nginx, LiteSpeed, Caddy, FrankenPHP, Octane)**, and **100% Direct Gateway connectivity (No Cloudflare WARP required)**.
 
 Developed by [Mostafizur Rahman Refat](https://github.com/refatbd).
 
@@ -82,9 +82,66 @@ MIRROR_CONNECT_TIMEOUT=10
 
 # Route Prefixes
 MIRROR_OPENAI_PREFIX=v1
-MIRROR_BROWSER_PREFIX=mirror
+MIRROR_ADMIN_PREFIX=mirror/admin
+MIRROR_BROWSER_PREFIX=
 MIRROR_BACKEND_PREFIX=backend-api
+
+# Universal Web Server & Reverse Proxy Settings
+MIRROR_SERVER_PLATFORM=auto
+MIRROR_TRUST_PROXIES=true
+MIRROR_TRUSTED_PROXIES=*
+MIRROR_FORCE_HTTPS=false
+MIRROR_STREAM_MAX_EXECUTION_TIME=0
+MIRROR_DISABLE_OUTPUT_COMPRESSION=true
+
+# Redis Cache & Distributed Locks (Recommended for multi-worker PHP-FPM / Octane)
+MIRROR_CACHE_STORE=mirror_redis
+MIRROR_REDIS_CLIENT=phpredis
+MIRROR_REDIS_HOST=127.0.0.1
+MIRROR_REDIS_PORT=6379
+MIRROR_REDIS_PASSWORD=
+MIRROR_REDIS_DB=0
 ```
+
+---
+
+## 🌐 Universal Production Deployment & Redis
+
+`laravel-chatgpt-mirror` automatically adapts to whichever web server and PHP runtime you run in production, and gracefully falls back to your default cache store if Redis is absent locally:
+
+* **Bearer Auth Header Normalization (`PrepareMirrorRuntime`):** Automatically restores `Authorization` from `REDIRECT_HTTP_AUTHORIZATION` / `HTTP_AUTHORIZATION` under Apache CGI / FastCGI / PHP-FPM, plus `X-API-Key` and `?api_key=`.
+* **Reverse Proxy & HTTPS Detection:** Detects TLS and public origin cleanly behind Cloudflare, Nginx, Caddy, Load Balancers, and Webuzo Apache via `X-Forwarded-Proto`, `X-Forwarded-Host`, `Front-End-Https`, `CF-Visitor`, and RFC 7239 `Forwarded` without leaking static Symfony trusted-proxy state in Octane/FrankenPHP workers.
+* **Unbuffered SSE Across All Servers:** Sends `X-Accel-Buffering: no`, `X-LiteSpeed-Cache-Control: no-cache`, `Content-Encoding: none`, `Cache-Control: no-cache, no-store, must-revalidate, no-transform`, disables `zlib.output_compression` on stream routes, and lifts `max_execution_time` cleanly for long reasoning responses.
+* **Multi-Worker Concurrency & Redis:**
+  * Atomic SQL `tryAcquireSlot()` prevents concurrency overshoot across parallel PHP-FPM/Octane workers.
+  * Redis-backed distributed locks guard `ensureTokenFreshness()` and static `.env` bootstrap inserts so parallel workers do not stampede upstream token refreshes.
+  * Redis caches `/v1/models`, `/api/models`, `/api/gpts`, runtime settings, decoder challenges, and origin-scoped static proxy assets (`storage` fallback preserved).
+
+### Server-Specific Setup CLI
+
+Run the built-in server setup assistant at any time:
+
+```bash
+# Publish Apache/Webuzo, Nginx, and Caddy templates to deploy/mirror/
+php artisan vendor:publish --tag=mirror-deploy
+
+# Webuzo / Apache / LiteSpeed: idempotently update public/.htaccess + inspect VirtualHost directives
+php artisan mirror:server apache --write --vhost
+# (Or using the alias:)
+php artisan mirror:apache --write --vhost
+
+# Nginx / Caddy / FrankenPHP / Octane: print production server snippet
+php artisan mirror:server nginx --vhost
+php artisan mirror:server caddy --vhost
+php artisan mirror:server octane --vhost
+
+# Verify Redis ping, locks, PHP runtime flags, and upstream reachability
+php artisan mirror:health
+```
+
+> **Webuzo Panel + Apache Quick Note:** After running `php artisan mirror:server apache --write`, also paste the printed directives (`AllowEncodedSlashes NoDecode`, `CGIPassAuth On`, `Timeout 300`) into **Webuzo → Apache Extra Configuration / Custom VirtualHost Include** so `%2F` URLs and long SSE streams work cleanly.
+>
+> **Redis Client:** Install either PHP's `redis` extension (`phpredis`, enabled in PHP extensions in Webuzo/cPanel) or `composer require predis/predis`. Even before Redis is configured, the package stays operational using Laravel's configured cache store.
 
 ---
 

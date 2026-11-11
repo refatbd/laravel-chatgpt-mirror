@@ -91,10 +91,19 @@ class SecurityService
 
     public function bearerToken(Request $request): ?string
     {
-        $authHeader = (string) $request->header('Authorization', '');
-        if (str_starts_with($authHeader, 'Bearer ')) {
+        $authHeader = (string) ($request->header('Authorization')
+            ?: $request->server('HTTP_AUTHORIZATION')
+            ?: $request->server('REDIRECT_HTTP_AUTHORIZATION')
+            ?: '');
+
+        if (stripos($authHeader, 'Bearer ') === 0) {
             $token = trim(substr($authHeader, 7));
             return $token !== '' ? $token : null;
+        }
+
+        $xApiKey = $request->header('X-API-Key');
+        if (is_string($xApiKey) && trim($xApiKey) !== '') {
+            return trim($xApiKey);
         }
 
         $queryKey = $request->query('api_key');
@@ -103,6 +112,103 @@ class SecurityService
         }
 
         return null;
+    }
+
+    public function isSecureRequest(Request $request): bool
+    {
+        $forced = config('mirror.server.force_https');
+        if ($forced === true || $forced === 'true' || $forced === '1' || $forced === 1) {
+            return true;
+        }
+
+        if ($request->isSecure()) {
+            return true;
+        }
+
+        if (!config('mirror.server.trust_proxies', true)) {
+            return false;
+        }
+
+        $proto = strtolower(trim(explode(',', (string) $request->header('X-Forwarded-Proto', ''))[0]));
+        if ($proto === 'https') {
+            return true;
+        }
+
+        if (strtolower((string) $request->header('Front-End-Https', '')) === 'on'
+            || strtolower((string) $request->header('X-Forwarded-Ssl', '')) === 'on') {
+            return true;
+        }
+
+        $cfVisitor = (string) $request->header('CF-Visitor', '');
+        if ($cfVisitor !== '' && str_contains($cfVisitor, '"scheme":"https"')) {
+            return true;
+        }
+
+        $rfcForwarded = (string) $request->header('Forwarded', '');
+        if ($rfcForwarded !== '' && preg_match('/(?:^|[;,\s])proto\s*=\s*"?https"?/i', $rfcForwarded) === 1) {
+            return true;
+        }
+
+        return false;
+    }
+
+    public function resolveOrigin(Request $request): string
+    {
+        $scheme = $this->isSecureRequest($request) ? 'https' : $request->getScheme();
+        $trustProxies = (bool) config('mirror.server.trust_proxies', true);
+
+        $forwardedHost = $trustProxies
+            ? trim(explode(',', (string) $request->header('X-Forwarded-Host', ''))[0])
+            : '';
+
+        if ($forwardedHost === '' && $trustProxies) {
+            $rfcForwarded = (string) $request->header('Forwarded', '');
+            if ($rfcForwarded !== '' && preg_match('/(?:^|[;,\s])host\s*=\s*"?([^";,\s]+)"?/i', $rfcForwarded, $m) === 1) {
+                $forwardedHost = trim($m[1]);
+            }
+        }
+
+        $host = $forwardedHost !== '' ? $forwardedHost : $request->getHttpHost();
+
+        if ($host === '') {
+            $appUrl = rtrim((string) config('app.url', 'http://127.0.0.1:8000'), '/');
+            return $appUrl !== '' ? $appUrl : 'http://127.0.0.1:8000';
+        }
+
+        if ($trustProxies && !str_contains($host, ':')) {
+            $forwardedPort = trim(explode(',', (string) $request->header('X-Forwarded-Port', ''))[0]);
+            if ($forwardedPort !== '' && ctype_digit($forwardedPort)) {
+                $portInt = (int) $forwardedPort;
+                if (($scheme === 'https' && $portInt !== 443) || ($scheme === 'http' && $portInt !== 80)) {
+                    $host .= ':' . $portInt;
+                }
+            }
+        }
+
+        return $scheme . '://' . $host;
+    }
+
+    /**
+     * Universal unbuffered SSE headers honored by Apache, Nginx, LiteSpeed, Caddy, and CDN proxies.
+     *
+     * @return array<string, string>
+     */
+    public function streamingHeaders(string $requestId = ''): array
+    {
+        $headers = [
+            'Content-Type' => 'text/event-stream; charset=utf-8',
+            'Cache-Control' => 'no-cache, no-store, must-revalidate, no-transform',
+            'Pragma' => 'no-cache',
+            'X-Accel-Buffering' => 'no',
+            'X-LiteSpeed-Cache-Control' => 'no-cache',
+            'Content-Encoding' => 'none',
+        ];
+
+        if ($requestId !== '') {
+            $headers['X-Request-Id'] = $requestId;
+        }
+
+        return $headers;
     }
 
     public function matchesApiKey(?string $candidate): bool
@@ -154,7 +260,7 @@ class SecurityService
             now()->addDays(30)->getTimestamp(),
             '/',
             null,
-            $request->isSecure(),
+            $this->isSecureRequest($request),
             true,
             false,
             Cookie::SAMESITE_LAX

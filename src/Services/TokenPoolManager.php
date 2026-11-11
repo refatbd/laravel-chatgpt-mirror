@@ -6,7 +6,6 @@ namespace Refatbd\LaravelChatGptMirror\Services;
 
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Collection;
-use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Log;
 use Refatbd\LaravelChatGptMirror\Contracts\TokenPoolInterface;
 use Refatbd\LaravelChatGptMirror\Models\MirrorToken;
@@ -14,8 +13,25 @@ use Refatbd\LaravelChatGptMirror\Models\MirrorToken;
 class TokenPoolManager implements TokenPoolInterface
 {
     public function __construct(
-        protected TokenRefresher $refresher
-    ) {}
+        protected TokenRefresher $refresher,
+        protected ?MirrorCache $cache = null
+    ) {
+        $this->cache ??= $this->resolveCache();
+    }
+
+    protected function cache(): MirrorCache
+    {
+        return $this->cache ??= $this->resolveCache();
+    }
+
+    protected function resolveCache(): MirrorCache
+    {
+        if (function_exists('app') && app()->bound(MirrorCache::class)) {
+            return app(MirrorCache::class);
+        }
+
+        return new MirrorCache();
+    }
 
     /**
      * Acquire the best available healthy token for a request.
@@ -32,14 +48,13 @@ class TokenPoolManager implements TokenPoolInterface
     {
         $this->releaseExpiredCooldowns();
 
-        $maxConcurrent = (int) config('mirror.pool.max_concurrent_per_token', 5);
-        $strategy = config('mirror.pool.strategy', 'least_busy');
+        $maxConcurrent = max(1, (int) config('mirror.pool.max_concurrent_per_token', 5));
+        $strategy = (string) config('mirror.pool.strategy', 'least_busy');
 
         if ($preferredTokenId !== null && $preferredTokenId !== '') {
             $preferred = MirrorToken::find($preferredTokenId);
             if ($preferred && $preferred->isHealthy() && $preferred->active_requests < $maxConcurrent) {
-                if ($this->ensureTokenFreshness($preferred)) {
-                    $preferred->incrementActive();
+                if ($this->ensureTokenFreshness($preferred) && $preferred->tryAcquireSlot($maxConcurrent)) {
                     return $preferred;
                 }
             }
@@ -74,27 +89,19 @@ class TokenPoolManager implements TokenPoolInterface
             return null;
         }
 
-        $candidate = $strategy === 'round_robin'
-            ? $this->selectRoundRobin($tokens)
-            : $this->selectLeastBusy($tokens);
+        $ordered = $this->orderCandidates($tokens, $strategy);
 
-        if (!$candidate) {
-            return null;
-        }
-
-        if (!$this->ensureTokenFreshness($candidate)) {
-            $fallback = $tokens->where('id', '!=', $candidate->id)->first(function (MirrorToken $t) {
-                return $this->ensureTokenFreshness($t);
-            });
-
-            if (!$fallback) {
-                return null;
+        foreach ($ordered as $candidate) {
+            if (!$this->ensureTokenFreshness($candidate)) {
+                continue;
             }
-            $candidate = $fallback;
+
+            if ($candidate->tryAcquireSlot($maxConcurrent)) {
+                return $candidate;
+            }
         }
 
-        $candidate->incrementActive();
-        return $candidate;
+        return null;
     }
 
     /**
@@ -126,18 +133,41 @@ class TokenPoolManager implements TokenPoolInterface
         ])->first();
     }
 
-    protected function selectRoundRobin(Collection $tokens): ?MirrorToken
+    /**
+     * Order healthy candidates according to the configured load-balancing strategy.
+     * Returning all candidates in priority order lets acquireForAccount() fail over
+     * cleanly if a token fails refresh or loses an atomic concurrency-slot race.
+     */
+    protected function orderCandidates(Collection $tokens, string $strategy): Collection
     {
-        $sorted = $tokens->sortBy('id')->values();
-        if ($sorted->isEmpty()) {
-            return null;
+        if ($strategy !== 'round_robin') {
+            return $tokens->sortBy([
+                ['active_requests', 'asc'],
+                ['consecutive_errors', 'asc'],
+                ['last_used_at', 'asc'],
+            ])->values();
         }
 
-        $lastIndex = Cache::get('mirror.pool.rr_index', -1);
-        $nextIndex = ($lastIndex + 1) % $sorted->count();
-        Cache::put('mirror.pool.rr_index', $nextIndex, 3600);
+        $sorted = $tokens->sortBy('id')->values();
+        $count = $sorted->count();
+        if ($count <= 1) {
+            return $sorted;
+        }
 
-        return $sorted->get($nextIndex);
+        $seq = max(1, $this->cache()->increment('pool:rr_index', 1, 86400));
+        $startIndex = ($seq - 1) % $count;
+
+        $rotated = new Collection();
+        for ($i = 0; $i < $count; $i++) {
+            $rotated->push($sorted->get(($startIndex + $i) % $count));
+        }
+
+        return $rotated;
+    }
+
+    protected function selectRoundRobin(Collection $tokens): ?MirrorToken
+    {
+        return $this->orderCandidates($tokens, 'round_robin')->first();
     }
 
     public function release(MirrorToken $token, bool $success = true, ?int $tokensUsed = null): void
@@ -162,7 +192,43 @@ class TokenPoolManager implements TokenPoolInterface
             return !empty($token->access_token);
         }
 
-        return $this->refresher->refresh($token);
+        $lockTtl = max(5, (int) config('mirror.cache.lock_ttl', 15));
+        $lockWait = max(1, (int) config('mirror.cache.lock_wait', 5));
+
+        return (bool) $this->cache()->lock("token_refresh:{$token->id}", $lockTtl, function () use ($token): bool {
+            $fresh = MirrorToken::find($token->id);
+            if ($fresh) {
+                $token->setRawAttributes($fresh->getAttributes(), true);
+                if (!$token->needsRefresh()) {
+                    return true;
+                }
+            }
+
+            $ok = $this->refresher->refresh($token);
+            if ($ok) {
+                $this->invalidateDiscoveryCaches($token->getEffectiveAccountId());
+            }
+
+            return $ok;
+        }, $lockWait);
+    }
+
+    public function invalidateDiscoveryCaches(?string $accountId = null): void
+    {
+        $keys = ['models:default', 'gpts:default', 'pool:primary_account'];
+        if ($accountId !== null && $accountId !== '') {
+            $keys[] = "models:{$accountId}";
+            $keys[] = "gpts:{$accountId}";
+        }
+
+        foreach (MirrorToken::query()->pluck('account_id')->filter()->unique() as $aid) {
+            $keys[] = "models:{$aid}";
+            $keys[] = "gpts:{$aid}";
+        }
+
+        foreach (array_unique($keys) as $key) {
+            $this->cache()->forget($key);
+        }
     }
 
     protected function releaseExpiredCooldowns(): void
@@ -203,23 +269,30 @@ class TokenPoolManager implements TokenPoolInterface
             return $existing;
         }
 
-        // Preserve backward compatibility if an old single-token row exists without token_hash.
-        if ($index === 1) {
-            $legacy = MirrorToken::where('name', 'Env Fallback Token')->first();
-            if ($legacy) {
-                if (empty($legacy->token_hash)) {
-                    $legacy->update(['token_hash' => $hash]);
-                }
-                return $legacy;
+        return $this->cache()->lock("sync_static:{$hash}", 10, function () use ($rawToken, $index, $hash): MirrorToken {
+            $rechecked = MirrorToken::where('token_hash', $hash)->first();
+            if ($rechecked) {
+                return $rechecked;
             }
-        }
 
-        return MirrorToken::create([
-            'name' => $index === 1 ? 'Env Fallback Token' : "Env Fallback Token #{$index}",
-            'session_token' => $rawToken,
-            'token_hash' => $hash,
-            'status' => 'active',
-        ]);
+            // Preserve backward compatibility if an old single-token row exists without token_hash.
+            if ($index === 1) {
+                $legacy = MirrorToken::where('name', 'Env Fallback Token')->first();
+                if ($legacy) {
+                    if (empty($legacy->token_hash)) {
+                        $legacy->update(['token_hash' => $hash]);
+                    }
+                    return $legacy;
+                }
+            }
+
+            return MirrorToken::create([
+                'name' => $index === 1 ? 'Env Fallback Token' : "Env Fallback Token #{$index}",
+                'session_token' => $rawToken,
+                'token_hash' => $hash,
+                'status' => 'active',
+            ]);
+        }, 5);
     }
 
     public function getPoolStats(): array

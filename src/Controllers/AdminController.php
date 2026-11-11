@@ -11,6 +11,7 @@ use Illuminate\Support\Str;
 use Refatbd\LaravelChatGptMirror\Models\MirrorConversation;
 use Refatbd\LaravelChatGptMirror\Models\MirrorToken;
 use Refatbd\LaravelChatGptMirror\Services\FailureTracker;
+use Refatbd\LaravelChatGptMirror\Services\MirrorCache;
 use Refatbd\LaravelChatGptMirror\Services\SecurityService;
 use Refatbd\LaravelChatGptMirror\Services\TokenPoolManager;
 use Refatbd\LaravelChatGptMirror\Services\TokenRefresher;
@@ -29,8 +30,16 @@ class AdminController extends Controller
         protected TokenPoolManager $pool,
         protected TokenRefresher $refresher,
         protected FailureTracker $failures,
-        protected SecurityService $security
-    ) {}
+        protected SecurityService $security,
+        protected ?MirrorCache $cache = null
+    ) {
+        $this->cache ??= app()->bound(MirrorCache::class) ? app(MirrorCache::class) : new MirrorCache();
+    }
+
+    protected function cache(): MirrorCache
+    {
+        return $this->cache ??= app()->bound(MirrorCache::class) ? app(MirrorCache::class) : new MirrorCache();
+    }
 
     public function index(Request $request): Response
     {
@@ -99,31 +108,38 @@ class AdminController extends Controller
             $token->save();
         }
 
+        $this->pool->invalidateDiscoveryCaches($token->getEffectiveAccountId());
+
         $label = $token->email ?: $token->name;
-        return $this->redirectWithFlash('success', "Verified and saved account: {$label}");
+        return $this->redirectWithFlash('success', "Verified and saved account: {$label}", $request);
     }
 
-    public function refreshToken(int|string $id): Response
+    public function refreshToken(Request $request, int|string $id): Response
     {
         $token = MirrorToken::findOrFail($id);
         $ok = $this->refresher->refresh($token);
+        if ($ok) {
+            $this->pool->invalidateDiscoveryCaches($token->getEffectiveAccountId());
+        }
 
         return $ok
-            ? $this->redirectWithFlash('success', "Token #{$token->id} ({$token->name}) refreshed successfully.")
-            : $this->redirectWithFlash('error', "Failed to refresh token #{$token->id}: " . ($token->last_error ?: 'upstream rejected session.'));
+            ? $this->redirectWithFlash('success', "Token #{$token->id} ({$token->name}) refreshed successfully.", $request)
+            : $this->redirectWithFlash('error', "Failed to refresh token #{$token->id}: " . ($token->last_error ?: 'upstream rejected session.'), $request);
     }
 
-    public function deleteToken(int|string $id): Response
+    public function deleteToken(Request $request, int|string $id): Response
     {
         $token = MirrorToken::findOrFail($id);
         $label = $token->name;
+        $accountId = $token->getEffectiveAccountId();
         $token->delete();
         $this->security->rotateAssetLinkGeneration();
+        $this->pool->invalidateDiscoveryCaches($accountId);
 
-        return $this->redirectWithFlash('success', "Removed account '{$label}' and rotated asset tickets.");
+        return $this->redirectWithFlash('success', "Removed account '{$label}' and rotated asset tickets.", $request);
     }
 
-    public function resetCounters(): Response
+    public function resetCounters(Request $request): Response
     {
         MirrorToken::query()->update([
             'active_requests' => 0,
@@ -133,7 +149,9 @@ class AdminController extends Controller
             'last_error' => null,
         ]);
 
-        return $this->redirectWithFlash('success', 'All token counters and cooldowns were reset.');
+        $this->pool->invalidateDiscoveryCaches();
+
+        return $this->redirectWithFlash('success', 'All token counters and cooldowns were reset.', $request);
     }
 
     public function stats(): Response
@@ -152,7 +170,7 @@ class AdminController extends Controller
         ]);
     }
 
-    public function health(): Response
+    public function health(?Request $request = null): Response
     {
         $dbOk = true;
         try {
@@ -162,6 +180,8 @@ class AdminController extends Controller
         }
 
         $stats = $this->pool->getPoolStats();
+        $cacheDiag = $this->cache()->diagnostics();
+        $runtimeDiag = $this->runtimeDiagnostics($request);
         $healthy = $dbOk && ($stats['active_tokens'] > 0);
 
         return response()->json([
@@ -177,10 +197,12 @@ class AdminController extends Controller
             'egressMode' => 'direct',
             'sha3_512_supported' => in_array('sha3-512', hash_algos(), true),
             'gd_supported' => extension_loaded('gd'),
+            'cache' => $cacheDiag,
+            'runtime' => $runtimeDiag,
         ], $healthy ? 200 : 503);
     }
 
-    public function diagnostics(): Response
+    public function diagnostics(?Request $request = null): Response
     {
         $dbOk = true;
         try {
@@ -188,6 +210,9 @@ class AdminController extends Controller
         } catch (\Throwable) {
             $dbOk = false;
         }
+
+        $cacheDiag = $this->cache()->diagnostics();
+        $runtimeDiag = $this->runtimeDiagnostics($request);
 
         return response()->json([
             'schemaVersion' => '2026-11',
@@ -198,11 +223,14 @@ class AdminController extends Controller
                 'version' => '2.1.0',
                 'framework' => 'laravel',
                 'php' => PHP_VERSION,
+                'sapi' => PHP_SAPI,
             ],
             'storage' => [
                 'engine' => (string) config('database.default'),
                 'healthy' => $dbOk,
             ],
+            'cache' => $cacheDiag,
+            'runtime' => $runtimeDiag,
             'config' => [
                 'upstream' => (string) config('mirror.upstream', 'https://chatgpt.com'),
                 'egressMode' => 'direct',
@@ -239,6 +267,9 @@ class AdminController extends Controller
             'mirror_decoder_challenges' => '/api/decoder-challenges',
         ];
 
+        $cacheDiag = $this->cache()->diagnostics();
+        $runtimeDiag = $this->runtimeDiagnostics($request);
+
         $features = [
             'streaming' => true,
             'sse_v1_patch' => true,
@@ -252,6 +283,10 @@ class AdminController extends Controller
             'conversions' => true,
             'decoder_challenges' => true,
             'multi_account_pool' => true,
+            'multi_worker_safe' => true,
+            'redis_cache' => (bool) ($cacheDiag['redis_active'] ?? false),
+            'distributed_locks' => (bool) ($cacheDiag['locks_supported'] ?? false),
+            'reverse_proxy_headers' => true,
             'browser_proxy' => true,
             'websocket_proxy' => false,
             'warp_egress_toggle' => false,
@@ -270,8 +305,10 @@ class AdminController extends Controller
             'supported' => $features,
             'endpoints' => $endpoints,
             'features' => $features,
+            'cache' => $cacheDiag,
+            'runtime' => $runtimeDiag,
             'notes' => [
-                'websocket_proxy' => 'PHP built-in development server does not terminate raw WebSocket upgrades; HTTP SSE and proxy fallback operate directly.',
+                'websocket_proxy' => 'Standard PHP-FPM/Apache/Nginx servers terminate HTTP SSE natively; raw WebSocket upgrades fall back automatically to HTTP SSE + Conduit.',
             ],
         ]);
     }
@@ -347,6 +384,7 @@ class AdminController extends Controller
         }
 
         $this->security->rotateAssetLinkGeneration();
+        $this->pool->invalidateDiscoveryCaches($token->getEffectiveAccountId());
 
         return response()->json([
             'ok' => true,
@@ -367,27 +405,89 @@ class AdminController extends Controller
 
     public function deleteSession(): Response
     {
+        $this->pool->invalidateDiscoveryCaches();
         MirrorToken::query()->delete();
         $this->security->rotateAssetLinkGeneration();
 
         return response()->json(['ok' => true, 'message' => 'All mirror sessions cleared']);
     }
 
-    protected function redirectWithFlash(string $type, string $message): Response
+    /**
+     * @return array<string, mixed>
+     */
+    protected function runtimeDiagnostics(?Request $request = null): array
     {
+        $req = $request ?? request();
+        $serverSoftware = (string) ($req->server('SERVER_SOFTWARE') ?: ($_SERVER['SERVER_SOFTWARE'] ?? PHP_SAPI));
+        $configuredPlatform = (string) config('mirror.server.platform', 'auto');
+        $detectedPlatform = $this->detectServerPlatform($serverSoftware, $req);
+
+        return [
+            'php_version' => PHP_VERSION,
+            'sapi' => PHP_SAPI,
+            'server_software' => $serverSoftware,
+            'configured_platform' => $configuredPlatform,
+            'detected_platform' => $detectedPlatform,
+            'zlib_output_compression' => filter_var((string) ini_get('zlib.output_compression'), FILTER_VALIDATE_BOOLEAN),
+            'output_buffering' => (string) ini_get('output_buffering'),
+            'max_execution_time' => (int) ini_get('max_execution_time'),
+            'stream_max_execution_time' => (int) config('mirror.server.stream_max_execution_time', 0),
+            'trust_proxies' => (bool) config('mirror.server.trust_proxies', true),
+            'force_https' => (bool) config('mirror.server.force_https', false),
+            'https_detected' => $this->security->isSecureRequest($req),
+            'resolved_origin' => $this->security->resolveOrigin($req),
+            'authorization_header_present' => $req->headers->has('Authorization')
+                || (string) $req->server('HTTP_AUTHORIZATION', '') !== ''
+                || (string) $req->server('REDIRECT_HTTP_AUTHORIZATION', '') !== '',
+        ];
+    }
+
+    protected function detectServerPlatform(string $serverSoftware, Request $request): string
+    {
+        if (isset($_SERVER['LARAVEL_OCTANE']) || class_exists(\Laravel\Octane\Octane::class, false)) {
+            return 'octane';
+        }
+
+        $lower = strtolower($serverSoftware);
+        if (str_contains($lower, 'frankenphp') || $request->server('FRANKENPHP')) {
+            return 'frankenphp';
+        }
+        if (str_contains($lower, 'litespeed')) {
+            return 'litespeed';
+        }
+        if (str_contains($lower, 'apache')) {
+            return 'apache';
+        }
+        if (str_contains($lower, 'nginx')) {
+            return 'nginx';
+        }
+        if (str_contains($lower, 'caddy')) {
+            return 'caddy';
+        }
+        if (PHP_SAPI === 'cli-server') {
+            return 'php-cli-server';
+        }
+
+        return PHP_SAPI;
+    }
+
+    protected function redirectWithFlash(string $type, string $message, ?Request $request = null): Response
+    {
+        $req = $request ?? request();
         $payload = json_encode(['type' => $type, 'message' => $message]);
         $sig = hash_hmac('sha256', (string) $payload, $this->security->hmacSecret());
         $encoded = base64_encode(json_encode(['p' => $payload, 's' => $sig]));
 
         $adminPath = '/' . trim((string) config('mirror.routes.admin_prefix', 'mirror/admin'), '/');
-        $response = redirect($adminPath);
+        $targetUrl = $req instanceof Request ? ($this->security->resolveOrigin($req) . $adminPath) : $adminPath;
+        $response = redirect($targetUrl);
         $response->headers->setCookie(Cookie::create(
             self::FLASH_COOKIE,
             $encoded,
             now()->addMinutes(5)->getTimestamp(),
             '/',
             null,
-            false,
+            $req instanceof Request ? $this->security->isSecureRequest($req) : false,
             true,
             false,
             Cookie::SAMESITE_LAX
@@ -435,9 +535,11 @@ class AdminController extends Controller
         array $recentFailures,
         ?array $flash
     ): string {
-        $baseUrl = $request->getSchemeAndHttpHost();
+        $baseUrl = $this->security->resolveOrigin($request);
         $openaiPrefix = '/' . trim((string) config('mirror.routes.openai_prefix', 'v1'), '/');
         $adminBase = $baseUrl . '/' . trim((string) config('mirror.routes.admin_prefix', 'mirror/admin'), '/');
+        $cacheDiag = $this->cache()->diagnostics();
+        $runtimeDiag = $this->runtimeDiagnostics($request);
         $apiKey = (string) config('mirror.api_key', '');
         $maskedKey = $apiKey !== ''
             ? (substr($apiKey, 0, 6) . str_repeat('*', max(4, strlen($apiKey) - 6)))
@@ -510,6 +612,16 @@ class AdminController extends Controller
         $safePlaygroundUrl = e($baseUrl . '/mirror/playground');
         $safeDocsUrl = e($baseUrl . '/mirror/api-docs');
         $safeHomeUrl = e($baseUrl . '/');
+
+        $redisBadge = ($cacheDiag['redis_active'] ?? false)
+            ? '<span style="padding:2px 8px;border-radius:99px;background:#ecfdf5;color:#047857;font-size:11px;font-weight:600">Redis Active (' . e((string) ($cacheDiag['redis_ping'] ?? 'PONG')) . ($cacheDiag['latency_ms'] !== null ? ', ' . e((string) $cacheDiag['latency_ms']) . 'ms' : '') . ')</span>'
+            : '<span style="padding:2px 8px;border-radius:99px;background:#eff6ff;color:#1d4ed8;font-size:11px;font-weight:600">Fallback Store (' . e((string) ($cacheDiag['driver'] ?? 'array')) . ')</span>';
+        $safeServerPlatform = e((string) $runtimeDiag['detected_platform'] . ' (config: ' . (string) $runtimeDiag['configured_platform'] . ')');
+        $safePhpSapi = e(PHP_VERSION . ' / ' . PHP_SAPI);
+        $safeHttpsState = ($runtimeDiag['https_detected'] ?? false) ? 'HTTPS (Origin: ' . $safeBase . ')' : 'HTTP (Origin: ' . $safeBase . ')';
+        $safeZlibState = ($runtimeDiag['zlib_output_compression'] ?? false) ? 'Enabled (Auto-disabled during SSE)' : 'Off (Unbuffered SSE Ready)';
+        $safeLocksState = ($cacheDiag['locks_supported'] ?? false) ? 'Distributed Atomic Locks Ready' : 'Single-node Lock Fallback';
+        $safeRedisExt = (($cacheDiag['phpredis_loaded'] ?? false) ? 'phpredis loaded' : 'no phpredis') . ' · ' . (($cacheDiag['predis_installed'] ?? false) ? 'predis installed' : 'no predis');
 
         return <<<HTML
 <!doctype html>
@@ -586,6 +698,17 @@ Routes:   {$safePrefix}/chat/completions, {$safePrefix}/responses, {$safePrefix}
         <a href="{$safeBase}/api/diagnostics" class="btn btn-light" style="text-decoration:none;display:inline-flex;align-items:center">JSON Diagnostics</a>
       </div>
     </div>
+  </div>
+
+  <div class="card">
+    <h2>Runtime, Web Server &amp; Redis Readiness {$redisBadge}</h2>
+    <table>
+      <tbody>
+        <tr><th>Web Server / SAPI</th><td>{$safeServerPlatform} · {$safePhpSapi}</td><th>Proxy / HTTPS Origin</th><td>{$safeHttpsState}</td></tr>
+        <tr><th>SSE Buffering</th><td>{$safeZlibState}</td><th>Concurrency &amp; Locks</th><td>{$safeLocksState}</td></tr>
+        <tr><th>Redis Extensions</th><td>{$safeRedisExt}</td><th>Production Setup CLI</th><td><code>php artisan mirror:server --write</code> / <code>--vhost</code></td></tr>
+      </tbody>
+    </table>
   </div>
 
   <div class="card">

@@ -7,6 +7,7 @@ namespace Refatbd\LaravelChatGptMirror\Models;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\Crypt;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Str;
 
 /**
@@ -219,44 +220,74 @@ class MirrorToken extends Model
         return (int) $decoded['exp'];
     }
 
+    /**
+     * Atomically claim one in-flight concurrency slot only if healthy & below maxConcurrent.
+     * Prevents multi-worker PHP-FPM / Octane race conditions exceeding max_concurrent_per_token.
+     */
+    public function tryAcquireSlot(int $maxConcurrent): bool
+    {
+        $now = Carbon::now();
+
+        $affected = static::whereKey($this->getKey())
+            ->whereIn('status', ['active', 'cooldown'])
+            ->where(function ($q) use ($now): void {
+                $q->whereNull('cooldown_until')
+                    ->orWhere('cooldown_until', '<=', $now);
+            })
+            ->where('active_requests', '<', $maxConcurrent)
+            ->update([
+                'active_requests' => DB::raw('active_requests + 1'),
+                'status' => 'active',
+                'cooldown_until' => null,
+                'last_used_at' => $now,
+            ]);
+
+        if ($affected !== 1) {
+            return false;
+        }
+
+        $this->refresh();
+        return true;
+    }
+
     public function incrementActive(): void
     {
-        $this->increment('active_requests');
-        $this->update(['last_used_at' => Carbon::now()]);
+        static::whereKey($this->getKey())->update([
+            'active_requests' => DB::raw('active_requests + 1'),
+            'last_used_at' => Carbon::now(),
+        ]);
+        $this->refresh();
     }
 
     public function decrementActive(bool $success = true, ?int $tokensUsed = null): void
     {
-        $decrement = $this->active_requests > 0 ? 1 : 0;
-
         $updates = [
-            'total_requests' => $this->total_requests + 1,
+            'active_requests' => DB::raw('CASE WHEN active_requests > 0 THEN active_requests - 1 ELSE 0 END'),
+            'total_requests' => DB::raw('total_requests + 1'),
         ];
-
-        if ($decrement > 0) {
-            $updates['active_requests'] = $this->active_requests - 1;
-        }
 
         if ($success) {
             $updates['consecutive_errors'] = 0;
             $updates['last_error'] = null;
-            if ($tokensUsed) {
-                $updates['total_tokens_used'] = $this->total_tokens_used + $tokensUsed;
+            if ($tokensUsed && $tokensUsed > 0) {
+                $updates['total_tokens_used'] = DB::raw('total_tokens_used + ' . (int) $tokensUsed);
             }
         } else {
-            $updates['consecutive_errors'] = $this->consecutive_errors + 1;
+            $updates['consecutive_errors'] = DB::raw('consecutive_errors + 1');
         }
 
-        $this->update($updates);
+        static::whereKey($this->getKey())->update($updates);
+        $this->refresh();
     }
 
     public function enterCooldown(int $seconds = 60): void
     {
-        $this->update([
+        static::whereKey($this->getKey())->update([
             'status' => 'cooldown',
             'cooldown_until' => Carbon::now()->addSeconds($seconds),
-            'active_requests' => max(0, $this->active_requests - 1),
-            'consecutive_errors' => $this->consecutive_errors + 1,
+            'active_requests' => DB::raw('CASE WHEN active_requests > 0 THEN active_requests - 1 ELSE 0 END'),
+            'consecutive_errors' => DB::raw('consecutive_errors + 1'),
         ]);
+        $this->refresh();
     }
 }

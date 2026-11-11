@@ -9,7 +9,10 @@ use Illuminate\Support\Str;
 
 class InstallCommand extends Command
 {
-    protected $signature = 'mirror:install {--force : Overwrite existing configuration}';
+    protected $signature = 'mirror:install
+        {--force : Overwrite existing configuration}
+        {--server= : Optional production web server setup target (apache, webuzo, nginx, litespeed, caddy, octane)}';
+
     protected $description = 'Install and bootstrap the Laravel ChatGPT Mirror package';
 
     public function handle(): int
@@ -30,10 +33,23 @@ class InstallCommand extends Command
         // 3. Check for MIRROR_API_KEY in .env
         $this->ensureApiKey();
 
+        // 4. Optional production web server setup
+        $server = strtolower(trim((string) ($this->option('server') ?? '')));
+        if ($server !== '') {
+            $args = ['target' => $server];
+            if (in_array($server, ['apache', 'webuzo', 'litespeed', 'openlitespeed'], true)) {
+                $args['--write'] = true;
+            } else {
+                $args['--vhost'] = true;
+            }
+            $this->call('mirror:server', $args);
+        }
+
         $this->newLine();
         $this->info('✅ Laravel ChatGPT Mirror successfully installed!');
         $this->line('👉 Add your first ChatGPT session token: <comment>php artisan mirror:token:add</comment>');
-        $this->line('👉 Or import tokens from a file: <comment>php artisan mirror:token:import token.txt</comment>');
+        $this->line('👉 Configure Apache/Nginx/LiteSpeed/Caddy & Redis: <comment>php artisan mirror:server --write --vhost</comment>');
+        $this->line('👉 Verify health & Redis status: <comment>php artisan mirror:health</comment>');
 
         return self::SUCCESS;
     }

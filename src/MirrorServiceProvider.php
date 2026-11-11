@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Refatbd\LaravelChatGptMirror;
 
+use Illuminate\Routing\Router;
 use Illuminate\Support\ServiceProvider;
 use Refatbd\LaravelChatGptMirror\Commands\AddTokenCommand;
 use Refatbd\LaravelChatGptMirror\Commands\HealthCheckCommand;
@@ -11,8 +12,10 @@ use Refatbd\LaravelChatGptMirror\Commands\ImportTokenCommand;
 use Refatbd\LaravelChatGptMirror\Commands\InstallCommand;
 use Refatbd\LaravelChatGptMirror\Commands\ListTokensCommand;
 use Refatbd\LaravelChatGptMirror\Commands\RefreshTokensCommand;
+use Refatbd\LaravelChatGptMirror\Commands\ServerSetupCommand;
 use Refatbd\LaravelChatGptMirror\Contracts\StreamTransformerInterface;
 use Refatbd\LaravelChatGptMirror\Contracts\TokenPoolInterface;
+use Refatbd\LaravelChatGptMirror\Http\Middleware\PrepareMirrorRuntime;
 use Refatbd\LaravelChatGptMirror\Services\AssetTicketService;
 use Refatbd\LaravelChatGptMirror\Services\BrowserPatchManager;
 use Refatbd\LaravelChatGptMirror\Services\ChatGptClient;
@@ -24,6 +27,7 @@ use Refatbd\LaravelChatGptMirror\Services\Convert\GptGifV4Codec;
 use Refatbd\LaravelChatGptMirror\Services\Convert\LoafCodec;
 use Refatbd\LaravelChatGptMirror\Services\Convert\PngSpeakCodec;
 use Refatbd\LaravelChatGptMirror\Services\FailureTracker;
+use Refatbd\LaravelChatGptMirror\Services\MirrorCache;
 use Refatbd\LaravelChatGptMirror\Services\ProofOfWorkSolver;
 use Refatbd\LaravelChatGptMirror\Services\RichOutputService;
 use Refatbd\LaravelChatGptMirror\Services\SecurityService;
@@ -39,7 +43,10 @@ class MirrorServiceProvider extends ServiceProvider
     {
         $this->mergeConfigFrom(__DIR__ . '/../config/mirror.php', 'mirror');
 
-        $this->app->singleton(FailureTracker::class, fn () => new FailureTracker());
+        $this->app->singleton(MirrorCache::class, fn () => new MirrorCache());
+        $this->app->singleton(FailureTracker::class, fn ($app) => new FailureTracker(
+            $app->make(MirrorCache::class)
+        ));
         $this->app->singleton(SecurityService::class, fn () => new SecurityService());
         $this->app->singleton(ProofOfWorkSolver::class, fn () => new ProofOfWorkSolver());
         $this->app->singleton(UrlRewriter::class, fn () => new UrlRewriter());
@@ -56,11 +63,13 @@ class MirrorServiceProvider extends ServiceProvider
         $this->app->singleton(BrowserPatchManager::class, fn ($app) => new BrowserPatchManager(
             $app->make(UrlRewriter::class)
         ));
-        $this->app->singleton(StreamTransformerInterface::class, fn () => new StreamTransformer());
-        $this->app->singleton(StreamTransformer::class, fn ($app) => $app->make(StreamTransformerInterface::class));
+        // Bind (not singleton) so Octane/FrankenPHP persistent workers never reuse SSE reducer state across requests.
+        $this->app->bind(StreamTransformerInterface::class, fn () => new StreamTransformer());
+        $this->app->bind(StreamTransformer::class, fn ($app) => $app->make(StreamTransformerInterface::class));
 
         $this->app->singleton(TokenPoolInterface::class, fn ($app) => new TokenPoolManager(
-            $app->make(TokenRefresher::class)
+            $app->make(TokenRefresher::class),
+            $app->make(MirrorCache::class)
         ));
         $this->app->singleton(TokenPoolManager::class, fn ($app) => $app->make(TokenPoolInterface::class));
 
@@ -96,10 +105,24 @@ class MirrorServiceProvider extends ServiceProvider
 
     public function boot(): void
     {
+        $this->configureMirrorRedis();
+
+        if ($this->app->bound(Router::class)) {
+            $this->app->make(Router::class)->aliasMiddleware('mirror.runtime', PrepareMirrorRuntime::class);
+        }
+
         if ($this->app->runningInConsole()) {
             $this->publishes([
                 __DIR__ . '/../config/mirror.php' => config_path('mirror.php'),
             ], 'mirror-config');
+
+            $this->publishes([
+                __DIR__ . '/../resources/deploy' => base_path('deploy/mirror'),
+            ], 'mirror-deploy');
+
+            $this->publishes([
+                __DIR__ . '/../resources/deploy/apache' => base_path('deploy/mirror/apache'),
+            ], 'mirror-apache');
 
             $this->commands([
                 InstallCommand::class,
@@ -108,11 +131,49 @@ class MirrorServiceProvider extends ServiceProvider
                 ListTokensCommand::class,
                 RefreshTokensCommand::class,
                 HealthCheckCommand::class,
+                ServerSetupCommand::class,
             ]);
         }
 
         $this->loadMigrationsFrom(__DIR__ . '/../database/migrations');
         $this->loadRoutesFrom(__DIR__ . '/../routes/api.php');
         $this->loadRoutesFrom(__DIR__ . '/../routes/web.php');
+    }
+
+    protected function configureMirrorRedis(): void
+    {
+        $redisUrl = config('mirror.redis.url');
+        $redisHost = config('mirror.redis.host');
+
+        if (empty($redisUrl) && empty($redisHost)) {
+            return;
+        }
+
+        if (!config('database.redis.mirror')) {
+            $conn = array_filter([
+                'url' => $redisUrl ?: null,
+                'host' => $redisHost ?: '127.0.0.1',
+                'password' => config('mirror.redis.password'),
+                'port' => (int) config('mirror.redis.port', 6379),
+                'database' => (int) config('mirror.redis.database', 0),
+                'persistent' => (bool) config('mirror.redis.persistent', true),
+            ], static fn ($value) => $value !== null && $value !== '');
+
+            config(['database.redis.mirror' => $conn]);
+        }
+
+        if (!config('database.redis.client')) {
+            config(['database.redis.client' => config('mirror.redis.client', 'phpredis')]);
+        }
+
+        if (!config('cache.stores.mirror_redis')) {
+            config([
+                'cache.stores.mirror_redis' => [
+                    'driver' => 'redis',
+                    'connection' => 'mirror',
+                    'lock_connection' => 'mirror',
+                ],
+            ]);
+        }
     }
 }
