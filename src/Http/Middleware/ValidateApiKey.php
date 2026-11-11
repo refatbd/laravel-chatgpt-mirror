@@ -6,35 +6,23 @@ namespace Refatbd\LaravelChatGptMirror\Http\Middleware;
 
 use Closure;
 use Illuminate\Http\Request;
+use Refatbd\LaravelChatGptMirror\Services\SecurityService;
 use Symfony\Component\HttpFoundation\Response;
 
+/**
+ * Validates OpenAI-compatible gateway endpoints (/v1/*).
+ * Accepts valid Bearer API key (or ?api_key=) or HMAC-signed HttpOnly browser control cookie.
+ * Never trusts spoofable Referer headers.
+ */
 class ValidateApiKey
 {
+    public function __construct(
+        protected SecurityService $security
+    ) {}
+
     public function handle(Request $request, Closure $next): Response
     {
-        $configuredKey = config('mirror.api_key');
-
-        if (empty($configuredKey)) {
-            return $next($request);
-        }
-
-        // Allow same-origin local browser requests (such as Playground and Admin UI)
-        $referer = $request->header('referer', '');
-        $host = $request->header('host', '');
-        if (!empty($referer) && !empty($host)) {
-            $parsedReferer = parse_url($referer);
-            $parsedHost = parse_url('http://' . $host, PHP_URL_HOST);
-            if (($parsedReferer['host'] ?? '') === $parsedHost) {
-                return $next($request);
-            }
-        }
-
-        $authHeader = $request->header('Authorization', '');
-        $token = str_starts_with($authHeader, 'Bearer ')
-            ? substr($authHeader, 7)
-            : $request->query('api_key', '');
-
-        if (!hash_equals((string) $configuredKey, (string) $token)) {
+        if (!$this->security->authorizePublicApi($request)) {
             return response()->json([
                 'error' => [
                     'message' => 'Invalid or missing API key in Authorization header.',

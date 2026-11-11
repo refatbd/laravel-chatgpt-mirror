@@ -5,15 +5,44 @@ declare(strict_types=1);
 namespace Refatbd\LaravelChatGptMirror\Controllers;
 
 use Illuminate\Http\Request;
-use Illuminate\Http\Response;
 use Illuminate\Routing\Controller;
+use Symfony\Component\HttpFoundation\Response;
 use Symfony\Component\Yaml\Yaml;
 
+/**
+ * Generates an OpenAPI 3.1.0 specification and serves the local Swagger UI (/mirror/api-docs).
+ */
 class ApiDocsController extends Controller
 {
-    /**
-     * Serve the interactive Swagger UI documentation page.
-     */
+    public function openapi(Request $request): Response
+    {
+        $format = strtolower((string) $request->query('format', 'json'));
+        if (!in_array($format, ['json', 'yaml'], true)) {
+            return response()->json([
+                'error' => [
+                    'message' => "Unsupported format '{$format}'. Supported values are 'json' and 'yaml'.",
+                    'type' => 'invalid_request_error',
+                    'code' => 'invalid_format',
+                ],
+            ], 400);
+        }
+
+        $doc = $this->buildOpenApiDocument($request->getSchemeAndHttpHost());
+
+        if ($format === 'yaml') {
+            $yaml = class_exists(Yaml::class)
+                ? Yaml::dump($doc, 10, 2)
+                : json_encode($doc, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
+
+            return response((string) $yaml, 200, [
+                'Content-Type' => 'application/yaml; charset=utf-8',
+                'Cache-Control' => 'no-store',
+            ]);
+        }
+
+        return response()->json($doc, 200, ['Cache-Control' => 'no-store'], JSON_UNESCAPED_SLASHES | JSON_PRETTY_PRINT);
+    }
+
     public function ui(): Response
     {
         $html = <<<'HTML'
@@ -21,12 +50,13 @@ class ApiDocsController extends Controller
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Mirror API Documentation — Swagger UI</title>
+    <title>Laravel ChatGPT Mirror API Docs</title>
     <link rel="stylesheet" type="text/css" href="/mirror/api-docs/swagger-ui.css" />
     <link rel="stylesheet" type="text/css" href="/mirror/api-docs/index.css" />
     <link rel="icon" type="image/png" href="/mirror/api-docs/favicon-32x32.png" sizes="32x32" />
-    <link rel="icon" type="image/png" href="/mirror/api-docs/favicon-16x16.png" sizes="16x16" />
+    <style>
+      .swagger-ui .topbar { display: none; }
+    </style>
   </head>
   <body>
     <div id="swagger-ui"></div>
@@ -35,8 +65,8 @@ class ApiDocsController extends Controller
     <script>
       window.onload = function () {
         window.ui = SwaggerUIBundle({
-          url: "/mirror/openapi",
-          dom_id: "#swagger-ui",
+          url: '/mirror/openapi',
+          dom_id: '#swagger-ui',
           deepLinking: true,
           presets: [
             SwaggerUIBundle.presets.apis,
@@ -45,11 +75,7 @@ class ApiDocsController extends Controller
           plugins: [
             SwaggerUIBundle.plugins.DownloadUrl
           ],
-          layout: "StandaloneLayout",
-          persistAuthorization: true,
-          displayRequestDuration: true,
-          filter: true,
-          oauth2RedirectUrl: window.location.origin + "/mirror/api-docs/oauth2-redirect.html"
+          layout: 'StandaloneLayout'
         });
       };
     </script>
@@ -59,870 +85,158 @@ HTML;
 
         return response($html, 200, [
             'Content-Type' => 'text/html; charset=utf-8',
-            'Cache-Control' => 'no-cache, private',
+            'Cache-Control' => 'no-store',
         ]);
     }
 
-    /**
-     * Serve bundled local Swagger UI static assets safely.
-     */
     public function asset(string $file): Response
     {
         $baseDir = realpath(__DIR__ . '/../../resources/web/swagger-ui');
-        if ($baseDir === false) {
-            abort(404, 'Swagger UI assets directory not found.');
+        $target = realpath($baseDir . '/' . basename($file));
+
+        if (!$baseDir || !$target || !str_starts_with($target, $baseDir) || !is_file($target)) {
+            return response('Swagger UI asset not found.', 404);
         }
 
-        $safeName = basename($file);
-        $targetPath = realpath($baseDir . DIRECTORY_SEPARATOR . $safeName);
-
-        if ($targetPath === false || !str_starts_with($targetPath, $baseDir) || !is_file($targetPath)) {
-            abort(404, 'Swagger UI asset not found.');
-        }
-
-        $ext = strtolower(pathinfo($safeName, PATHINFO_EXTENSION));
-        $contentType = match ($ext) {
-            'js' => 'application/javascript; charset=utf-8',
+        $ext = strtolower(pathinfo($target, PATHINFO_EXTENSION));
+        $mime = match ($ext) {
             'css' => 'text/css; charset=utf-8',
-            'html' => 'text/html; charset=utf-8',
+            'js' => 'application/javascript; charset=utf-8',
             'svg' => 'image/svg+xml',
             'png' => 'image/png',
-            'json' => 'application/json; charset=utf-8',
-            'map' => 'application/json; charset=utf-8',
+            'json' => 'application/json',
+            'html' => 'text/html; charset=utf-8',
             default => 'application/octet-stream',
         };
 
-        return response((string) file_get_contents($targetPath), 200, [
-            'Content-Type' => $contentType,
+        return response((string) file_get_contents($target), 200, [
+            'Content-Type' => $mime,
             'Cache-Control' => 'public, max-age=86400',
         ]);
     }
 
     /**
-     * Serve the full OpenAPI 3.1.0 specification in JSON (default) or YAML (?format=yaml).
+     * @return array<string, mixed>
      */
-    public function openapi(Request $request)
+    protected function buildOpenApiDocument(string $serverUrl): array
     {
-        $format = strtolower((string) $request->query('format', 'json'));
-
-        if (!in_array($format, ['json', 'yaml'], true)) {
-            return response()->json([
-                'error' => [
-                    'message' => 'Unsupported format. Expected "json" or "yaml".',
-                    'type' => 'invalid_request_error',
-                    'code' => 'invalid_format',
-                ],
-            ], 400);
-        }
-
-        $document = $this->buildOpenApiDocument();
-
-        if ($format === 'yaml') {
-            return response($this->encodeYaml($document), 200, [
-                'Content-Type' => 'application/yaml; charset=utf-8',
-                'Cache-Control' => 'no-cache, private',
-            ]);
-        }
-
-        return response()->json(
-            $document,
-            200,
-            ['Cache-Control' => 'no-cache, private'],
-            JSON_UNESCAPED_SLASHES | JSON_PRETTY_PRINT
-        );
-    }
-
-    /**
-     * Build the complete OpenAPI 3.1.0 document describing implemented routes.
-     */
-    public function buildOpenApiDocument(): array
-    {
-        $openAiPrefix = '/' . ltrim((string) config('mirror.prefix.openai', 'v1'), '/');
+        $openaiPrefix = '/' . trim((string) config('mirror.routes.openai_prefix', 'v1'), '/');
+        $adminPrefix = '/' . trim((string) config('mirror.routes.admin_prefix', 'mirror/admin'), '/');
 
         return [
             'openapi' => '3.1.0',
             'info' => [
                 'title' => 'Mirror API',
-                'version' => '1.0.0',
-                'description' => 'Laravel ChatGPT Mirror exposes an OpenAI-compatible API surface under '
-                    . $openAiPrefix
-                    . ' (backed by a multi-token least-busy pool), Mirror operational & Playground endpoints under /api, '
-                    . 'and pool monitoring endpoints under /mirror/admin. Pass ?format=yaml on /mirror/openapi for YAML output.',
+                'version' => '2.1.0',
+                'description' => 'Local ChatGPT Web Mirror in Laravel: OpenAI-compatible gateway (/v1/chat/completions, /v1/responses, /v1/models), Sentinel PoW + Conduit, native /api/chat & /api/conversations/*, file uploads & signed /api/asset-content links, binary codecs (/api/convert/*), decoder challenges, and transparent ChatGPT web proxy.',
             ],
-            'servers' => [
-                ['url' => '/', 'description' => 'This Mirror instance'],
-            ],
+            'servers' => [['url' => $serverUrl, 'description' => 'Active Laravel Mirror instance']],
             'tags' => [
-                [
-                    'name' => 'OpenAI-compatible',
-                    'description' => 'Drop-in OpenAI-compatible API endpoints backed by the ChatGPT token pool.',
-                ],
-                [
-                    'name' => 'Mirror',
-                    'description' => 'Health, diagnostics, session lifecycle, conversation history, Playground settings, and OpenAPI schema.',
-                ],
-                [
-                    'name' => 'Admin',
-                    'description' => 'Token pool runtime statistics.',
-                ],
+                ['name' => 'OpenAI Gateway', 'description' => 'Drop-in OpenAI-compatible endpoints (/v1/*)'],
+                ['name' => 'Mirror Chat & Models', 'description' => 'Native Playground & UI APIs (/api/chat, /api/models, /api/gpts)'],
+                ['name' => 'Conversations & Assets', 'description' => 'History search, branching, export, file uploads, signed asset tickets'],
+                ['name' => 'Conversions & Challenges', 'description' => 'LoaF, PngSpeak, gptgif, gptgif-v4, GIF89a & decoder challenges'],
+                ['name' => 'Health & Sessions', 'description' => 'Health, diagnostics, capabilities, session pool management'],
             ],
-            'security' => [
-                ['mirrorApiKey' => []],
-            ],
-            'paths' => array_merge(
-                $this->openAiPaths($openAiPrefix),
-                $this->mirrorPaths(),
-                $this->adminPaths()
-            ),
             'components' => [
                 'securitySchemes' => [
-                    'mirrorApiKey' => [
-                        'type' => 'http',
-                        'scheme' => 'bearer',
-                        'description' => 'Configured Mirror API key (MIRROR_API_KEY). Same-origin browser tabs opened on Mirror (e.g. Playground or Swagger UI) are automatically permitted.',
-                    ],
+                    'mirrorApiKey' => ['type' => 'http', 'scheme' => 'bearer'],
+                    'BearerAuth' => ['type' => 'http', 'scheme' => 'bearer'],
                 ],
-                'schemas' => $this->componentSchemas(),
-            ],
-        ];
-    }
-
-    /**
-     * OpenAI-compatible /v1/* path definitions.
-     */
-    protected function openAiPaths(string $prefix): array
-    {
-        return [
-            "{$prefix}/models" => [
-                'get' => [
-                    'summary' => 'List available models',
-                    'description' => 'Returns available ChatGPT model descriptors in OpenAI list format.',
-                    'tags' => ['OpenAI-compatible'],
-                    'responses' => [
-                        '200' => [
-                            'description' => 'OK',
-                            'content' => [
-                                'application/json' => [
-                                    'schema' => ['$ref' => '#/components/schemas/ModelsResponse'],
-                                ],
-                            ],
-                        ],
-                        '401' => $this->errorResponse('Missing or invalid Mirror API key'),
-                    ],
-                ],
-            ],
-            "{$prefix}/chat/completions" => [
-                'post' => [
-                    'summary' => 'Create a chat completion',
-                    'description' => 'OpenAI Chat Completions endpoint backed by the least-busy ChatGPT token pool. Supports synchronous JSON responses and real-time Server-Sent Events when stream=true.',
-                    'tags' => ['OpenAI-compatible'],
-                    'requestBody' => [
-                        'required' => true,
-                        'content' => [
-                            'application/json' => [
-                                'schema' => ['$ref' => '#/components/schemas/CompletionRequest'],
-                            ],
-                        ],
-                    ],
-                    'responses' => [
-                        '200' => [
-                            'description' => 'Completion JSON object, or text/event-stream SSE chunks when stream=true.',
-                            'content' => [
-                                'application/json' => [
-                                    'schema' => ['$ref' => '#/components/schemas/CompletionResponse'],
-                                ],
-                                'text/event-stream' => [
-                                    'schema' => ['type' => 'string'],
-                                ],
-                            ],
-                        ],
-                        '401' => $this->errorResponse('Missing or invalid Mirror API key'),
-                        '422' => $this->errorResponse('Validation error in request payload'),
-                        '503' => $this->errorResponse('All ChatGPT tokens in pool are exhausted or in cooldown'),
-                    ],
-                ],
-            ],
-            "{$prefix}/responses" => [
-                'post' => [
-                    'summary' => 'Create a text response',
-                    'description' => 'OpenAI Responses API adapter backed by the Mirror Chat Completions pipeline. Accepts string or structured array input plus optional system instructions.',
-                    'tags' => ['OpenAI-compatible'],
-                    'requestBody' => [
-                        'required' => true,
-                        'content' => [
-                            'application/json' => [
-                                'schema' => ['$ref' => '#/components/schemas/ResponsesRequest'],
-                            ],
-                        ],
-                    ],
-                    'responses' => [
-                        '200' => [
-                            'description' => 'Completion JSON object or text/event-stream SSE stream when stream=true.',
-                            'content' => [
-                                'application/json' => [
-                                    'schema' => ['$ref' => '#/components/schemas/CompletionResponse'],
-                                ],
-                                'text/event-stream' => [
-                                    'schema' => ['type' => 'string'],
-                                ],
-                            ],
-                        ],
-                        '401' => $this->errorResponse('Missing or invalid Mirror API key'),
-                        '422' => $this->errorResponse('Validation error in converted chat payload'),
-                    ],
-                ],
-            ],
-            "{$prefix}/capabilities" => [
-                'get' => [
-                    'summary' => 'Describe supported OpenAI-compatible capabilities',
-                    'description' => 'Machine-readable capability descriptor listing supported routes, request fields, and pool features.',
-                    'tags' => ['OpenAI-compatible'],
-                    'responses' => [
-                        '200' => [
-                            'description' => 'OK',
-                            'content' => [
-                                'application/json' => [
-                                    'schema' => ['$ref' => '#/components/schemas/CapabilitiesResponse'],
-                                ],
-                            ],
-                        ],
-                        '401' => $this->errorResponse('Missing or invalid Mirror API key'),
-                    ],
-                ],
-            ],
-        ];
-    }
-
-    /**
-     * Native Mirror /api/* and /mirror/openapi path definitions.
-     */
-    protected function mirrorPaths(): array
-    {
-        return [
-            '/api/health' => [
-                'get' => [
-                    'summary' => 'Health check',
-                    'description' => 'Reports database connectivity, configured session status, active healthy token count, in-flight requests, and upstream URL.',
-                    'tags' => ['Mirror'],
-                    'security' => [],
-                    'responses' => [
-                        '200' => [
-                            'description' => 'OK',
-                            'content' => [
-                                'application/json' => [
-                                    'schema' => ['$ref' => '#/components/schemas/HealthResponse'],
-                                ],
-                            ],
-                        ],
-                    ],
-                ],
-            ],
-            '/api/diagnostics' => [
-                'get' => [
-                    'summary' => 'Server diagnostics snapshot',
-                    'description' => 'Returns build versions, API key status, database storage details, token pool metrics, and Mirror configuration prefixes.',
-                    'tags' => ['Mirror'],
-                    'responses' => [
-                        '200' => [
-                            'description' => 'OK',
-                            'content' => [
-                                'application/json' => [
-                                    'schema' => ['$ref' => '#/components/schemas/DiagnosticsResponse'],
-                                ],
-                            ],
-                        ],
-                        '401' => $this->errorResponse('Missing or invalid Mirror API key'),
-                    ],
-                ],
-            ],
-            '/api/session' => [
-                'get' => [
-                    'summary' => 'Check active ChatGPT session status',
-                    'tags' => ['Mirror'],
-                    'responses' => [
-                        '200' => [
-                            'description' => 'OK',
-                            'content' => [
-                                'application/json' => [
-                                    'schema' => ['$ref' => '#/components/schemas/SessionStatusResponse'],
-                                ],
-                            ],
-                        ],
-                        '401' => $this->errorResponse('Missing or invalid Mirror API key'),
-                    ],
-                ],
-                'post' => [
-                    'summary' => 'Connect or update a ChatGPT session token',
-                    'tags' => ['Mirror'],
-                    'requestBody' => [
-                        'required' => true,
-                        'content' => [
-                            'application/json' => [
-                                'schema' => ['$ref' => '#/components/schemas/SessionSetRequest'],
-                            ],
-                        ],
-                    ],
-                    'responses' => [
-                        '200' => [
-                            'description' => 'Session stored and verified',
-                            'content' => [
-                                'application/json' => [
-                                    'schema' => ['$ref' => '#/components/schemas/OkResponse'],
-                                ],
-                            ],
-                        ],
-                        '400' => $this->errorResponse('Invalid or missing sessionToken'),
-                        '401' => $this->errorResponse('Missing or invalid Mirror API key'),
-                    ],
-                ],
-                'delete' => [
-                    'summary' => 'Disconnect stored ChatGPT session tokens',
-                    'tags' => ['Mirror'],
-                    'responses' => [
-                        '200' => [
-                            'description' => 'OK',
-                            'content' => [
-                                'application/json' => [
-                                    'schema' => ['$ref' => '#/components/schemas/OkResponse'],
-                                ],
-                            ],
-                        ],
-                        '401' => $this->errorResponse('Missing or invalid Mirror API key'),
-                    ],
-                ],
-            ],
-            '/api/conversations' => [
-                'get' => [
-                    'summary' => 'List locally tracked conversations',
-                    'tags' => ['Mirror'],
-                    'parameters' => [
-                        [
-                            'name' => 'limit',
-                            'in' => 'query',
-                            'required' => false,
-                            'schema' => ['type' => 'integer', 'default' => 50, 'minimum' => 1],
-                        ],
-                        [
-                            'name' => 'offset',
-                            'in' => 'query',
-                            'required' => false,
-                            'schema' => ['type' => 'integer', 'default' => 0, 'minimum' => 0],
-                        ],
-                    ],
-                    'responses' => [
-                        '200' => [
-                            'description' => 'OK',
-                            'content' => [
-                                'application/json' => [
-                                    'schema' => ['$ref' => '#/components/schemas/ConversationsResponse'],
-                                ],
-                            ],
-                        ],
-                        '401' => $this->errorResponse('Missing or invalid Mirror API key'),
-                    ],
-                ],
-            ],
-            '/api/conversations/{id}' => [
-                'get' => [
-                    'summary' => 'Fetch a single conversation metadata record',
-                    'tags' => ['Mirror'],
-                    'parameters' => [
-                        [
-                            'name' => 'id',
-                            'in' => 'path',
-                            'required' => true,
-                            'schema' => ['type' => 'string'],
-                        ],
-                    ],
-                    'responses' => [
-                        '200' => [
-                            'description' => 'OK',
-                            'content' => [
-                                'application/json' => [
-                                    'schema' => ['$ref' => '#/components/schemas/ConversationDetailResponse'],
-                                ],
-                            ],
-                        ],
-                        '401' => $this->errorResponse('Missing or invalid Mirror API key'),
-                    ],
-                ],
-            ],
-            '/api/settings/default-system-instructions' => [
-                'get' => [
-                    'summary' => 'Get Playground default system instructions',
-                    'tags' => ['Mirror'],
-                    'responses' => [
-                        '200' => [
-                            'description' => 'OK',
-                            'content' => [
-                                'application/json' => [
-                                    'schema' => ['$ref' => '#/components/schemas/DefaultInstructionsPayload'],
-                                ],
-                            ],
-                        ],
-                    ],
-                ],
-                'put' => [
-                    'summary' => 'Update Playground default system instructions',
-                    'tags' => ['Mirror'],
-                    'requestBody' => [
-                        'required' => true,
-                        'content' => [
-                            'application/json' => [
-                                'schema' => ['$ref' => '#/components/schemas/DefaultInstructionsPayload'],
-                            ],
-                        ],
-                    ],
-                    'responses' => [
-                        '200' => [
-                            'description' => 'OK',
-                            'content' => [
-                                'application/json' => [
-                                    'schema' => ['$ref' => '#/components/schemas/DefaultInstructionsPayload'],
-                                ],
-                            ],
-                        ],
-                    ],
-                ],
-            ],
-            '/api/settings/hotkeys' => [
-                'get' => [
-                    'summary' => 'Get Playground keyboard shortcut preferences',
-                    'tags' => ['Mirror'],
-                    'responses' => [
-                        '200' => [
-                            'description' => 'OK',
-                            'content' => [
-                                'application/json' => [
-                                    'schema' => ['$ref' => '#/components/schemas/HotkeysPayload'],
-                                ],
-                            ],
-                        ],
-                    ],
-                ],
-                'put' => [
-                    'summary' => 'Update Playground keyboard shortcut preferences',
-                    'tags' => ['Mirror'],
-                    'requestBody' => [
-                        'required' => true,
-                        'content' => [
-                            'application/json' => [
-                                'schema' => ['$ref' => '#/components/schemas/HotkeysPayload'],
-                            ],
-                        ],
-                    ],
-                    'responses' => [
-                        '200' => [
-                            'description' => 'OK',
-                            'content' => [
-                                'application/json' => [
-                                    'schema' => ['$ref' => '#/components/schemas/HotkeysPayload'],
-                                ],
-                            ],
-                        ],
-                    ],
-                ],
-            ],
-            '/mirror/openapi' => [
-                'get' => [
-                    'summary' => 'Get this OpenAPI 3.1.0 specification',
-                    'description' => 'Returns the live OpenAPI 3.1.0 specification in JSON (default) or YAML when ?format=yaml is passed.',
-                    'tags' => ['Mirror'],
-                    'security' => [],
-                    'parameters' => [
-                        [
-                            'name' => 'format',
-                            'in' => 'query',
-                            'required' => false,
-                            'description' => 'Pass "yaml" for YAML or omit/"json" for JSON.',
-                            'schema' => [
-                                'type' => 'string',
-                                'enum' => ['json', 'yaml'],
-                                'default' => 'json',
-                            ],
-                        ],
-                    ],
-                    'responses' => [
-                        '200' => [
-                            'description' => 'OK',
-                            'content' => [
-                                'application/json' => [
-                                    'schema' => [
-                                        'type' => 'object',
-                                        'additionalProperties' => true,
-                                        'description' => 'This OpenAPI 3.1.0 document as JSON.',
-                                    ],
-                                ],
-                                'application/yaml' => [
-                                    'schema' => [
-                                        'type' => 'string',
-                                        'description' => 'This OpenAPI 3.1.0 document as YAML.',
-                                    ],
-                                ],
-                            ],
-                        ],
-                        '400' => $this->errorResponse('Unsupported format parameter'),
-                    ],
-                ],
-            ],
-        ];
-    }
-
-    /**
-     * Admin monitoring endpoint definitions.
-     */
-    protected function adminPaths(): array
-    {
-        return [
-            '/mirror/admin/api/stats' => [
-                'get' => [
-                    'summary' => 'Live multi-token pool statistics',
-                    'description' => 'Returns active healthy token counts, cooldown counts, in-flight requests, total served counter, and balancing strategy.',
-                    'tags' => ['Admin'],
-                    'security' => [],
-                    'responses' => [
-                        '200' => [
-                            'description' => 'OK',
-                            'content' => [
-                                'application/json' => [
-                                    'schema' => ['$ref' => '#/components/schemas/AdminStatsResponse'],
-                                ],
-                            ],
-                        ],
-                    ],
-                ],
-            ],
-        ];
-    }
-
-    /**
-     * Reusable component schemas referenced by path definitions.
-     */
-    protected function componentSchemas(): array
-    {
-        return [
-            'ErrorResponse' => [
-                'type' => 'object',
-                'properties' => [
-                    'error' => [
+                'schemas' => [
+                    'ChatMessage' => [
                         'type' => 'object',
+                        'required' => ['role', 'content'],
                         'properties' => [
-                            'message' => ['type' => 'string'],
-                            'type' => ['type' => 'string'],
-                            'code' => ['type' => ['string', 'integer', 'null']],
+                            'role' => ['type' => 'string', 'enum' => ['system', 'developer', 'user', 'assistant']],
+                            'content' => ['type' => ['string', 'array']],
                         ],
                     ],
-                ],
-            ],
-            'OkResponse' => [
-                'type' => 'object',
-                'properties' => [
-                    'ok' => ['type' => 'boolean'],
-                ],
-                'additionalProperties' => true,
-            ],
-            'ModelSchema' => [
-                'type' => 'object',
-                'required' => ['id', 'object', 'created', 'owned_by'],
-                'properties' => [
-                    'id' => ['type' => 'string', 'example' => 'gpt-4o'],
-                    'object' => ['type' => 'string', 'const' => 'model'],
-                    'created' => ['type' => 'integer'],
-                    'owned_by' => ['type' => 'string'],
-                ],
-            ],
-            'ModelsResponse' => [
-                'type' => 'object',
-                'required' => ['object', 'data'],
-                'properties' => [
-                    'object' => ['type' => 'string', 'const' => 'list'],
-                    'data' => [
-                        'type' => 'array',
-                        'items' => ['$ref' => '#/components/schemas/ModelSchema'],
-                    ],
-                ],
-            ],
-            'ChatMessage' => [
-                'type' => 'object',
-                'required' => ['role', 'content'],
-                'properties' => [
-                    'role' => ['type' => 'string', 'enum' => ['system', 'developer', 'user', 'assistant']],
-                    'content' => ['type' => 'string'],
-                ],
-            ],
-            'CompletionRequest' => [
-                'type' => 'object',
-                'required' => ['messages'],
-                'properties' => [
-                    'model' => ['type' => 'string', 'default' => 'gpt-4o'],
-                    'messages' => [
-                        'type' => 'array',
-                        'minItems' => 1,
-                        'items' => ['$ref' => '#/components/schemas/ChatMessage'],
-                    ],
-                    'stream' => ['type' => 'boolean', 'default' => false],
-                ],
-            ],
-            'CompletionChoice' => [
-                'type' => 'object',
-                'properties' => [
-                    'index' => ['type' => 'integer'],
-                    'message' => [
+                    'ChatCompletionRequest' => [
                         'type' => 'object',
+                        'required' => ['model', 'messages'],
                         'properties' => [
-                            'role' => ['type' => 'string', 'const' => 'assistant'],
-                            'content' => ['type' => 'string'],
+                            'model' => ['type' => 'string', 'default' => 'auto'],
+                            'messages' => ['type' => 'array', 'items' => ['$ref' => '#/components/schemas/ChatMessage']],
+                            'stream' => ['type' => 'boolean', 'default' => false],
+                            'tools' => ['type' => 'array', 'items' => ['type' => 'object']],
+                            'tool_choice' => ['type' => ['string', 'object']],
+                            'metadata' => ['type' => 'object'],
                         ],
                     ],
-                    'logprobs' => ['type' => ['object', 'null']],
-                    'finish_reason' => ['type' => ['string', 'null']],
-                ],
-            ],
-            'CompletionResponse' => [
-                'type' => 'object',
-                'properties' => [
-                    'id' => ['type' => 'string'],
-                    'object' => ['type' => 'string', 'const' => 'chat.completion'],
-                    'created' => ['type' => 'integer'],
-                    'model' => ['type' => 'string'],
-                    'system_fingerprint' => ['type' => 'string'],
-                    'choices' => [
-                        'type' => 'array',
-                        'items' => ['$ref' => '#/components/schemas/CompletionChoice'],
-                    ],
-                    'usage' => [
+                    'ResponsesRequest' => [
                         'type' => 'object',
+                        'required' => ['model', 'input'],
                         'properties' => [
-                            'prompt_tokens' => ['type' => 'integer'],
-                            'completion_tokens' => ['type' => 'integer'],
-                            'total_tokens' => ['type' => 'integer'],
+                            'model' => ['type' => 'string', 'default' => 'auto'],
+                            'input' => ['type' => ['string', 'array']],
+                            'instructions' => ['type' => 'string'],
+                            'stream' => ['type' => 'boolean', 'default' => false],
+                            'metadata' => ['type' => 'object'],
                         ],
                     ],
                 ],
             ],
-            'ResponsesRequest' => [
-                'type' => 'object',
-                'required' => ['input'],
-                'properties' => [
-                    'model' => ['type' => 'string', 'default' => 'auto'],
-                    'instructions' => ['type' => ['string', 'null']],
-                    'input' => [
-                        'oneOf' => [
-                            ['type' => 'string'],
-                            [
-                                'type' => 'array',
-                                'items' => [
-                                    'type' => 'object',
-                                    'additionalProperties' => true,
-                                ],
-                            ],
-                        ],
-                    ],
-                    'stream' => ['type' => 'boolean', 'default' => false],
+            'paths' => [
+                "{$openaiPrefix}/models" => [
+                    'get' => ['tags' => ['OpenAI Gateway'], 'summary' => 'List available models', 'security' => [['BearerAuth' => []]], 'responses' => ['200' => ['description' => 'Model list']]],
                 ],
-            ],
-            'CapabilitiesResponse' => [
-                'type' => 'object',
-                'properties' => [
-                    'schemaVersion' => ['type' => 'integer'],
-                    'routes' => ['type' => 'array', 'items' => ['type' => 'string']],
-                    'fields' => ['type' => 'array', 'items' => ['type' => 'string']],
-                    'metadataFields' => ['type' => 'array', 'items' => ['type' => 'string']],
-                    'supported' => [
-                        'type' => 'object',
-                        'additionalProperties' => ['type' => 'boolean'],
+                "{$openaiPrefix}/chat/completions" => [
+                    'post' => [
+                        'tags' => ['OpenAI Gateway'],
+                        'summary' => 'Create Chat Completion (Sentinel PoW + Conduit + SSE/Tools/RichOutput)',
+                        'security' => [['BearerAuth' => []]],
+                        'requestBody' => ['required' => true, 'content' => ['application/json' => ['schema' => ['$ref' => '#/components/schemas/ChatCompletionRequest']]]],
+                        'responses' => ['200' => ['description' => 'Completion response or SSE stream']],
                     ],
                 ],
-            ],
-            'HealthResponse' => [
-                'type' => 'object',
-                'properties' => [
-                    'ok' => ['type' => 'boolean'],
-                    'storage' => ['type' => 'string'],
-                    'configured' => ['type' => 'boolean'],
-                    'active_tokens' => ['type' => 'integer'],
-                    'in_flight' => ['type' => 'integer'],
-                    'total_served' => ['type' => 'integer'],
-                    'upstream' => ['type' => 'string'],
-                ],
-            ],
-            'DiagnosticsResponse' => [
-                'type' => 'object',
-                'properties' => [
-                    'schemaVersion' => ['type' => 'integer'],
-                    'build' => ['type' => 'object', 'additionalProperties' => true],
-                    'api' => ['type' => 'object', 'additionalProperties' => true],
-                    'storage' => ['type' => 'object', 'additionalProperties' => true],
-                    'pool' => ['type' => 'object', 'additionalProperties' => true],
-                    'config' => ['type' => 'object', 'additionalProperties' => true],
-                ],
-            ],
-            'SessionStatusResponse' => [
-                'type' => 'object',
-                'properties' => [
-                    'configured' => ['type' => 'boolean'],
-                    'total_tokens' => ['type' => 'integer'],
-                    'active_tokens' => ['type' => 'integer'],
-                    'account' => [
-                        'type' => ['object', 'null'],
-                        'properties' => [
-                            'id' => ['type' => 'integer'],
-                            'email' => ['type' => ['string', 'null']],
-                            'name' => ['type' => ['string', 'null']],
-                            'plan' => ['type' => ['string', 'null']],
-                        ],
+                "{$openaiPrefix}/responses" => [
+                    'post' => [
+                        'tags' => ['OpenAI Gateway'],
+                        'summary' => 'Create Response (OpenAI Responses API JSON & SSE events)',
+                        'security' => [['BearerAuth' => []]],
+                        'requestBody' => ['required' => true, 'content' => ['application/json' => ['schema' => ['$ref' => '#/components/schemas/ResponsesRequest']]]],
+                        'responses' => ['200' => ['description' => 'Responses API object or event stream']],
                     ],
                 ],
-            ],
-            'SessionSetRequest' => [
-                'type' => 'object',
-                'required' => ['sessionToken'],
-                'properties' => [
-                    'sessionToken' => ['type' => 'string'],
+                "{$openaiPrefix}/capabilities" => [
+                    'get' => ['tags' => ['Health & Sessions'], 'summary' => 'Gateway feature capabilities matrix', 'responses' => ['200' => ['description' => 'Capabilities']]],
                 ],
-            ],
-            'ConversationSummary' => [
-                'type' => 'object',
-                'properties' => [
-                    'id' => ['type' => 'string'],
-                    'title' => ['type' => 'string'],
-                    'model' => ['type' => 'string'],
-                    'updatedAt' => ['type' => 'string', 'format' => 'date-time'],
+                '/api/health' => ['get' => ['tags' => ['Health & Sessions'], 'summary' => 'Liveness health check', 'responses' => ['200' => ['description' => 'Healthy']]]],
+                '/api/diagnostics' => ['get' => ['tags' => ['Health & Sessions'], 'summary' => 'Deep pool & failure diagnostics', 'responses' => ['200' => ['description' => 'Diagnostics JSON']]]],
+                '/api/session' => [
+                    'get' => ['tags' => ['Health & Sessions'], 'summary' => 'Session status', 'responses' => ['200' => ['description' => 'Status']]],
+                    'post' => ['tags' => ['Health & Sessions'], 'summary' => 'Verify and store sessionToken (+ optional turnstileToken)', 'responses' => ['200' => ['description' => 'Saved']]],
+                    'delete' => ['tags' => ['Health & Sessions'], 'summary' => 'Clear sessions', 'responses' => ['200' => ['description' => 'Cleared']]],
                 ],
-            ],
-            'ConversationsResponse' => [
-                'type' => 'object',
-                'properties' => [
-                    'items' => [
-                        'type' => 'array',
-                        'items' => ['$ref' => '#/components/schemas/ConversationSummary'],
-                    ],
-                    'total' => ['type' => 'integer'],
-                    'hasMore' => ['type' => 'boolean'],
+                '/api/models' => ['get' => ['tags' => ['Mirror Chat & Models'], 'summary' => 'Normalized ChatGPT models', 'responses' => ['200' => ['description' => 'Array of models']]]],
+                '/api/gpts' => ['get' => ['tags' => ['Mirror Chat & Models'], 'summary' => 'Custom GPTs & Projects', 'responses' => ['200' => ['description' => 'Array of GPTs']]]],
+                '/api/chat' => ['post' => ['tags' => ['Mirror Chat & Models'], 'summary' => 'Native Playground SSE chat', 'responses' => ['200' => ['description' => 'SSE stream']]]],
+                '/api/conversations' => [
+                    'get' => ['tags' => ['Conversations & Assets'], 'summary' => 'Paginated conversations (sync=true|false)', 'responses' => ['200' => ['description' => 'List']]],
+                    'post' => ['tags' => ['Conversations & Assets'], 'summary' => 'Create new local conversation', 'responses' => ['201' => ['description' => 'Created']]],
                 ],
-            ],
-            'ConversationDetailResponse' => [
-                'type' => 'object',
-                'properties' => [
-                    'conversation' => ['type' => 'object', 'additionalProperties' => true],
-                    'messages' => ['type' => 'array', 'items' => ['type' => 'object']],
-                    'instructions' => ['type' => ['string', 'null']],
+                '/api/conversations/search' => ['get' => ['tags' => ['Conversations & Assets'], 'summary' => 'Search conversations & messages', 'responses' => ['200' => ['description' => 'Matches']]]],
+                '/api/conversations/{id}' => [
+                    'get' => ['tags' => ['Conversations & Assets'], 'summary' => 'Load conversation & messages', 'responses' => ['200' => ['description' => 'Detail']]],
+                    'patch' => ['tags' => ['Conversations & Assets'], 'summary' => 'Update conversation model', 'responses' => ['200' => ['description' => 'Updated']]],
+                    'delete' => ['tags' => ['Conversations & Assets'], 'summary' => 'Delete conversation', 'responses' => ['200' => ['description' => 'Deleted']]],
                 ],
-            ],
-            'DefaultInstructionsPayload' => [
-                'type' => 'object',
-                'properties' => [
-                    'content' => ['type' => 'string'],
-                ],
-            ],
-            'HotkeysPayload' => [
-                'type' => 'object',
-                'properties' => [
-                    'hotkeys' => ['type' => 'object', 'additionalProperties' => true],
-                ],
-            ],
-            'AdminStatsResponse' => [
-                'type' => 'object',
-                'properties' => [
-                    'total_tokens' => ['type' => 'integer'],
-                    'active_healthy' => ['type' => 'integer'],
-                    'in_cooldown' => ['type' => 'integer'],
-                    'total_in_flight_requests' => ['type' => 'integer'],
-                    'total_requests_served' => ['type' => 'integer'],
-                    'strategy' => ['type' => 'string'],
-                ],
+                '/api/conversations/{id}/stop' => ['post' => ['tags' => ['Conversations & Assets'], 'summary' => 'Abort active generation', 'responses' => ['200' => ['description' => 'Stopped']]]],
+                '/api/conversations/{id}/branch' => ['post' => ['tags' => ['Conversations & Assets'], 'summary' => 'Branch from message', 'responses' => ['201' => ['description' => 'Branch created']]]],
+                '/api/conversations/{id}/branches' => ['get' => ['tags' => ['Conversations & Assets'], 'summary' => 'List conversation branches', 'responses' => ['200' => ['description' => 'Branches']]]],
+                '/api/conversations/{id}/export' => ['get' => ['tags' => ['Conversations & Assets'], 'summary' => 'Export conversation as JSON or Markdown', 'responses' => ['200' => ['description' => 'Export']]]],
+                '/api/files' => ['post' => ['tags' => ['Conversations & Assets'], 'summary' => 'Upload attachment to ChatGPT backend', 'responses' => ['201' => ['description' => 'Uploaded metadata']]]],
+                '/api/assets' => ['get' => ['tags' => ['Conversations & Assets'], 'summary' => 'Resolve file-service:// or sediment:// pointer', 'responses' => ['302' => ['description' => 'Redirect']]]],
+                '/api/asset-content' => ['get' => ['tags' => ['Conversations & Assets'], 'summary' => 'Sealed 7-day preview/download proxy endpoint', 'responses' => ['200' => ['description' => 'Binary asset content']]]],
+                '/api/convert/formats' => ['get' => ['tags' => ['Conversions & Challenges'], 'summary' => 'Supported conversion formats', 'responses' => ['200' => ['description' => 'Formats']]]],
+                '/api/convert/roundtrip' => ['post' => ['tags' => ['Conversions & Challenges'], 'summary' => 'Encode+decode verification', 'responses' => ['200' => ['description' => 'Result']]]],
+                '/api/convert/gauntlet' => ['post' => ['tags' => ['Conversions & Challenges'], 'summary' => 'Run round-trip across all codecs', 'responses' => ['200' => ['description' => 'Results']]]],
+                '/api/convert/gpt-prompt' => ['post' => ['tags' => ['Conversions & Challenges'], 'summary' => 'Generate ChatGPT decoding prompt', 'responses' => ['200' => ['description' => 'Prompt payload']]]],
+                '/api/decoder-challenges' => ['post' => ['tags' => ['Conversions & Challenges'], 'summary' => 'Create ephemeral decoder challenge', 'responses' => ['200' => ['description' => 'Challenge']]]],
+                '/mirror/openapi' => ['get' => ['tags' => ['Health & Sessions'], 'summary' => 'OpenAPI 3.1.0 specification (json|yaml)', 'responses' => ['200' => ['description' => 'OpenAPI document']]]],
+                "{$adminPrefix}/api/stats" => ['get' => ['tags' => ['Health & Sessions'], 'summary' => 'Pool & request statistics', 'security' => [['mirrorApiKey' => []]], 'responses' => ['200' => ['description' => 'Pool stats']]]],
             ],
         ];
-    }
-
-    /**
-     * Build a reusable JSON error response entry.
-     */
-    protected function errorResponse(string $description): array
-    {
-        return [
-            'description' => $description,
-            'content' => [
-                'application/json' => [
-                    'schema' => ['$ref' => '#/components/schemas/ErrorResponse'],
-                ],
-            ],
-        ];
-    }
-
-    /**
-     * Serialize an OpenAPI document array to YAML using Symfony Yaml or a pure-PHP fallback.
-     */
-    protected function encodeYaml(array $document): string
-    {
-        if (class_exists(Yaml::class)) {
-            return Yaml::dump(
-                $document,
-                12,
-                2,
-                Yaml::DUMP_OBJECT_AS_MAP | Yaml::DUMP_EMPTY_ARRAY_AS_SEQUENCE
-            );
-        }
-
-        return $this->dumpYamlFallback($document, 0);
-    }
-
-    /**
-     * Minimal dependency-free YAML serializer fallback.
-     */
-    protected function dumpYamlFallback(mixed $value, int $indent): string
-    {
-        $pad = str_repeat('  ', $indent);
-
-        if (!is_array($value)) {
-            return $this->formatYamlScalar($value);
-        }
-
-        if ($value === []) {
-            return '[]';
-        }
-
-        $isList = array_is_list($value);
-        $lines = [];
-
-        foreach ($value as $k => $v) {
-            if ($isList) {
-                if (is_array($v) && $v !== []) {
-                    $lines[] = $pad . '-';
-                    $lines[] = $this->dumpYamlFallback($v, $indent + 1);
-                } else {
-                    $lines[] = $pad . '- ' . $this->dumpYamlFallback($v, $indent + 1);
-                }
-                continue;
-            }
-
-            $key = preg_match('/^[A-Za-z0-9_.-]+$/', (string) $k) ? (string) $k : json_encode((string) $k);
-            if (is_array($v) && $v !== []) {
-                $lines[] = $pad . $key . ':';
-                $lines[] = $this->dumpYamlFallback($v, $indent + 1);
-            } else {
-                $lines[] = $pad . $key . ': ' . $this->dumpYamlFallback($v, $indent + 1);
-            }
-        }
-
-        return implode("\n", $lines);
-    }
-
-    /**
-     * Format a scalar value safely for YAML output.
-     */
-    protected function formatYamlScalar(mixed $value): string
-    {
-        if ($value === null) {
-            return 'null';
-        }
-        if (is_bool($value)) {
-            return $value ? 'true' : 'false';
-        }
-        if (is_int($value) || is_float($value)) {
-            return (string) $value;
-        }
-
-        return (string) json_encode((string) $value, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
     }
 }

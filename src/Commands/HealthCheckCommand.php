@@ -6,61 +6,74 @@ namespace Refatbd\LaravelChatGptMirror\Commands;
 
 use GuzzleHttp\Client;
 use Illuminate\Console\Command;
+use Illuminate\Support\Facades\Schema;
 use Refatbd\LaravelChatGptMirror\Services\TokenPoolManager;
-use Throwable;
 
 class HealthCheckCommand extends Command
 {
     protected $signature = 'mirror:health';
-    protected $description = 'Perform an operational health check on Mirror upstream egress and token pool';
 
-    public function handle(TokenPoolManager $poolManager): int
+    protected $description = 'Check connectivity to ChatGPT upstream, SHA3-512 PoW support, database schema, and pool status';
+
+    public function handle(TokenPoolManager $pool): int
     {
-        $this->info("🔍 Running Laravel ChatGPT Mirror Diagnostic...");
-        $this->newLine();
+        $this->info('Running ChatGPT Mirror Health Diagnostics...');
 
-        // 1. Direct Upstream Egress Check
-        $upstream = config('mirror.upstream', 'https://chatgpt.com');
-        $this->line("1. Testing Direct Upstream Connectivity (<comment>{$upstream}</comment>)...");
-
-        $http = new Client([
-            'base_uri' => $upstream,
-            'timeout' => 10,
-            'verify' => (bool) config('mirror.egress.verify_ssl', true),
-            'proxy' => config('mirror.egress.proxy'),
-            'headers' => [
-                'User-Agent' => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36',
-            ],
+        $upstream = (string) config('mirror.upstream', 'https://chatgpt.com');
+        $client = new Client([
+            'timeout' => (float) config('mirror.http.timeout', 10),
+            'connect_timeout' => (float) config('mirror.http.connect_timeout', 5),
+            'verify' => (bool) config('mirror.http.verify_ssl', true),
+            'proxy' => config('mirror.http.proxy'),
+            'http_errors' => false,
         ]);
 
+        $egressIp = 'Unknown';
         try {
-            $resp = $http->get('/', ['http_errors' => false]);
-            $this->info("   ✓ Direct Network Egress: Reachable (HTTP {$resp->getStatusCode()})");
-        } catch (Throwable $e) {
-            $this->error("   ✗ Direct Network Egress Failed: " . $e->getMessage());
+            $res = $client->get('https://api.ipify.org?format=json');
+            $data = json_decode((string) $res->getBody(), true);
+            $egressIp = $data['ip'] ?? 'Unknown';
+        } catch (\Throwable) {
+            $egressIp = 'Failed to fetch IP';
         }
 
-        // 2. Token Pool Health Check
-        $this->newLine();
-        $this->line("2. Inspecting Token Pool Status...");
-        $stats = $poolManager->getPoolStats();
-
-        $this->table(['Metric', 'Value'], [
-            ['Total Configured Tokens', $stats['total_tokens']],
-            ['Active Healthy Tokens', $stats['active_healthy']],
-            ['Tokens in Cooldown', $stats['in_cooldown']],
-            ['Current In-Flight Requests', $stats['total_in_flight_requests']],
-            ['Total Requests Served', $stats['total_requests_served']],
-            ['Load Balancing Strategy', config('mirror.pool.strategy', 'least_busy')],
-            ['Egress Mode', config('mirror.egress.mode', 'direct') . ' (WARP: Disabled)'],
-        ]);
-
-        if ($stats['active_healthy'] > 0) {
-            $this->info("✅ Mirror is operational and ready to serve traffic!");
-            return self::SUCCESS;
+        $upstreamStatus = 'Unreachable';
+        $upstreamOk = false;
+        try {
+            $res = $client->get($upstream . '/api/auth/session');
+            $code = $res->getStatusCode();
+            $upstreamStatus = "HTTP {$code}";
+            $upstreamOk = $code >= 200 && $code < 500;
+        } catch (\Throwable $e) {
+            $upstreamStatus = $e->getMessage();
         }
 
-        $this->warn("⚠️ No active tokens found in the pool. Use `php artisan mirror:token:add` to register a session token.");
-        return self::FAILURE;
+        $powSupported = in_array('sha3-512', hash_algos(), true);
+        $gdSupported = extension_loaded('gd');
+        $tablesOk = Schema::hasTable('mirror_tokens')
+            && Schema::hasTable('mirror_conversations')
+            && Schema::hasTable('mirror_messages');
+
+        $stats = $pool->getPoolStats();
+
+        $this->table(
+            ['Check', 'Result'],
+            [
+                ['Upstream URL', $upstream],
+                ['Egress Mode', 'Direct Egress'],
+                ['Public Egress IP', $egressIp],
+                ['Upstream Reachability', $upstreamStatus],
+                ['SHA3-512 PoW Solver', $powSupported ? 'Supported' : 'Missing PHP sha3-512'],
+                ['GD Image Conversion', $gdSupported ? 'Loaded' : 'Missing PHP GD'],
+                ['Database Tables', $tablesOk ? 'OK' : 'Run migrations'],
+                ['Active Tokens in Pool', "{$stats['active_tokens']} / {$stats['total_tokens']}"],
+                ['Cooldown Tokens', (string) $stats['cooldown_tokens']],
+                ['Active Requests Now', (string) $stats['total_active_requests']],
+            ]
+        );
+
+        return ($upstreamOk && $powSupported && $tablesOk && $stats['active_tokens'] > 0)
+            ? self::SUCCESS
+            : self::FAILURE;
     }
 }

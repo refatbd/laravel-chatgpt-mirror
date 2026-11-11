@@ -5,163 +5,207 @@ declare(strict_types=1);
 namespace Refatbd\LaravelChatGptMirror\Controllers;
 
 use GuzzleHttp\Client;
-use GuzzleHttp\Exception\GuzzleException;
 use Illuminate\Http\Request;
-use Illuminate\Http\Response;
 use Illuminate\Routing\Controller;
+use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\File;
 use Refatbd\LaravelChatGptMirror\Services\BrowserPatchManager;
-use Throwable;
+use Refatbd\LaravelChatGptMirror\Services\SecurityService;
+use Refatbd\LaravelChatGptMirror\Services\TokenPoolManager;
+use Refatbd\LaravelChatGptMirror\Services\UrlRewriter;
+use Symfony\Component\HttpFoundation\Response;
 
+/**
+ * Reverse-proxies the ChatGPT web UI and static bundles through Mirror cleanly:
+ * strips blocking security headers, rewrites upstream origins, sanitizes SSR tokens,
+ * fixes POST Content-Type forwarding, and preserves `/` UI parity cleanly.
+ */
 class BrowserProxyController extends Controller
 {
     protected Client $http;
+    protected BrowserPatchManager $patcher;
+    protected UrlRewriter $rewriter;
+    protected TokenPoolManager $pool;
+    protected SecurityService $security;
 
     public function __construct(
-        protected BrowserPatchManager $patchManager,
-        protected \Refatbd\LaravelChatGptMirror\Services\TokenPoolManager $poolManager
+        BrowserPatchManager $patcher,
+        UrlRewriter $rewriter,
+        TokenPoolManager $pool,
+        SecurityService $security
     ) {
+        $this->patcher = $patcher;
+        $this->rewriter = $rewriter;
+        $this->pool = $pool;
+        $this->security = $security;
+
         $this->http = new Client([
-            'base_uri' => config('mirror.upstream', 'https://chatgpt.com'),
-            'timeout' => 45,
-            'connect_timeout' => 10,
-            'verify' => (bool) config('mirror.egress.verify_ssl', true),
-            'proxy' => config('mirror.egress.proxy'),
-            'headers' => [
-                'User-Agent' => 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36',
-                'Accept' => 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-                'Accept-Language' => 'en-US,en;q=0.9',
-            ],
+            'base_uri' => rtrim((string) config('mirror.upstream', 'https://chatgpt.com'), '/'),
+            'timeout' => (float) config('mirror.http.timeout', 60),
+            'connect_timeout' => (float) config('mirror.http.connect_timeout', 15),
+            'verify' => (bool) config('mirror.http.verify_ssl', true),
+            'proxy' => config('mirror.http.proxy'),
+            'http_errors' => false,
+            'allow_redirects' => false,
         ]);
     }
 
-    /**
-     * Proxy ChatGPT Web UI root and sub-paths.
-     */
-    public function proxy(Request $request, ?string $path = null): Response
+    public function proxy(Request $request, string $path = ''): Response
     {
-        $resolvedPath = $path ?? $request->path();
-        if ($resolvedPath === 'mirror' || $resolvedPath === '/') {
-            $targetPath = '/';
+        if (str_starts_with($request->path(), 'ces/noop')) {
+            return response('', 204);
+        }
+
+        $targetPath = '/' . ltrim($path, '/');
+        if ($targetPath === '/' && $request->path() !== '/') {
+            $targetPath = '/' . ltrim($request->path(), '/');
+        }
+
+        if (str_starts_with($targetPath, '/cdn/')) {
+            $targetPath = substr($targetPath, 4);
+            $baseOverride = 'https://cdn.oaistatic.com';
         } else {
-            $targetPath = '/' . ltrim(preg_replace('#^mirror/?#', '', $resolvedPath), '/');
+            $baseOverride = null;
         }
 
         $query = $request->getQueryString();
-        if ($query) {
-            $targetPath .= '?' . $query;
-        }
+        $fullPath = $targetPath . ($query ? '?' . $query : '');
+        $localOrigin = $request->getSchemeAndHttpHost();
 
-        $isStaticAsset = $request->isMethod('get') && (
-            preg_match('/\.(js|css|svg|png|jpg|jpeg|webp|avif|woff2?|ttf|ico)$/i', parse_url($targetPath, PHP_URL_PATH) ?? '') ||
-            str_starts_with($targetPath, '/cdn/') ||
-            str_starts_with($targetPath, '/_next/')
-        );
+        // Disk cache for immutable static bundles (including query string in cache key!)
+        $isStaticAsset = preg_match('#\.(js|css|woff2?|png|jpg|jpeg|gif|svg|ico|json|webp)$#i', $targetPath) === 1;
+        if ($request->isMethod('get') && $isStaticAsset && !str_starts_with($targetPath, '/api/')) {
+            $cacheKey = md5(($baseOverride ?: '') . $fullPath);
+            $cacheDir = storage_path('framework/mirror-assets');
+            $cacheFile = $cacheDir . '/' . $cacheKey;
+            $metaFile = $cacheDir . '/' . $cacheKey . '.meta.json';
 
-        // 1. Check local disk cache for static assets to eliminate sequential network latency in PHP-CLI
-        if ($isStaticAsset) {
-            $cleanStaticPath = parse_url($targetPath, PHP_URL_PATH);
-            $cacheDir = storage_path('framework/cache/mirror-assets');
-            $cacheKey = md5($cleanStaticPath);
-            $ext = pathinfo($cleanStaticPath, PATHINFO_EXTENSION) ?: 'bin';
-            $cachedFile = "{$cacheDir}/{$cacheKey}.{$ext}";
-            $metaFile = "{$cacheDir}/{$cacheKey}.meta";
-
-            if (file_exists($cachedFile) && file_exists($metaFile)) {
-                $meta = json_decode((string) file_get_contents($metaFile), true) ?? [];
-                $contentType = $meta['content-type'] ?? $this->guessMimeType($ext);
-
-                return response((string) file_get_contents($cachedFile), 200, [
-                    'Content-Type' => $contentType,
-                    'Cache-Control' => 'public, max-age=31536000, immutable',
-                    'X-Mirror-Cache' => 'HIT',
+            if (File::exists($cacheFile) && File::exists($metaFile)) {
+                $meta = json_decode((string) File::get($metaFile), true) ?: [];
+                return response(File::get($cacheFile), 200, [
+                    'Content-Type' => $meta['content_type'] ?? $this->guessMimeType($targetPath),
+                    'Cache-Control' => str_contains((string) ($meta['content_type'] ?? ''), 'javascript')
+                        ? 'no-store'
+                        : 'public, max-age=86400',
+                    'Alt-Svc' => 'clear',
                 ]);
             }
         }
 
+        $token = $this->pool->acquire();
+        $upstreamHost = parse_url($baseOverride ?: (string) config('mirror.upstream', 'https://chatgpt.com'), PHP_URL_HOST) ?: 'chatgpt.com';
+
         $headers = [
-            'Origin' => 'https://chatgpt.com',
-            'Referer' => 'https://chatgpt.com/',
+            'User-Agent' => (string) config('mirror.http.user_agent', $request->userAgent() ?: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'),
+            'Accept' => (string) $request->header('Accept', 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'),
+            'Accept-Language' => 'en-US,en;q=0.9',
+            'Origin' => 'https://' . $upstreamHost,
+            'Referer' => 'https://' . $upstreamHost . '/',
         ];
 
-        try {
-            $token = $this->poolManager->acquire();
-            if ($token && $token->session_token) {
-                $headers['Cookie'] = "__Secure-next-auth.session-token={$token->session_token}";
+        $cookies = [];
+        if ($token && $token->session_token) {
+            $cookies[] = '__Secure-next-auth.session-token=' . $token->session_token;
+        }
+        $clientCookie = $request->header('Cookie');
+        if ($clientCookie) {
+            // Strip local mirror_control cookie before forwarding upstream.
+            $filtered = preg_replace('/(?:^|;\s*)mirror_control=[^;]*/i', '', $clientCookie);
+            $filtered = trim((string) $filtered, "; \t");
+            if ($filtered !== '') {
+                $cookies[] = $filtered;
             }
-            if ($token) {
-                $this->poolManager->release($token, true);
-            }
-        } catch (Throwable) {}
+        }
+        if ($cookies !== []) {
+            $headers['Cookie'] = implode('; ', $cookies);
+        }
+
+        if ($request->isMethod('post') || $request->isMethod('put') || $request->isMethod('patch')) {
+            $headers['Content-Type'] = (string) $request->header('Content-Type', 'application/json');
+        }
 
         try {
             $options = [
-                'http_errors' => false,
                 'headers' => $headers,
             ];
-
             if ($request->isMethod('post') || $request->isMethod('put') || $request->isMethod('patch')) {
                 $options['body'] = $request->getContent();
-                $headers['Content-Type'] = $request->header('Content-Type', 'application/json');
             }
 
-            $response = $this->http->request($request->method(), $targetPath, $options);
-
-            $contentType = $response->getHeaderLine('Content-Type');
+            $upstreamUrl = $baseOverride ? ($baseOverride . $fullPath) : $fullPath;
+            $response = $this->http->request($request->method(), $upstreamUrl, $options);
+            $status = $response->getStatusCode();
             $body = (string) $response->getBody();
 
-            // Save to disk cache if it's a static asset and upstream succeeded
-            if ($isStaticAsset && $response->getStatusCode() === 200) {
-                $cleanStaticPath = parse_url($targetPath, PHP_URL_PATH);
-                $cacheDir = storage_path('framework/cache/mirror-assets');
-                if (!is_dir($cacheDir)) {
-                    @mkdir($cacheDir, 0755, true);
-                }
-                $cacheKey = md5($cleanStaticPath);
-                $ext = pathinfo($cleanStaticPath, PATHINFO_EXTENSION) ?: 'bin';
-                $cachedFile = "{$cacheDir}/{$cacheKey}.{$ext}";
-                $metaFile = "{$cacheDir}/{$cacheKey}.meta";
-
-                @file_put_contents($cachedFile, $body);
-                @file_put_contents($metaFile, json_encode(['content-type' => $contentType]));
+            $rawHeaders = [];
+            foreach ($response->getHeaders() as $k => $vals) {
+                $rawHeaders[$k] = $vals[0] ?? '';
             }
 
-            $laravelResponse = response($body, $response->getStatusCode());
-
-            // Forward filtered headers
-            $respHeaders = $this->patchManager->cleanHeaders($response->getHeaders());
-            foreach ($respHeaders as $key => $values) {
-                if (strtolower($key) !== 'transfer-encoding') {
-                    $laravelResponse->header($key, implode(', ', $values));
-                }
+            // Rewrite Location redirects back onto local mirror host cleanly.
+            if (isset($rawHeaders['Location']) || isset($rawHeaders['location'])) {
+                $loc = $rawHeaders['Location'] ?? $rawHeaders['location'];
+                $rawHeaders['Location'] = $this->rewriter->rewriteText($loc, $localOrigin);
+                unset($rawHeaders['location']);
             }
 
-            // Patch HTML if content is HTML
+            $cleanedHeaders = $this->patcher->cleanHeaders($rawHeaders);
+            $cleanedHeaders['Alt-Svc'] = 'clear';
+            $contentType = (string) ($cleanedHeaders['Content-Type'] ?? $cleanedHeaders['content-type'] ?? $this->guessMimeType($targetPath));
+
             if (stripos($contentType, 'text/html') !== false) {
-                $patchedBody = $this->patchManager->patchHtml($body);
-                $laravelResponse->setContent($patchedBody);
+                $body = $this->patcher->patchHtml($body, $localOrigin);
+                $cleanedHeaders['Cache-Control'] = 'no-store';
+                $resp = response($body, $status, $cleanedHeaders);
+                return $this->security->attachControlCookie($resp, $request);
             }
 
-            return $laravelResponse;
-        } catch (GuzzleException $e) {
-            return response("Upstream gateway error: " . $e->getMessage(), 502);
-        } catch (Throwable $e) {
-            return response("Proxy error: " . $e->getMessage(), 500);
+            if (
+                stripos($contentType, 'javascript') !== false ||
+                stripos($contentType, 'text/css') !== false ||
+                stripos($contentType, 'application/json') !== false
+            ) {
+                $body = $this->rewriter->rewriteText($body, $localOrigin, $contentType);
+                $cleanedHeaders['Cache-Control'] = 'no-store';
+            }
+
+            if ($status === 200 && $request->isMethod('get') && $isStaticAsset && isset($cacheFile, $metaFile)) {
+                try {
+                    File::ensureDirectoryExists(dirname($cacheFile));
+                    File::put($cacheFile, $body);
+                    File::put($metaFile, json_encode(['content_type' => $contentType]));
+                } catch (\Throwable) {
+                }
+            }
+
+            return response($body, $status, $cleanedHeaders);
+        } catch (\Throwable $e) {
+            return response()->json([
+                'error' => 'Mirror Browser Proxy Error: ' . $e->getMessage(),
+            ], 502);
+        } finally {
+            if ($token) {
+                $this->pool->release($token, true);
+            }
         }
     }
 
-    protected function guessMimeType(string $ext): string
+    protected function guessMimeType(string $path): string
     {
-        return match (strtolower($ext)) {
-            'js', 'mjs' => 'application/javascript; charset=UTF-8',
-            'css' => 'text/css; charset=UTF-8',
+        $ext = strtolower(pathinfo($path, PATHINFO_EXTENSION));
+        return match ($ext) {
+            'js', 'mjs' => 'application/javascript; charset=utf-8',
+            'css' => 'text/css; charset=utf-8',
+            'json' => 'application/json; charset=utf-8',
             'svg' => 'image/svg+xml',
             'png' => 'image/png',
             'jpg', 'jpeg' => 'image/jpeg',
-            'woff2' => 'font/woff2',
+            'gif' => 'image/gif',
+            'webp' => 'image/webp',
             'woff' => 'font/woff',
-            'ttf' => 'font/ttf',
-            'json' => 'application/json',
-            default => 'application/octet-stream',
+            'woff2' => 'font/woff2',
+            'ico' => 'image/x-icon',
+            default => 'text/html; charset=utf-8',
         };
     }
 }

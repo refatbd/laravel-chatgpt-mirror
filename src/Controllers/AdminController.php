@@ -4,632 +4,615 @@ declare(strict_types=1);
 
 namespace Refatbd\LaravelChatGptMirror\Controllers;
 
-use Carbon\Carbon;
-use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
-use Illuminate\Http\Response;
 use Illuminate\Routing\Controller;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Str;
+use Refatbd\LaravelChatGptMirror\Models\MirrorConversation;
 use Refatbd\LaravelChatGptMirror\Models\MirrorToken;
-use Refatbd\LaravelChatGptMirror\Services\ChatGptClient;
+use Refatbd\LaravelChatGptMirror\Services\FailureTracker;
+use Refatbd\LaravelChatGptMirror\Services\SecurityService;
 use Refatbd\LaravelChatGptMirror\Services\TokenPoolManager;
 use Refatbd\LaravelChatGptMirror\Services\TokenRefresher;
-use Throwable;
+use Symfony\Component\HttpFoundation\Cookie;
+use Symfony\Component\HttpFoundation\Response;
 
+/**
+ * Provides Admin UI dashboard, pool metrics, health/diagnostics/capabilities APIs,
+ * and programmatic /api/session token lifecycle management.
+ */
 class AdminController extends Controller
 {
+    private const FLASH_COOKIE = 'mirror_admin_flash';
+
     public function __construct(
-        protected TokenPoolManager $poolManager,
+        protected TokenPoolManager $pool,
         protected TokenRefresher $refresher,
-        protected ChatGptClient $client
-    ) {
-    }
+        protected FailureTracker $failures,
+        protected SecurityService $security
+    ) {}
 
-    /**
-     * Render the administrative dashboard & settings UI.
-     */
-    public function index(): Response
+    public function index(Request $request): Response
     {
-        $tokens = MirrorToken::orderBy('id', 'desc')->get();
-        $stats = $this->poolManager->getPoolStats();
-        $config = config('mirror');
+        $stats = $this->pool->getPoolStats();
+        $tokens = MirrorToken::orderBy('id', 'asc')->get();
+        $conversations = MirrorConversation::orderByDesc('last_active_at')->take(25)->get();
+        $recentFailures = $this->failures->recent();
+        $flash = $this->pullFlash($request);
 
-        $html = $this->renderView($tokens, $stats, $config);
-
-        return response($html, 200)->header('Content-Type', 'text/html; charset=utf-8');
-    }
-
-    /**
-     * Add and validate a new token via UI.
-     */
-    public function addToken(Request $request)
-    {
-        $raw = trim((string) $request->input('session_token', ''));
-        $name = trim((string) $request->input('name', ''));
-
-        if (empty($raw)) {
-            return redirect()->back()->with('error', 'Session token cannot be empty.');
-        }
-
-        // Check if raw is a JSON dump
-        $json = json_decode($raw, true);
-        if (is_array($json) && (isset($json['accessToken']) || isset($json['sessionToken']))) {
-            $token = MirrorToken::create([
-                'name' => $name ?: ($json['user']['name'] ?? 'Imported Account'),
-                'email' => $json['user']['email'] ?? null,
-                'session_token' => $json['sessionToken'] ?? ($json['accessToken'] ?? ''),
-                'access_token' => $json['accessToken'] ?? null,
-                'access_token_expires_at' => isset($json['expires']) ? Carbon::parse($json['expires']) : now()->addDays(7),
-                'plan_type' => $json['account']['planType'] ?? 'free',
-                'account_id' => $json['account']['id'] ?? ($json['user']['id'] ?? null),
-                'status' => 'active',
-                'last_refreshed_at' => now(),
-                'meta' => $json,
-            ]);
-
-            return redirect()->back()->with('success', "Account {$token->email} added successfully!");
-        }
-
-        $token = new MirrorToken([
-            'name' => $name ?: 'Account #' . (MirrorToken::count() + 1),
-            'session_token' => $raw,
-            'status' => 'active',
+        $html = $this->renderView($request, $stats, $tokens, $conversations, $recentFailures, $flash);
+        $response = response($html, 200, [
+            'Content-Type' => 'text/html; charset=utf-8',
+            'Cache-Control' => 'no-store',
         ]);
-        $token->save();
 
-        try {
-            $this->refresher->refresh($token);
-            return redirect()->back()->with('success', "Token #{$token->id} ({$token->email}) validated and added to pool!");
-        } catch (Throwable $e) {
-            return redirect()->back()->with('warning', "Token saved, but verification failed: " . $e->getMessage());
+        if ($flash !== null) {
+            $response->headers->clearCookie(self::FLASH_COOKIE, '/');
         }
+
+        return $this->security->attachControlCookie($response, $request);
     }
 
-    /**
-     * Refresh a specific token.
-     */
-    public function refreshToken(int $id)
+    public function addToken(Request $request): Response
     {
-        $token = MirrorToken::findOrFail($id);
-        try {
-            $this->refresher->refresh($token);
-            return redirect()->back()->with('success', "Token #{$token->id} refreshed successfully!");
-        } catch (Throwable $e) {
-            return redirect()->back()->with('error', "Refresh failed: " . $e->getMessage());
+        $sessionToken = trim((string) $request->input('session_token', ''));
+        $turnstileToken = trim((string) $request->input('turnstile_token', ''));
+        $customName = trim((string) $request->input('name', ''));
+
+        if (strlen($sessionToken) < 20) {
+            return $this->redirectWithFlash('error', 'Session token must be at least 20 characters.');
         }
+
+        $verified = $this->refresher->verifyCandidateSessionToken($sessionToken);
+        if (!$verified) {
+            $this->failures->record('invalid_session_token', $request->header('x-request-id'), 'session_verification_failed');
+            return $this->redirectWithFlash('error', 'ChatGPT upstream rejected this __Secure-next-auth.session-token.');
+        }
+
+        $hash = hash('sha256', $verified['session_token']);
+        $token = MirrorToken::where('token_hash', $hash)->first();
+
+        $attributes = [
+            'name' => $customName !== '' ? $customName : ($verified['name'] ?: 'Account ' . Str::random(4)),
+            'session_token' => $verified['session_token'],
+            'token_hash' => $hash,
+            'access_token' => $verified['access_token'],
+            'access_token_expires_at' => $verified['expires_at'],
+            'email' => $verified['email'],
+            'account_id' => $verified['account_id'],
+            'plan_type' => $verified['plan_type'] ?? 'free',
+            'status' => 'active',
+            'consecutive_errors' => 0,
+            'cooldown_until' => null,
+            'last_refreshed_at' => now(),
+            'last_error' => null,
+        ];
+
+        if ($token) {
+            $token->update($attributes);
+        } else {
+            $token = MirrorToken::create($attributes);
+        }
+
+        if ($turnstileToken !== '') {
+            $token->setTurnstileToken($turnstileToken);
+            $token->save();
+        }
+
+        $label = $token->email ?: $token->name;
+        return $this->redirectWithFlash('success', "Verified and saved account: {$label}");
     }
 
-    /**
-     * Delete a token from the pool.
-     */
-    public function deleteToken(int $id)
+    public function refreshToken(int|string $id): Response
     {
         $token = MirrorToken::findOrFail($id);
+        $ok = $this->refresher->refresh($token);
+
+        return $ok
+            ? $this->redirectWithFlash('success', "Token #{$token->id} ({$token->name}) refreshed successfully.")
+            : $this->redirectWithFlash('error', "Failed to refresh token #{$token->id}: " . ($token->last_error ?: 'upstream rejected session.'));
+    }
+
+    public function deleteToken(int|string $id): Response
+    {
+        $token = MirrorToken::findOrFail($id);
+        $label = $token->name;
         $token->delete();
+        $this->security->rotateAssetLinkGeneration();
 
-        return redirect()->back()->with('success', "Token #{$id} deleted from pool.");
+        return $this->redirectWithFlash('success', "Removed account '{$label}' and rotated asset tickets.");
     }
 
-    /**
-     * Reset stuck in-flight counters.
-     */
-    public function resetCounters()
+    public function resetCounters(): Response
     {
-        MirrorToken::query()->update(['active_requests' => 0]);
+        MirrorToken::query()->update([
+            'active_requests' => 0,
+            'consecutive_errors' => 0,
+            'cooldown_until' => null,
+            'status' => 'active',
+            'last_error' => null,
+        ]);
 
-        return redirect()->back()->with('success', 'In-flight counters reset to 0.');
+        return $this->redirectWithFlash('success', 'All token counters and cooldowns were reset.');
     }
 
-    /**
-     * Return live pool statistics in JSON.
-     */
-    public function stats(): JsonResponse
+    public function stats(): Response
     {
-        $stats = $this->poolManager->getPoolStats();
-        $stats['strategy'] = config('mirror.pool.strategy', 'least_busy');
+        $stats = $this->pool->getPoolStats();
 
-        return response()->json($stats);
+        return response()->json([
+            'total_tokens' => $stats['total_tokens'],
+            'active_healthy' => $stats['active_tokens'],
+            'in_cooldown' => $stats['cooldown_tokens'],
+            'total_requests_served' => $stats['total_lifetime_requests'],
+            'total_in_flight_requests' => $stats['total_active_requests'],
+            'strategy' => (string) config('mirror.pool.strategy', 'least_busy'),
+            'pool' => $stats,
+            'active_conversations' => MirrorConversation::count(),
+        ]);
     }
 
-    /**
-     * Return system health status matching Node.js /api/health.
-     */
-    public function health(): JsonResponse
+    public function health(): Response
     {
-        $all = MirrorToken::all();
+        $dbOk = true;
+        try {
+            DB::select('SELECT 1');
+        } catch (\Throwable) {
+            $dbOk = false;
+        }
+
+        $stats = $this->pool->getPoolStats();
+        $healthy = $dbOk && ($stats['active_tokens'] > 0);
+
+        return response()->json([
+            'status' => $healthy ? 'ok' : 'degraded',
+            'ok' => $healthy,
+            'configured' => $stats['total_tokens'] > 0,
+            'version' => '2.1.0',
+            'database' => $dbOk ? 'ok' : 'error',
+            'active_tokens' => $stats['active_tokens'],
+            'total_tokens' => $stats['total_tokens'],
+            'cooldown_tokens' => $stats['cooldown_tokens'],
+            'upstream' => config('mirror.upstream', 'https://chatgpt.com'),
+            'egressMode' => 'direct',
+            'sha3_512_supported' => in_array('sha3-512', hash_algos(), true),
+            'gd_supported' => extension_loaded('gd'),
+        ], $healthy ? 200 : 503);
+    }
+
+    public function diagnostics(): Response
+    {
+        $dbOk = true;
+        try {
+            DB::select('SELECT 1');
+        } catch (\Throwable) {
+            $dbOk = false;
+        }
+
+        return response()->json([
+            'schemaVersion' => '2026-11',
+            'ok' => $dbOk,
+            'version' => '2.1.0',
+            'build' => [
+                'package' => 'refatbd/laravel-chatgpt-mirror',
+                'version' => '2.1.0',
+                'framework' => 'laravel',
+                'php' => PHP_VERSION,
+            ],
+            'storage' => [
+                'engine' => (string) config('database.default'),
+                'healthy' => $dbOk,
+            ],
+            'config' => [
+                'upstream' => (string) config('mirror.upstream', 'https://chatgpt.com'),
+                'egressMode' => 'direct',
+                'openaiPrefix' => '/' . trim((string) config('mirror.routes.openai_prefix', 'v1'), '/'),
+            ],
+            'uptimeSeconds' => (int) (defined('LARAVEL_START') ? max(0, microtime(true) - LARAVEL_START) : 0),
+            'database' => $dbOk ? 'ok' : 'error',
+            'egressMode' => 'direct',
+            'pool' => $this->pool->getPoolStats(),
+            'active_conversations' => MirrorConversation::count(),
+            'recentFailures' => $this->failures->recent(),
+            'timestamp' => now()->toIso8601String(),
+        ]);
+    }
+
+    public function capabilities(Request $request): Response
+    {
+        $openaiPrefix = '/' . trim((string) config('mirror.routes.openai_prefix', 'v1'), '/');
+
+        $endpoints = [
+            'chat_completions' => "{$openaiPrefix}/chat/completions",
+            'responses' => "{$openaiPrefix}/responses",
+            'models' => "{$openaiPrefix}/models",
+            'capabilities' => "{$openaiPrefix}/capabilities",
+            'playground' => '/mirror/playground',
+            'admin' => '/' . trim((string) config('mirror.routes.admin_prefix', 'mirror/admin'), '/'),
+            'api_docs' => '/mirror/api-docs',
+            'openapi' => '/mirror/openapi',
+            'mirror_chat' => '/api/chat',
+            'mirror_conversations' => '/api/conversations',
+            'mirror_files' => '/api/files',
+            'mirror_assets' => '/api/assets',
+            'mirror_convert' => '/api/convert/formats',
+            'mirror_decoder_challenges' => '/api/decoder-challenges',
+        ];
+
+        $features = [
+            'streaming' => true,
+            'sse_v1_patch' => true,
+            'sentinel_pow' => in_array('sha3-512', hash_algos(), true),
+            'conduit' => true,
+            'responses_api' => true,
+            'tools' => true,
+            'attachments' => true,
+            'rich_output' => true,
+            'conversations' => true,
+            'conversions' => true,
+            'decoder_challenges' => true,
+            'multi_account_pool' => true,
+            'browser_proxy' => true,
+            'websocket_proxy' => false,
+            'warp_egress_toggle' => false,
+        ];
+
+        return response()->json([
+            'schemaVersion' => '2026-11',
+            'server' => 'laravel-chatgpt-mirror',
+            'version' => '2.1.0',
+            'routes' => $endpoints,
+            'fields' => [
+                'chat_completions' => ['model', 'messages', 'stream', 'tools', 'tool_choice', 'metadata'],
+                'responses' => ['model', 'input', 'instructions', 'stream', 'tools', 'tool_choice', 'metadata'],
+                'mirror_chat' => ['conversationId', 'message', 'model', 'gizmoId', 'private', 'temporary', 'attachments', 'instructions'],
+            ],
+            'supported' => $features,
+            'endpoints' => $endpoints,
+            'features' => $features,
+            'notes' => [
+                'websocket_proxy' => 'PHP built-in development server does not terminate raw WebSocket upgrades; HTTP SSE and proxy fallback operate directly.',
+            ],
+        ]);
+    }
+
+    public function getSession(): Response
+    {
+        $stats = $this->pool->getPoolStats();
+        $latest = MirrorToken::orderByDesc('last_refreshed_at')->orderByDesc('id')->first();
+
+        return response()->json([
+            'configured' => $stats['total_tokens'] > 0,
+            'savedAt' => $latest?->last_refreshed_at?->toIso8601String() ?? $latest?->created_at?->toIso8601String(),
+            'hasTurnstileToken' => $latest ? ($latest->getTurnstileToken() !== null) : false,
+            'active_tokens' => $stats['active_tokens'],
+            'healthy_tokens' => $stats['active_tokens'],
+            'total_tokens' => $stats['total_tokens'],
+            'accounts' => collect($stats['tokens'])->map(fn (array $t) => [
+                'id' => $t['id'],
+                'name' => $t['name'],
+                'email' => $t['email'],
+                'plan' => $t['plan_type'],
+                'status' => $t['status'],
+                'expires_at' => $t['expires_at'],
+                'has_turnstile_token' => $t['has_turnstile_token'] ?? false,
+            ])->all(),
+        ]);
+    }
+
+    public function postSession(Request $request): Response
+    {
+        $sessionToken = trim((string) ($request->input('sessionToken') ?? $request->input('session_token') ?? ''));
+        $turnstileToken = trim((string) ($request->input('turnstileToken') ?? $request->input('turnstile_token') ?? ''));
+        $name = trim((string) ($request->input('name') ?? ''));
+
+        if (strlen($sessionToken) < 20) {
+            return response()->json(['error' => 'That does not look like a valid sessionToken (minimum 20 characters).'], 400);
+        }
+
+        $verified = $this->refresher->verifyCandidateSessionToken($sessionToken);
+        if (!$verified) {
+            $this->failures->record('invalid_session_token', $request->header('x-request-id'), 'session_verification_failed');
+            return response()->json(['error' => 'Failed to verify session token with ChatGPT upstream'], 401);
+        }
+
+        $hash = hash('sha256', $verified['session_token']);
+        $token = MirrorToken::where('token_hash', $hash)->first();
+
+        $attrs = [
+            'name' => $name !== '' ? $name : ($verified['name'] ?: 'API Session Account'),
+            'session_token' => $verified['session_token'],
+            'token_hash' => $hash,
+            'access_token' => $verified['access_token'],
+            'access_token_expires_at' => $verified['expires_at'],
+            'email' => $verified['email'],
+            'account_id' => $verified['account_id'],
+            'plan_type' => $verified['plan_type'] ?? 'free',
+            'status' => 'active',
+            'consecutive_errors' => 0,
+            'cooldown_until' => null,
+            'last_refreshed_at' => now(),
+            'last_error' => null,
+        ];
+
+        if ($token) {
+            $token->update($attrs);
+        } else {
+            $token = MirrorToken::create($attrs);
+        }
+
+        if ($turnstileToken !== '') {
+            $token->setTurnstileToken($turnstileToken);
+            $token->save();
+        }
+
+        $this->security->rotateAssetLinkGeneration();
 
         return response()->json([
             'ok' => true,
-            'storage' => config('mirror.storage.driver', 'database'),
-            'configured' => $all->where('status', 'active')->count() > 0,
-            'active_tokens' => $all->filter->isHealthy()->count(),
-            'in_flight' => (int) $all->sum('active_requests'),
-            'total_served' => (int) $all->sum('total_requests'),
-            'upstream' => config('mirror.upstream', 'https://chatgpt.com'),
-        ]);
-    }
-
-    /**
-     * Return detailed system diagnostics matching Node.js /api/diagnostics.
-     */
-    public function diagnostics(): JsonResponse
-    {
-        $all = MirrorToken::all();
-
-        return response()->json([
-            'schemaVersion' => 1,
-            'build' => [
-                'package' => 'refatbd/laravel-chatgpt-mirror',
-                'version' => '1.0.0',
-                'framework' => 'Laravel ' . app()->version(),
-                'php' => PHP_VERSION,
-            ],
-            'api' => [
-                'reachable' => true,
-                'key_configured' => !empty(config('mirror.api_key')),
-            ],
-            'storage' => [
-                'engine' => 'sqlite',
-                'healthy' => true,
-                'tokens_count' => $all->count(),
-            ],
-            'pool' => $this->poolManager->getPoolStats(),
-            'config' => [
-                'strategy' => config('mirror.pool.strategy'),
-                'cooldown_seconds' => config('mirror.pool.cooldown_seconds'),
-                'openai_prefix' => config('mirror.routes.openai_prefix'),
-                'browser_prefix' => config('mirror.routes.browser_prefix'),
-            ],
-        ]);
-    }
-
-    /**
-     * Return OpenAI capabilities matrix matching Node.js /v1/capabilities.
-     */
-    public function capabilities(): JsonResponse
-    {
-        return response()->json([
-            'schemaVersion' => 1,
-            'routes' => [
-                'GET /v1/models',
-                'POST /v1/chat/completions',
-                'GET /v1/capabilities',
-            ],
-            'fields' => ['model', 'messages', 'stream', 'temperature', 'max_tokens'],
-            'metadataFields' => ['conversation_id'],
-            'supported' => [
-                'text_streaming' => true,
-                'least_busy_pooling' => true,
-                'multi_account_pooling' => true,
-                'direct_gateway' => true,
-                'automatic_429_cooldown' => true,
-            ],
-        ]);
-    }
-
-    /**
-     * Programmatic session status (/api/session).
-     */
-    public function getSession(): JsonResponse
-    {
-        $active = MirrorToken::where('status', 'active')->first();
-
-        return response()->json([
-            'configured' => $active !== null,
-            'total_tokens' => MirrorToken::count(),
-            'active_tokens' => MirrorToken::where('status', 'active')->count(),
-            'account' => $active ? [
-                'id' => $active->id,
-                'email' => $active->email,
-                'name' => $active->name,
-                'plan' => $active->plan_type,
-            ] : null,
-        ]);
-    }
-
-    /**
-     * Programmatic session addition (/api/session).
-     */
-    public function postSession(Request $request): JsonResponse
-    {
-        $raw = trim((string) $request->input('sessionToken', $request->input('session_token', '')));
-        if (empty($raw)) {
-            return response()->json(['error' => 'sessionToken is required'], 422);
-        }
-
-        $token = new MirrorToken([
-            'name' => $request->input('name', 'API Session Account'),
-            'session_token' => $raw,
-            'status' => 'active',
-        ]);
-        $token->save();
-
-        try {
-            $this->refresher->refresh($token);
-            return response()->json([
-                'ok' => true,
+            'id' => $token->id,
+            'accountId' => $token->account_id,
+            'email' => $token->email,
+            'plan_type' => $token->plan_type,
+            'account' => [
                 'id' => $token->id,
-                'email' => $token->email,
                 'name' => $token->name,
-            ]);
-        } catch (Throwable $e) {
-            return response()->json([
-                'ok' => false,
-                'error' => 'Validation error: ' . $e->getMessage(),
-            ], 400);
-        }
+                'email' => $token->email,
+                'accountId' => $token->account_id,
+                'plan' => $token->plan_type,
+                'status' => $token->status,
+            ],
+        ]);
     }
 
-    /**
-     * Programmatic session clear (/api/session).
-     */
-    public function deleteSession(): JsonResponse
+    public function deleteSession(): Response
     {
         MirrorToken::query()->delete();
-        return response()->json(['ok' => true]);
+        $this->security->rotateAssetLinkGeneration();
+
+        return response()->json(['ok' => true, 'message' => 'All mirror sessions cleared']);
+    }
+
+    protected function redirectWithFlash(string $type, string $message): Response
+    {
+        $payload = json_encode(['type' => $type, 'message' => $message]);
+        $sig = hash_hmac('sha256', (string) $payload, $this->security->hmacSecret());
+        $encoded = base64_encode(json_encode(['p' => $payload, 's' => $sig]));
+
+        $adminPath = '/' . trim((string) config('mirror.routes.admin_prefix', 'mirror/admin'), '/');
+        $response = redirect($adminPath);
+        $response->headers->setCookie(Cookie::create(
+            self::FLASH_COOKIE,
+            $encoded,
+            now()->addMinutes(5)->getTimestamp(),
+            '/',
+            null,
+            false,
+            true,
+            false,
+            Cookie::SAMESITE_LAX
+        ));
+
+        return $response;
     }
 
     /**
-     * Render the complete self-contained Admin Dashboard HTML.
+     * @return array{type: string, message: string}|null
      */
-    protected function renderView($tokens, array $stats, array $config): string
+    protected function pullFlash(Request $request): ?array
     {
-        $csrf = function_exists('csrf_token') ? csrf_token() : '';
-        $rows = '';
+        $raw = $request->cookie(self::FLASH_COOKIE);
+        if (!is_string($raw) || $raw === '') {
+            return null;
+        }
+
+        $decoded = json_decode((string) base64_decode($raw, true), true);
+        if (!is_array($decoded) || empty($decoded['p']) || empty($decoded['s'])) {
+            return null;
+        }
+
+        $expected = hash_hmac('sha256', (string) $decoded['p'], $this->security->hmacSecret());
+        if (!hash_equals($expected, (string) $decoded['s'])) {
+            return null;
+        }
+
+        $flash = json_decode((string) $decoded['p'], true);
+        return is_array($flash) && isset($flash['type'], $flash['message']) ? $flash : null;
+    }
+
+    /**
+     * @param array<string, mixed> $stats
+     * @param iterable<MirrorToken> $tokens
+     * @param iterable<MirrorConversation> $conversations
+     * @param array<int, array<string, mixed>> $recentFailures
+     * @param array{type: string, message: string}|null $flash
+     */
+    protected function renderView(
+        Request $request,
+        array $stats,
+        iterable $tokens,
+        iterable $conversations,
+        array $recentFailures,
+        ?array $flash
+    ): string {
+        $baseUrl = $request->getSchemeAndHttpHost();
+        $openaiPrefix = '/' . trim((string) config('mirror.routes.openai_prefix', 'v1'), '/');
+        $adminBase = $baseUrl . '/' . trim((string) config('mirror.routes.admin_prefix', 'mirror/admin'), '/');
+        $apiKey = (string) config('mirror.api_key', '');
+        $maskedKey = $apiKey !== ''
+            ? (substr($apiKey, 0, 6) . str_repeat('*', max(4, strlen($apiKey) - 6)))
+            : 'Open (Local/Unauthenticated)';
+
+        $flashHtml = '';
+        if ($flash !== null) {
+            $bg = $flash['type'] === 'success' ? '#ecfdf5' : '#fef2f2';
+            $border = $flash['type'] === 'success' ? '#10b981' : '#ef4444';
+            $color = $flash['type'] === 'success' ? '#065f46' : '#991b1b';
+            $msg = e($flash['message']);
+            $flashHtml = "<div style='margin-bottom:16px;padding:12px 16px;border-radius:10px;background:{$bg};border:1px solid {$border};color:{$color};font-size:13px;font-weight:500'>{$msg}</div>";
+        }
+
+        $tokenRows = '';
         foreach ($tokens as $t) {
             $badgeColor = match ($t->status) {
-                'active' => 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20',
-                'cooldown' => 'bg-amber-500/10 text-amber-400 border-amber-500/20',
-                default => 'bg-rose-500/10 text-rose-400 border-rose-500/20',
+                'active' => '#10b981',
+                'cooldown' => '#f59e0b',
+                default => '#ef4444',
             };
+            $tName = e($t->name);
+            $tEmail = e($t->email ?: 'Pending Sync');
+            $tPlan = e(strtoupper((string) ($t->plan_type ?: 'free')));
+            $tStatus = e(strtoupper((string) $t->status));
+            $tExpires = e($t->access_token_expires_at ? $t->access_token_expires_at->diffForHumans() : 'Pending Refresh');
+            $turnstileBadge = $t->getTurnstileToken() ? '<span style="margin-left:6px;padding:1px 6px;border-radius:99px;background:#e0e7ff;color:#3730a3;font-size:10px">TS</span>' : '';
+            $errLine = $t->last_error ? '<div style="font-size:11px;color:#b91c1c;margin-top:2px">' . e(Str::limit($t->last_error, 80)) . '</div>' : '';
 
-            $expires = $t->access_token_expires_at ? $t->access_token_expires_at->diffForHumans() : 'Unknown';
-            $inFlight = $t->active_requests > 0 ? "<span class='px-2 py-0.5 rounded text-xs font-bold bg-indigo-500/20 text-indigo-300'>{$t->active_requests}</span>" : "<span class='text-zinc-500'>0</span>";
-
-            $rows .= <<<HTML
-            <tr class="border-b border-zinc-800 hover:bg-zinc-800/40 transition">
-                <td class="py-3 px-4 text-xs font-mono text-zinc-400">#{$t->id}</td>
-                <td class="py-3 px-4 font-medium text-white">{$t->name}</td>
-                <td class="py-3 px-4 text-zinc-300 font-mono text-xs">{$t->email}</td>
-                <td class="py-3 px-4"><span class="px-2 py-0.5 rounded text-xs font-semibold bg-zinc-800 text-zinc-300 uppercase">{$t->plan_type}</span></td>
-                <td class="py-3 px-4"><span class="px-2 py-0.5 rounded text-xs border font-medium {$badgeColor}">{$t->status}</span></td>
-                <td class="py-3 px-4 text-center font-mono">{$inFlight}</td>
-                <td class="py-3 px-4 text-center font-mono text-zinc-400">{$t->total_requests}</td>
-                <td class="py-3 px-4 text-xs text-zinc-400">{$expires}</td>
-                <td class="py-3 px-4 text-right space-x-2">
-                    <form method="POST" action="/mirror/admin/tokens/{$t->id}/refresh" class="inline">
-                        <input type="hidden" name="_token" value="{$csrf}">
-                        <button type="submit" class="px-2.5 py-1 text-xs bg-zinc-700 hover:bg-zinc-600 text-zinc-200 rounded transition">Refresh</button>
-                    </form>
-                    <form method="POST" action="/mirror/admin/tokens/{$t->id}/delete" class="inline" onsubmit="return confirm('Delete this token from pool?');">
-                        <input type="hidden" name="_token" value="{$csrf}">
-                        <button type="submit" class="px-2.5 py-1 text-xs bg-rose-900/40 hover:bg-rose-800/60 text-rose-300 border border-rose-800/50 rounded transition">Delete</button>
-                    </form>
+            $tokenRows .= "<tr>
+                <td>#{$t->id} <strong>{$tName}</strong>{$turnstileBadge}{$errLine}</td>
+                <td>{$tEmail}</td>
+                <td><span style='padding:2px 8px;border-radius:99px;background:#f3f4f6;font-size:11px;font-weight:600'>{$tPlan}</span></td>
+                <td><span style='color:{$badgeColor};font-weight:600'>{$tStatus}</span></td>
+                <td>{$t->active_requests} / {$t->total_requests}</td>
+                <td>{$tExpires}</td>
+                <td style='display:flex;gap:6px'>
+                    <form method='POST' action='{$adminBase}/tokens/{$t->id}/refresh'><button type='submit' class='btn btn-sm'>Refresh</button></form>
+                    <form method='POST' action='{$adminBase}/tokens/{$t->id}/delete' onsubmit='return confirm(\"Delete account?\")'><button type='submit' class='btn btn-sm btn-danger'>Delete</button></form>
                 </td>
-            </tr>
-HTML;
+            </tr>";
+        }
+        if ($tokenRows === '') {
+            $tokenRows = '<tr><td colspan="7" style="text-align:center;color:#6b7280;padding:24px">No ChatGPT accounts added yet.</td></tr>';
         }
 
-        if (empty($rows)) {
-            $rows = '<tr><td colspan="9" class="py-8 text-center text-zinc-500 text-sm">No tokens configured in the pool. Use the form below to add your first session token.</td></tr>';
+        $convRows = '';
+        foreach ($conversations as $c) {
+            $cId = e(Str::limit((string) ($c->public_id ?: $c->conversation_id), 22));
+            $cModel = e((string) $c->model);
+            $cTitle = e($c->title ?: 'Untitled Chat');
+            $cActive = e($c->last_active_at ? $c->last_active_at->diffForHumans() : '-');
+            $convRows .= "<tr><td><code>{$cId}</code></td><td>{$cModel}</td><td>{$cTitle}</td><td>{$cActive}</td></tr>";
+        }
+        if ($convRows === '') {
+            $convRows = '<tr><td colspan="4" style="text-align:center;color:#6b7280;padding:18px">No conversations cached yet.</td></tr>';
         }
 
-        $apiKey = config('mirror.api_key', 'Not Set');
-        $strategy = config('mirror.pool.strategy', 'least_busy');
-        $cooldown = config('mirror.pool.cooldown_seconds', 60);
-        $upstream = config('mirror.upstream', 'https://chatgpt.com');
+        $failureRows = '';
+        foreach ($recentFailures as $f) {
+            $failureRows .= '<tr><td>' . e((string) ($f['time'] ?? '')) . '</td><td><code>' . e((string) ($f['code'] ?? '')) . '</code></td><td>' . e((string) ($f['protocolCategory'] ?? '-')) . '</td><td><code>' . e((string) ($f['requestId'] ?? '')) . '</code></td></tr>';
+        }
+        if ($failureRows === '') {
+            $failureRows = '<tr><td colspan="4" style="text-align:center;color:#6b7280;padding:14px">No recent protocol/upstream failures recorded.</td></tr>';
+        }
+
+        $safeKey = e($maskedKey);
+        $safeBase = e($baseUrl);
+        $safePrefix = e($openaiPrefix);
+        $safePlaygroundUrl = e($baseUrl . '/mirror/playground');
+        $safeDocsUrl = e($baseUrl . '/mirror/api-docs');
+        $safeHomeUrl = e($baseUrl . '/');
 
         return <<<HTML
-<!DOCTYPE html>
-<html lang="en" class="dark">
+<!doctype html>
+<html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Laravel ChatGPT Mirror — Settings & Admin Dashboard</title>
-    <script src="https://cdn.tailwindcss.com"></script>
-    <script>
-        tailwind.config = {
-            darkMode: 'class',
-            theme: {
-                extend: {
-                    colors: {
-                        brand: '#10a37f',
-                        'brand-hover': '#0e8a6c'
-                    }
-                }
-            }
-        }
-    </script>
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
-    <style>
-        body { font-family: 'Inter', sans-serif; }
-        code, pre { font-family: 'JetBrains Mono', monospace; }
-    </style>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1.0" />
+<title>Laravel ChatGPT Mirror - Settings & Admin Dashboard</title>
+<style>
+  :root { --bg:#fafafa; --card:#fff; --text:#111827; --muted:#6b7280; --border:#e5e7eb; --accent:#111827; }
+  * { box-sizing:border-box; }
+  body { margin:0; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; background:var(--bg); color:var(--text); }
+  .nav { background:#fff; border-bottom:1px solid var(--border); padding:0 24px; height:56px; display:flex; align-items:center; justify-content:space-between; }
+  .nav-brand { font-weight:700; font-size:15px; display:flex; align-items:center; gap:10px; }
+  .nav-links { display:flex; gap:18px; font-size:13px; }
+  .nav-links a { color:#374151; text-decoration:none; font-weight:500; }
+  .nav-links a.active { color:#000; font-weight:700; }
+  .container { max-width:1160px; margin:24px auto; padding:0 20px; }
+  .stats { display:grid; grid-template-columns:repeat(4,1fr); gap:14px; margin-bottom:20px; }
+  .card { background:var(--card); border:1px solid var(--border); border-radius:12px; padding:18px; margin-bottom:18px; }
+  .stat-val { font-size:26px; font-weight:700; margin-top:4px; }
+  .stat-lbl { font-size:12px; color:var(--muted); text-transform:uppercase; letter-spacing:.04em; }
+  h2 { font-size:16px; margin:0 0 12px 0; display:flex; align-items:center; justify-content:space-between; }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th,td { text-align:left; padding:10px 12px; border-bottom:1px solid var(--border); vertical-align:middle; }
+  th { font-size:11px; text-transform:uppercase; color:var(--muted); background:#f9fafb; }
+  .btn { padding:8px 14px; border-radius:8px; border:1px solid var(--border); background:#111827; color:#fff; font-weight:600; font-size:12px; cursor:pointer; }
+  .btn-sm { padding:4px 9px; font-size:11px; }
+  .btn-danger { background:#dc2626; border-color:#dc2626; }
+  .btn-light { background:#fff; color:#111827; }
+  .input { width:100%; padding:9px 11px; border:1px solid var(--border); border-radius:8px; font-size:13px; margin-bottom:10px; }
+  .grid-2 { display:grid; grid-template-columns:1fr 1fr; gap:18px; }
+  pre { background:#0f172a; color:#f8fafc; padding:12px; border-radius:8px; font-size:12px; overflow:auto; margin:0; }
+  @media(max-width:768px) { .stats,.grid-2 { grid-template-columns:1fr; } }
+</style>
 </head>
-<body class="bg-zinc-950 text-zinc-100 min-h-screen">
-    <!-- Top Header -->
-    <header class="border-b border-zinc-800 bg-zinc-900/60 backdrop-blur sticky top-0 z-50">
-        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between">
-            <div class="flex items-center space-x-3">
-                <div class="w-8 h-8 rounded-lg bg-emerald-500/20 border border-emerald-500/30 flex items-center justify-center text-emerald-400 font-bold text-lg">
-                    ⚡
-                </div>
-                <div>
-                    <h1 class="text-base font-bold tracking-tight text-white flex items-center gap-2">
-                        Laravel ChatGPT Mirror
-                        <span class="text-[10px] font-mono uppercase bg-emerald-500/20 text-emerald-400 border border-emerald-500/30 px-2 py-0.5 rounded-full">v1.0.0</span>
-                    </h1>
-                    <p class="text-xs text-zinc-400">High-Concurrency Pool & Direct OpenAI Gateway</p>
-                </div>
-            </div>
-            <div class="flex items-center space-x-3">
-                <a href="/" target="_blank" class="px-3 py-1.5 text-xs font-medium text-zinc-300 hover:text-white bg-zinc-800 hover:bg-zinc-700 rounded-md transition flex items-center gap-1.5 border border-zinc-700">
-                    <span>Open ChatGPT</span>
-                    <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"></path></svg>
-                </a>
-                <a href="/mirror/playground" target="_blank" class="px-3 py-1.5 text-xs font-medium text-emerald-300 hover:text-emerald-200 bg-emerald-950/60 rounded-md transition border border-emerald-800/80 flex items-center gap-1.5">
-                    <span>API Playground</span>
-                    <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"></path></svg>
-                </a>
-                <a href="/api/health" target="_blank" class="px-2.5 py-1.5 text-xs font-medium text-zinc-400 hover:text-zinc-200 bg-zinc-900 rounded-md transition border border-zinc-800">
-                    Health JSON
-                </a>
-                <a href="/api/diagnostics" target="_blank" class="px-2.5 py-1.5 text-xs font-medium text-zinc-400 hover:text-zinc-200 bg-zinc-900 rounded-md transition border border-zinc-800">
-                    Diagnostics
-                </a>
-                <a href="/v1/capabilities" target="_blank" class="px-2.5 py-1.5 text-xs font-medium text-zinc-400 hover:text-zinc-200 bg-zinc-900 rounded-md transition border border-zinc-800">
-                    Capabilities
-                </a>
-                <div class="flex items-center gap-2 text-xs text-emerald-400 bg-emerald-500/10 border border-emerald-500/20 px-3 py-1.5 rounded-md">
-                    <span class="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
-                    <span>Direct OpenAI Gateway &bull; Ready</span>
-                </div>
-            </div>
-        </div>
-    </header>
+<body>
+<nav class="nav">
+  <div class="nav-brand">Laravel ChatGPT Mirror <span style="font-size:11px;color:#059669;background:#ecfdf5;padding:2px 8px;border-radius:99px">Direct OpenAI Gateway</span></div>
+  <div class="nav-links">
+    <a href="{$safeHomeUrl}">ChatGPT Web</a>
+    <a href="{$safePlaygroundUrl}">Playground</a>
+    <a href="{$safeDocsUrl}">API Docs</a>
+    <a href="{$adminBase}" class="active">Settings &amp; Admin Dashboard</a>
+  </div>
+</nav>
+<div class="container">
+  {$flashHtml}
+  <div class="stats">
+    <div class="card"><div class="stat-lbl">Active Accounts</div><div class="stat-val">{$stats['active_tokens']} / {$stats['total_tokens']}</div></div>
+    <div class="card"><div class="stat-lbl">In Cooldown</div><div class="stat-val">{$stats['cooldown_tokens']}</div></div>
+    <div class="card"><div class="stat-lbl">Active Requests</div><div class="stat-val">{$stats['total_active_requests']}</div></div>
+    <div class="card"><div class="stat-lbl">Lifetime Requests</div><div class="stat-val">{$stats['total_lifetime_requests']}</div></div>
+  </div>
 
-    <main class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8 space-y-8">
-        <!-- Live Pool Metric Cards -->
-        <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-            <div class="bg-zinc-900 border border-zinc-800 rounded-xl p-5 shadow-sm">
-                <div class="text-xs font-medium text-zinc-400 uppercase tracking-wider">Total Accounts in Pool</div>
-                <div class="mt-2 text-3xl font-extrabold text-white">{$stats['total_tokens']}</div>
-                <div class="mt-1 text-xs text-emerald-400">{$stats['active_healthy']} active &amp; ready</div>
-            </div>
+  <div class="grid-2">
+    <div class="card">
+      <h2>Add ChatGPT Account Token</h2>
+      <form method="POST" action="{$adminBase}/tokens">
+        <input type="text" name="name" class="input" placeholder="Account label (optional, auto-detected if empty)" />
+        <textarea name="session_token" rows="3" class="input" placeholder="Paste __Secure-next-auth.session-token value here..." required></textarea>
+        <input type="text" name="turnstile_token" class="input" placeholder="Optional Turnstile token (if Sentinel requires it)" />
+        <button type="submit" class="btn">Verify &amp; Save Account</button>
+      </form>
+    </div>
+    <div class="card">
+      <h2>OpenAI API Gateway Configuration</h2>
+      <p style="font-size:13px;color:var(--muted);margin-top:0">Use any OpenAI SDK pointed cleanly at this Mirror server:</p>
+      <pre>Base URL: {$safeBase}{$safePrefix}
+API Key:  {$safeKey}
+Routes:   {$safePrefix}/chat/completions, {$safePrefix}/responses, {$safePrefix}/models</pre>
+      <div style="margin-top:12px;display:flex;gap:8px">
+        <form method="POST" action="{$adminBase}/tokens/reset-counters"><button type="submit" class="btn btn-light">Reset Pool Counters</button></form>
+        <a href="{$safeBase}/api/diagnostics" class="btn btn-light" style="text-decoration:none;display:inline-flex;align-items:center">JSON Diagnostics</a>
+      </div>
+    </div>
+  </div>
 
-            <div class="bg-zinc-900 border border-zinc-800 rounded-xl p-5 shadow-sm">
-                <div class="text-xs font-medium text-zinc-400 uppercase tracking-wider">In-Flight Concurrency</div>
-                <div class="mt-2 text-3xl font-extrabold text-indigo-400">{$stats['total_in_flight_requests']}</div>
-                <div class="mt-1 text-xs text-zinc-400">Targeting 100–200 concurrent users</div>
-            </div>
+  <div class="card">
+    <h2>Connected ChatGPT Accounts Pool</h2>
+    <table>
+      <thead><tr><th>Account</th><th>Email</th><th>Plan</th><th>Status</th><th>Active / Total</th><th>JWT Expiry</th><th>Actions</th></tr></thead>
+      <tbody>{$tokenRows}</tbody>
+    </table>
+  </div>
 
-            <div class="bg-zinc-900 border border-zinc-800 rounded-xl p-5 shadow-sm">
-                <div class="text-xs font-medium text-zinc-400 uppercase tracking-wider">Total Requests Served</div>
-                <div class="mt-2 text-3xl font-extrabold text-white">{$stats['total_requests_served']}</div>
-                <div class="mt-1 text-xs text-zinc-400">Zero upstream concurrency drops</div>
-            </div>
-
-            <div class="bg-zinc-900 border border-zinc-800 rounded-xl p-5 shadow-sm">
-                <div class="text-xs font-medium text-zinc-400 uppercase tracking-wider">Balancing Strategy</div>
-                <div class="mt-2 text-2xl font-bold font-mono text-emerald-400 uppercase">{$strategy}</div>
-                <div class="mt-1 text-xs text-zinc-400">Auto-routes to least busy account</div>
-            </div>
-        </div>
-
-        <!-- Token Pool Table -->
-        <div class="bg-zinc-900 border border-zinc-800 rounded-xl overflow-hidden shadow-sm">
-            <div class="px-6 py-4 border-b border-zinc-800 flex items-center justify-between bg-zinc-900/80">
-                <div>
-                    <h2 class="text-base font-semibold text-white">ChatGPT Accounts &amp; Token Pool</h2>
-                    <p class="text-xs text-zinc-400">Tokens are encrypted with AES-256 at rest and rotated dynamically under high traffic.</p>
-                </div>
-                <div class="flex items-center gap-3">
-                    <form method="POST" action="/mirror/admin/tokens/reset-counters" class="inline">
-                        <input type="hidden" name="_token" value="{$csrf}">
-                        <button type="submit" title="Resets any in-flight counters that got stuck" class="px-2.5 py-1 text-xs bg-zinc-800 hover:bg-zinc-700 text-zinc-300 rounded border border-zinc-700 transition">
-                            Reset In-Flight
-                        </button>
-                    </form>
-                    <span class="text-xs font-mono text-zinc-400">Storage: SQLite Encrypted</span>
-                </div>
-            </div>
-            <div class="overflow-x-auto">
-                <table class="w-full text-left border-collapse">
-                    <thead>
-                        <tr class="border-b border-zinc-800 text-xs font-medium text-zinc-400 uppercase tracking-wider bg-zinc-950/50">
-                            <th class="py-3 px-4">ID</th>
-                            <th class="py-3 px-4">Name / Label</th>
-                            <th class="py-3 px-4">Email Account</th>
-                            <th class="py-3 px-4">Plan</th>
-                            <th class="py-3 px-4">Health Status</th>
-                            <th class="py-3 px-4 text-center">In-Flight</th>
-                            <th class="py-3 px-4 text-center">Total Served</th>
-                            <th class="py-3 px-4">Access Token</th>
-                            <th class="py-3 px-4 text-right">Actions</th>
-                        </tr>
-                    </thead>
-                    <tbody class="divide-y divide-zinc-800 text-sm">
-                        {$rows}
-                    </tbody>
-                </table>
-            </div>
-        </div>
-
-        <!-- Two Columns: Add Token & System Configuration -->
-        <div class="grid grid-cols-1 lg:grid-cols-2 gap-8">
-            <!-- Add Token Box -->
-            <div class="bg-zinc-900 border border-zinc-800 rounded-xl p-6 shadow-sm flex flex-col justify-between">
-                <div>
-                    <h3 class="text-base font-semibold text-white mb-1">Add Account to Pool</h3>
-                    <p class="text-xs text-zinc-400 mb-4">Paste a single session token, or the entire JSON object from <a href="https://chatgpt.com/api/auth/session" target="_blank" class="text-emerald-400 underline">chatgpt.com/api/auth/session</a>.</p>
-
-                    <form method="POST" action="/mirror/admin/tokens/add" class="space-y-4">
-                        <input type="hidden" name="_token" value="{$csrf}">
-                        <div>
-                            <label class="block text-xs font-medium text-zinc-300 mb-1">Account Label (Optional)</label>
-                            <input type="text" name="name" placeholder="e.g. Production Account #2" class="w-full px-3 py-2 text-sm bg-zinc-950 border border-zinc-800 rounded-lg text-white focus:outline-none focus:border-emerald-500">
-                        </div>
-                        <div>
-                            <label class="block text-xs font-medium text-zinc-300 mb-1">Session Token or Full Session JSON</label>
-                            <textarea name="session_token" rows="5" placeholder="eyJhbGciOiJkaXIi... or { 'accessToken': '...', 'sessionToken': '...' }" required class="w-full px-3 py-2 text-xs font-mono bg-zinc-950 border border-zinc-800 rounded-lg text-zinc-200 focus:outline-none focus:border-emerald-500"></textarea>
-                        </div>
-                        <button type="submit" class="w-full py-2.5 px-4 bg-emerald-600 hover:bg-emerald-500 text-white font-medium text-sm rounded-lg transition shadow">
-                            + Add Account to Concurrency Pool
-                        </button>
-                    </form>
-                </div>
-            </div>
-
-            <!-- Configuration & Gateway Settings -->
-            <div class="bg-zinc-900 border border-zinc-800 rounded-xl p-6 shadow-sm">
-                <h3 class="text-base font-semibold text-white mb-1">Project &amp; Gateway Settings</h3>
-                <p class="text-xs text-zinc-400 mb-4">Current runtime parameters loaded from <code>config/mirror.php</code> and <code>.env</code>.</p>
-
-                <div class="space-y-4 text-xs font-mono">
-                    <div class="bg-zinc-950 p-3 rounded-lg border border-zinc-800 flex items-center justify-between">
-                        <div>
-                            <div class="text-zinc-500 uppercase">API Key (Authorization: Bearer)</div>
-                            <div class="text-emerald-400 font-bold mt-0.5 select-all">{$apiKey}</div>
-                        </div>
-                        <button onclick="navigator.clipboard.writeText('{$apiKey}'); alert('Copied API Key!');" class="px-2.5 py-1 text-[11px] bg-zinc-800 hover:bg-zinc-700 text-zinc-300 rounded border border-zinc-700">Copy</button>
-                    </div>
-
-                    <div class="grid grid-cols-2 gap-3">
-                        <div class="bg-zinc-950 p-3 rounded-lg border border-zinc-800">
-                            <div class="text-zinc-500 uppercase">Upstream Gateway</div>
-                            <div class="text-white font-semibold mt-0.5 truncate">{$upstream}</div>
-                        </div>
-                        <div class="bg-zinc-950 p-3 rounded-lg border border-zinc-800">
-                            <div class="text-zinc-500 uppercase">Token Encryption</div>
-                            <div class="text-white font-semibold mt-0.5">AES-256 (At-Rest)</div>
-                        </div>
-                        <div class="bg-zinc-950 p-3 rounded-lg border border-zinc-800">
-                            <div class="text-zinc-500 uppercase">429 Cooldown</div>
-                            <div class="text-white font-semibold mt-0.5">{$cooldown} seconds</div>
-                        </div>
-                        <div class="bg-zinc-950 p-3 rounded-lg border border-zinc-800">
-                            <div class="text-zinc-500 uppercase">OpenAI Prefix</div>
-                            <div class="text-white font-semibold mt-0.5">/v1/chat/completions</div>
-                        </div>
-                    </div>
-
-                    <div class="bg-zinc-950 p-3 rounded-lg border border-zinc-800 text-[11px] font-mono">
-                        <div class="text-zinc-400 font-semibold mb-1 flex items-center justify-between">
-                            <span>Integration Snippet (Python):</span>
-                            <button onclick="navigator.clipboard.writeText('from openai import OpenAI\\nclient = OpenAI(base_url=\'http://127.0.0.1:8000/v1\', api_key=\'{$apiKey}\')'); alert('Copied Python snippet!');" class="text-[10px] text-emerald-400 hover:underline">Copy</button>
-                        </div>
-                        <div class="text-zinc-500 select-all">from openai import OpenAI<br>client = OpenAI(base_url="http://127.0.0.1:8000/v1", api_key="{$apiKey}")</div>
-                    </div>
-
-                    <div class="bg-zinc-950/60 p-3 rounded-lg border border-zinc-800/80 text-zinc-400 text-[11px] font-sans">
-                        💡 <strong>High-concurrency Scaling:</strong> To serve 100–200 concurrent users without rate limits, add 3 to 5 separate session tokens above. The <code>least_busy</code> load balancer will automatically rotate prompts across healthy accounts.
-                    </div>
-                </div>
-            </div>
-        </div>
-
-        <!-- Live API Tester / Playground -->
-        <div class="bg-zinc-900 border border-zinc-800 rounded-xl p-6 shadow-sm">
-            <h3 class="text-base font-semibold text-white mb-1">Live API Tester (OpenAI Compatible)</h3>
-            <p class="text-xs text-zinc-400 mb-4">Send an prompt to test Server-Sent Events (SSE) token streaming via your active token pool.</p>
-
-            <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
-                <div class="space-y-4">
-                    <div>
-                        <label class="block text-xs font-medium text-zinc-300 mb-1">Model</label>
-                        <select id="test-model" class="w-full px-3 py-2 text-sm bg-zinc-950 border border-zinc-800 rounded-lg text-white">
-                            <option value="auto">auto (ChatGPT Default)</option>
-                            <option value="gpt-4o">gpt-4o</option>
-                            <option value="gpt-4o-mini">gpt-4o-mini</option>
-                            <option value="o1">o1</option>
-                        </select>
-                    </div>
-                    <div>
-                        <label class="block text-xs font-medium text-zinc-300 mb-1">Test Prompt</label>
-                        <textarea id="test-prompt" rows="4" class="w-full px-3 py-2 text-sm bg-zinc-950 border border-zinc-800 rounded-lg text-white">Hello! Write a 2-line greeting in Bengali.</textarea>
-                    </div>
-                    <button type="button" onclick="runTestPrompt()" id="btn-run" class="py-2.5 px-6 bg-indigo-600 hover:bg-indigo-500 text-white font-medium text-sm rounded-lg transition shadow flex items-center gap-2">
-                        <span>Execute Completion</span>
-                    </button>
-                </div>
-                <div>
-                    <label class="block text-xs font-medium text-zinc-300 mb-1">Streaming Output</label>
-                    <div id="test-output" class="w-full h-48 bg-zinc-950 border border-zinc-800 rounded-lg p-3 text-xs font-mono text-emerald-400 overflow-y-auto whitespace-pre-wrap select-all">Ready for execution. Click "Execute Completion" to start...</div>
-                </div>
-            </div>
-        </div>
-    </main>
-
-    <footer class="border-t border-zinc-800 mt-12 py-6 text-center text-xs text-zinc-500">
-        Laravel ChatGPT Mirror &bull; Built by Mostafizur Rahman Refat (<a href="https://github.com/refatbd" target="_blank" class="text-zinc-400 hover:text-white">github.com/refatbd</a>)
-    </footer>
-
-    <script>
-        async function runTestPrompt() {
-            const btn = document.getElementById('btn-run');
-            const output = document.getElementById('test-output');
-            const prompt = document.getElementById('test-prompt').value;
-            const model = document.getElementById('test-model').value;
-
-            btn.disabled = true;
-            btn.innerText = 'Streaming...';
-            output.innerText = '';
-
-            try {
-                const response = await fetch('/v1/chat/completions', {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                        'Authorization': 'Bearer {$apiKey}'
-                    },
-                    body: JSON.stringify({
-                        model: model,
-                        messages: [{ role: 'user', content: prompt }],
-                        stream: true
-                    })
-                });
-
-                if (!response.ok) {
-                    const err = await response.text();
-                    output.innerText = 'Error [' + response.status + ']: ' + err;
-                    return;
-                }
-
-                const reader = response.body.getReader();
-                const decoder = new TextDecoder();
-                let buffer = '';
-
-                while (true) {
-                    const { done, value } = await reader.read();
-                    if (done) break;
-
-                    buffer += decoder.decode(value, { stream: true });
-                    const lines = buffer.split('\\n');
-                    buffer = lines.pop();
-
-                    for (const line of lines) {
-                        const trimmed = line.trim();
-                        if (trimmed.startsWith('data: ') && trimmed !== 'data: [DONE]') {
-                            try {
-                                const json = JSON.parse(trimmed.substring(6));
-                                if (json.choices && json.choices[0] && json.choices[0].delta && json.choices[0].delta.content) {
-                                    output.innerText += json.choices[0].delta.content;
-                                    output.scrollTop = output.scrollHeight;
-                                } else if (json.error && json.error.message) {
-                                    output.innerText = 'Error: ' + json.error.message;
-                                }
-                            } catch (e) {}
-                        }
-                    }
-                }
-            } catch (err) {
-                output.innerText = 'Connection error: ' + err.message;
-            } finally {
-                btn.disabled = false;
-                btn.innerText = 'Execute Completion';
-            }
-        }
-    </script>
+  <div class="grid-2">
+    <div class="card">
+      <h2>Recent Tracked Conversations</h2>
+      <table>
+        <thead><tr><th>ID</th><th>Model</th><th>Title</th><th>Last Active</th></tr></thead>
+        <tbody>{$convRows}</tbody>
+      </table>
+    </div>
+    <div class="card">
+      <h2>Recent Protocol Failures (Sanitized)</h2>
+      <table>
+        <thead><tr><th>Time</th><th>Code</th><th>Category</th><th>Request ID</th></tr></thead>
+        <tbody>{$failureRows}</tbody>
+      </table>
+    </div>
+  </div>
+</div>
 </body>
 </html>
 HTML;

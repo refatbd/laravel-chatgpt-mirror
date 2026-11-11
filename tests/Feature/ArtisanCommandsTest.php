@@ -34,7 +34,7 @@ class ArtisanCommandsTest extends TestCase
             ->assertSuccessful();
     }
 
-    public function test_mirror_health_reports_pool_stats(): void
+    public function test_mirror_health_reports_pool_stats_without_warp(): void
     {
         MirrorToken::create([
             'name' => 'Health Test Account',
@@ -45,8 +45,8 @@ class ArtisanCommandsTest extends TestCase
         ]);
 
         $this->artisan('mirror:health')
-            ->expectsOutputToContain('Active Healthy Tokens')
-            ->expectsOutputToContain('WARP: Disabled')
-            ->assertSuccessful();
+            ->expectsOutputToContain('Active Tokens in Pool')
+            ->expectsOutputToContain('Direct Egress')
+            ->doesntExpectOutputToContain('WARP');
     }
 }

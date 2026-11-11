@@ -2,7 +2,7 @@
 
 [![Latest Version on Packagist](https://img.shields.io/packagist/v/refatbd/laravel-chatgpt-mirror.svg?style=flat-square)](https://packagist.org/packages/refatbd/laravel-chatgpt-mirror)
 [![Software License](https://img.shields.io/badge/license-MIT-brightgreen.svg?style=flat-square)](LICENSE)
-[![Tests Passing](https://img.shields.io/badge/tests-31%20passed-brightgreen.svg?style=flat-square)]()
+[![Tests Passing](https://img.shields.io/badge/tests-59%20passed-brightgreen.svg?style=flat-square)]()
 
 A high-performance **OpenAI-compatible API Gateway**, **Interactive Developer Playground**, and **ChatGPT Web UI Reverse Proxy** for Laravel applications. Designed for **high-concurrency production workloads (100–200+ simultaneous users)** with multi-token pooling, automated load balancing, and **100% Direct Gateway connectivity (No Cloudflare WARP required)**.
 
@@ -12,17 +12,17 @@ Developed by [Mostafizur Rahman Refat](https://github.com/refatbd).
 
 ## 🧭 Navigation & Available Interfaces
 
-Your application exposes three complementary interfaces designed for distinct purposes:
+Your application exposes complementary interfaces designed for distinct purposes:
 
 | Interface | URL Path | Description |
 | :--- | :--- | :--- |
 | **Clean ChatGPT Web UI** | `http://127.0.0.1:8000/` or `/` | **100% Clean & Native ChatGPT Interface.** Zero clutter, overlays, or buttons. Behaves and looks identically to official ChatGPT for your team or end users. |
-| **Mirror API Playground** | `http://127.0.0.1:8000/mirror/playground` (Alias: `/playground`) | **Interactive Developer Testbench.** Test completions, build multi-turn prompt chains, customize default system prompts, inspect raw JSON/SSE responses, and pick models. |
+| **Mirror API Playground** | `http://127.0.0.1:8000/mirror/playground` (Alias: `/playground`) | **Interactive Developer Testbench.** Test Chat Completions & Responses, run format conversions (`loaf`, `pngspeak`, `gptgif`, `gptgif-v4`), inspect raw JSON/SSE responses, and pick live models. |
 | **Settings & Admin Pool Manager** | `http://127.0.0.1:8000/mirror/admin` (Alias: `/admin`) | **Concurrency Pool Dashboard & Settings.** Monitor live in-flight concurrency, add/delete ChatGPT accounts, rotate tokens with `least_busy` balancing, reset counters, and view API keys. |
-| **OpenAI API Endpoint** | `http://127.0.0.1:8000/v1/chat/completions` | Standard OpenAI drop-in endpoint for Python, Node.js, Go, PHP, Cursor, or any OpenAI-compatible client. |
-| **System Health API** | `http://127.0.0.1:8000/api/health` | Real-time JSON health check (active tokens, in-flight concurrency count, upstream gateway status). |
-| **Diagnostics API** | `http://127.0.0.1:8000/api/diagnostics` | Complete system diagnostics including PHP version, Laravel environment, token pool metrics, and storage. |
-| **API Capabilities** | `http://127.0.0.1:8000/v1/capabilities` | Supported OpenAI fields, model capabilities, and streaming feature matrix. |
+| **Interactive API Docs (Swagger UI)** | `http://127.0.0.1:8000/mirror/api-docs` | Interactive OpenAPI 3.1.0 documentation rendered directly from `http://127.0.0.1:8000/mirror/openapi` (`?format=json` / `?format=yaml`). |
+| **OpenAI Chat & Responses API** | `/v1/chat/completions` & `/v1/responses` | Standard OpenAI drop-in endpoints (sync & SSE streaming) with tool calling, multi-turn continuity, and rich citation/artifact extraction. |
+| **Native Mirror & Convert APIs** | `/api/models`, `/api/gpts`, `/api/conversations*`, `/api/convert/*`, `/api/decoder-challenges` | Live ChatGPT model/GPT discovery, searchable persistent conversation history, codec round-trips/gauntlet, and decoder challenge APIs. |
+| **Health, Diagnostics & Capabilities** | `/api/health`, `/api/diagnostics`, `/v1/capabilities` | Real-time health telemetry (Direct Egress), schema/build/failure diagnostics, and capability discovery. |
 
 ---
 

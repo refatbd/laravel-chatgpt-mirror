@@ -5,14 +5,16 @@ declare(strict_types=1);
 namespace Refatbd\LaravelChatGptMirror\Tests\Feature;
 
 use Refatbd\LaravelChatGptMirror\Models\MirrorToken;
+use Refatbd\LaravelChatGptMirror\Services\SecurityService;
+use Refatbd\LaravelChatGptMirror\Services\TokenRefresher;
 use Refatbd\LaravelChatGptMirror\Tests\TestCase;
 
 class AdminControllerTest extends TestCase
 {
-    public function test_admin_dashboard_renders_successfully(): void
+    public function test_admin_dashboard_renders_successfully_and_escapes_xss(): void
     {
         MirrorToken::create([
-            'name' => 'Test Account Alpha',
+            'name' => '<script>alert("xss")</script>Test Account Alpha',
             'email' => 'test@example.com',
             'session_token' => 'sample-session-token-for-test',
             'access_token' => 'sample-access-token',
@@ -23,11 +25,14 @@ class AdminControllerTest extends TestCase
         $response = $this->get('/mirror/admin');
 
         $response->assertStatus(200);
+        $response->assertCookie(SecurityService::CONTROL_COOKIE_NAME);
         $response->assertSee('Laravel ChatGPT Mirror');
         $response->assertSee('Settings & Admin Dashboard', false);
         $response->assertSee('Test Account Alpha');
+        $response->assertSee('&lt;script&gt;alert(&quot;xss&quot;)&lt;/script&gt;', false);
+        $response->assertDontSee('<script>alert("xss")</script>', false);
         $response->assertSee('test@example.com');
-        $response->assertSee('Total Accounts in Pool');
+        $response->assertSee('Active Accounts');
         $response->assertSee('Direct OpenAI Gateway');
         $response->assertDontSee('WARP: Off');
         $response->assertDontSee('WARP: Disabled');
@@ -39,7 +44,21 @@ class AdminControllerTest extends TestCase
         $response->assertRedirect('/mirror/admin');
     }
 
-    public function test_admin_stats_returns_json(): void
+    public function test_control_endpoints_reject_unauthenticated_and_spoofed_referer_requests(): void
+    {
+        $this->withHeader('Referer', 'http://localhost/mirror/admin')
+            ->getJson('/mirror/admin/api/stats')
+            ->assertStatus(401);
+
+        $this->withHeader('Referer', 'http://localhost/mirror/playground')
+            ->getJson('/api/diagnostics')
+            ->assertStatus(401);
+
+        $this->post('/mirror/admin/tokens/reset-counters')
+            ->assertStatus(401);
+    }
+
+    public function test_admin_stats_returns_json_with_bearer_auth(): void
     {
         MirrorToken::create([
             'name' => 'Active Account',
@@ -48,7 +67,8 @@ class AdminControllerTest extends TestCase
             'status' => 'active',
         ]);
 
-        $response = $this->getJson('/mirror/admin/api/stats');
+        $response = $this->withHeader('Authorization', 'Bearer test-mirror-key-12345')
+            ->getJson('/mirror/admin/api/stats');
 
         $response->assertStatus(200);
         $response->assertJsonStructure([
@@ -58,10 +78,12 @@ class AdminControllerTest extends TestCase
             'total_requests_served',
             'total_in_flight_requests',
             'strategy',
+            'pool',
+            'active_conversations',
         ]);
     }
 
-    public function test_reset_in_flight_counters(): void
+    public function test_reset_in_flight_counters_with_control_cookie(): void
     {
         $token = MirrorToken::create([
             'name' => 'Stuck Token',
@@ -71,7 +93,10 @@ class AdminControllerTest extends TestCase
             'active_requests' => 5,
         ]);
 
-        $response = $this->post('/mirror/admin/tokens/reset-counters');
+        $cookie = $this->get('/mirror/admin')->getCookie(SecurityService::CONTROL_COOKIE_NAME, false)?->getValue();
+
+        $response = $this->withUnencryptedCookie(SecurityService::CONTROL_COOKIE_NAME, (string) $cookie)
+            ->post('/mirror/admin/tokens/reset-counters');
         $response->assertRedirect();
 
         $token->refresh();
@@ -92,12 +117,14 @@ class AdminControllerTest extends TestCase
         $response->assertJson([
             'ok' => true,
             'configured' => true,
+            'egressMode' => 'direct',
         ]);
     }
 
     public function test_diagnostics_endpoint(): void
     {
-        $response = $this->getJson('/api/diagnostics');
+        $response = $this->withHeader('Authorization', 'Bearer test-mirror-key-12345')
+            ->getJson('/api/diagnostics');
 
         $response->assertStatus(200);
         $response->assertJsonStructure([
@@ -106,6 +133,7 @@ class AdminControllerTest extends TestCase
             'storage' => ['engine', 'healthy'],
             'pool',
             'config',
+            'recentFailures',
         ]);
     }
 
@@ -119,14 +147,40 @@ class AdminControllerTest extends TestCase
             'routes',
             'fields',
             'supported',
+            'endpoints',
+            'features',
         ]);
     }
 
-    public function test_session_endpoints(): void
+    public function test_session_endpoints_with_verified_candidate_mock(): void
     {
-        $response = $this->getJson('/api/session');
-        $response->assertStatus(200);
-        $response->assertJsonStructure(['configured', 'total_tokens', 'active_tokens']);
+        $mockRefresher = $this->createMock(TokenRefresher::class);
+        $mockRefresher->method('verifyCandidateSessionToken')->willReturn([
+            'session_token' => str_repeat('s', 30),
+            'access_token' => 'jwt-verified-123',
+            'expires_at' => now()->addHour(),
+            'email' => 'verified@example.com',
+            'name' => 'Verified User',
+            'account_id' => 'acct-verified-1',
+            'plan_type' => 'plus',
+        ]);
+        $this->app->instance(TokenRefresher::class, $mockRefresher);
+
+        $postRes = $this->withHeader('Authorization', 'Bearer test-mirror-key-12345')
+            ->postJson('/api/session', [
+                'sessionToken' => str_repeat('s', 30),
+                'turnstileToken' => 'ts-token-999',
+            ]);
+        $postRes->assertStatus(200);
+        $postRes->assertJsonPath('ok', true);
+        $postRes->assertJsonPath('account.email', 'verified@example.com');
+
+        $getRes = $this->withHeader('Authorization', 'Bearer test-mirror-key-12345')
+            ->getJson('/api/session');
+        $getRes->assertStatus(200);
+        $getRes->assertJsonPath('configured', true);
+        $getRes->assertJsonPath('hasTurnstileToken', true);
+        $getRes->assertJsonStructure(['configured', 'total_tokens', 'active_tokens', 'accounts']);
     }
 
     public function test_delete_token_from_pool(): void
@@ -138,7 +192,8 @@ class AdminControllerTest extends TestCase
             'status' => 'active',
         ]);
 
-        $response = $this->post("/mirror/admin/tokens/{$token->id}/delete");
+        $response = $this->withHeader('Authorization', 'Bearer test-mirror-key-12345')
+            ->post("/mirror/admin/tokens/{$token->id}/delete");
         $response->assertRedirect();
 
         $this->assertDatabaseMissing('mirror_tokens', [

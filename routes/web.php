@@ -6,40 +6,46 @@ use Illuminate\Support\Facades\Route;
 use Refatbd\LaravelChatGptMirror\Controllers\AdminController;
 use Refatbd\LaravelChatGptMirror\Controllers\BrowserProxyController;
 use Refatbd\LaravelChatGptMirror\Controllers\PlaygroundController;
+use Refatbd\LaravelChatGptMirror\Http\Middleware\ProtectControlEndpoints;
 
-// 1. Mirror API Playground
-Route::get('/mirror/playground', [PlaygroundController::class, 'index'])->name('mirror.playground');
+$browserPrefix = trim((string) config('mirror.routes.browser_prefix', ''), '/');
+$adminPrefix = trim((string) config('mirror.routes.admin_prefix', 'mirror/admin'), '/');
+
+// 1. Built-in Playground UI & Static Assets
+Route::get('/mirror/playground', [PlaygroundController::class, 'index']);
 Route::get('/playground', fn () => redirect('/mirror/playground'));
-Route::get('/mirror/assets/{file}', [PlaygroundController::class, 'asset'])->where('file', '.*');
+Route::get('/mirror/assets/{file}', [PlaygroundController::class, 'asset'])
+    ->where('file', '[A-Za-z0-9._-]+');
 
-// 2. Admin Dashboard, Settings & Concurrency Pool Manager
-Route::prefix('mirror/admin')->group(function () {
+// 2. Settings & Admin Dashboard
+Route::prefix($adminPrefix)->group(function () {
     Route::get('/', [AdminController::class, 'index'])->name('mirror.admin.index');
-    Route::post('/tokens/add', [AdminController::class, 'addToken'])->name('mirror.admin.tokens.add');
-    Route::post('/tokens/{id}/refresh', [AdminController::class, 'refreshToken'])->name('mirror.admin.tokens.refresh');
-    Route::post('/tokens/{id}/delete', [AdminController::class, 'deleteToken'])->name('mirror.admin.tokens.delete');
-    Route::post('/tokens/reset-counters', [AdminController::class, 'resetCounters'])->name('mirror.admin.tokens.reset');
-    Route::get('/api/stats', [AdminController::class, 'stats'])->name('mirror.admin.stats');
+    Route::middleware([ProtectControlEndpoints::class])->group(function () {
+        Route::post('/tokens', [AdminController::class, 'addToken']);
+        Route::post('/tokens/reset-counters', [AdminController::class, 'resetCounters']);
+        Route::post('/tokens/{id}/refresh', [AdminController::class, 'refreshToken']);
+        Route::post('/tokens/{id}/delete', [AdminController::class, 'deleteToken']);
+        Route::get('/api/stats', [AdminController::class, 'stats']);
+    });
 });
 
-// Settings & Admin navigation aliases
-Route::get('/admin', fn () => redirect('/mirror/admin'));
-Route::get('/settings/mirror', fn () => redirect('/mirror/admin'));
+// Friendly Settings / Admin aliases
+Route::get('/admin', fn () => redirect('/' . $adminPrefix));
+Route::get('/settings/mirror', fn () => redirect('/' . $adminPrefix));
 
-$browserPrefix = config('mirror.routes.browser_prefix', 'mirror');
-
+// 3. Explicit Proxied ChatGPT Web Frontend Paths
 Route::prefix($browserPrefix)->group(function () {
-    Route::any('/{path?}', [BrowserProxyController::class, 'proxy'])->where('path', '.*');
+    Route::get('/', [BrowserProxyController::class, 'proxy']);
+    Route::get('/c/{id}', [BrowserProxyController::class, 'proxy'])->where('id', '.*');
+    Route::any('/_next/{path}', [BrowserProxyController::class, 'proxy'])->where('path', '.*');
+    Route::any('/cdn/{path}', [BrowserProxyController::class, 'proxy'])->where('path', '.*');
+    Route::any('/public-api/{path}', [BrowserProxyController::class, 'proxy'])->where('path', '.*');
+    Route::any('/ces/{path}', [BrowserProxyController::class, 'proxy'])->where('path', '.*');
+    Route::any('/assets/{path}', [BrowserProxyController::class, 'proxy'])->where('path', '.*');
+    Route::any('/fonts/{path}', [BrowserProxyController::class, 'proxy'])->where('path', '.*');
+    Route::any('/images/{path}', [BrowserProxyController::class, 'proxy'])->where('path', '.*');
 });
 
-// Root & direct browser routes
-Route::get('/', [BrowserProxyController::class, 'proxy']);
-Route::get('/c/{id}', [BrowserProxyController::class, 'proxy']);
-Route::any('/_next/{path}', [BrowserProxyController::class, 'proxy'])->where('path', '.*');
-Route::any('/cdn/{path}', [BrowserProxyController::class, 'proxy'])->where('path', '.*');
-Route::any('/public-api/{path}', [BrowserProxyController::class, 'proxy'])->where('path', '.*');
-Route::any('/ces/{path}', [BrowserProxyController::class, 'proxy'])->where('path', '.*');
-Route::any('/assets/{path}', [BrowserProxyController::class, 'proxy'])->where('path', '.*');
-Route::any('/fonts/{path}', [BrowserProxyController::class, 'proxy'])->where('path', '.*');
-Route::any('/images/{path}', [BrowserProxyController::class, 'proxy'])->where('path', '.*');
-
+// 4. Catch-All Browser Proxy Fallback (for /sentinel/*, /g/*, /share/*, /realtime/*, unknown ChatGPT frontend routes)
+Route::any('/{path}', [BrowserProxyController::class, 'proxy'])
+    ->where('path', '^(?!api(?:/|$)|v1(?:/|$)|mirror(?:/|$)|backend-api(?:/|$)|__codex-api(?:/|$)).+');

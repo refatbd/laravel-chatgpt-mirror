@@ -7,122 +7,80 @@ namespace Refatbd\LaravelChatGptMirror\Commands;
 use Illuminate\Console\Command;
 use Refatbd\LaravelChatGptMirror\Models\MirrorToken;
 use Refatbd\LaravelChatGptMirror\Services\TokenRefresher;
-use Throwable;
 
 class ImportTokenCommand extends Command
 {
-    protected $signature = 'mirror:token:import {file : Path to the file containing session token(s) or auth JSON}';
-    protected $description = 'Import one or more ChatGPT session tokens from a file (e.g. token.txt or session JSON)';
+    protected $signature = 'mirror:import-token
+                            {file? : Optional path to a file containing session tokens (one per line)}
+                            {--name=Imported Account : Default name prefix}
+                            {--turnstile= : Optional Cloudflare Turnstile token}';
+
+    protected $description = 'Bulk import or interactively paste ChatGPT __Secure-next-auth.session-token credentials';
 
     public function handle(TokenRefresher $refresher): int
     {
-        $filePath = $this->argument('file');
+        $file = $this->argument('file');
+        $tokensToImport = [];
 
-        if (!file_exists($filePath)) {
-            $filePath = base_path($filePath);
+        if ($file && is_string($file) && file_exists($file)) {
+            $lines = file($file, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+            if ($lines) {
+                $tokensToImport = array_map('trim', $lines);
+            }
+        } else {
+            $this->info('Paste your __Secure-next-auth.session-token value:');
+            $token = trim((string) $this->secret('Session Token'));
+            if ($token !== '') {
+                $tokensToImport[] = $token;
+            }
         }
 
-        if (!file_exists($filePath)) {
-            $this->error("File not found: {$this->argument('file')}");
+        $tokensToImport = array_values(array_filter(array_map('trim', $tokensToImport)));
+        if ($tokensToImport === []) {
+            $this->error('No valid tokens provided.');
             return self::FAILURE;
         }
 
-        $content = file_get_contents($filePath);
-        $json = json_decode(trim($content), true);
+        $turnstile = $this->option('turnstile');
+        $imported = 0;
 
-        // If it's a full /api/auth/session JSON dump
-        if (is_array($json) && (isset($json['accessToken']) || isset($json['sessionToken']))) {
-            $this->info("Detected full ChatGPT session dump. Importing account directly...");
+        foreach ($tokensToImport as $idx => $rawToken) {
+            $hash = hash('sha256', $rawToken);
+            if (MirrorToken::where('token_hash', $hash)->exists()) {
+                $this->warn('Skipped duplicate session token #' . ($idx + 1));
+                continue;
+            }
 
-            $sessionToken = $json['sessionToken'] ?? ($json['accessToken'] ?? '');
-            $accessToken = $json['accessToken'] ?? null;
-            $email = $json['user']['email'] ?? null;
-            $name = $json['user']['name'] ?? 'Imported Account';
-            $planType = $json['account']['planType'] ?? 'free';
-            $accountId = $json['account']['id'] ?? ($json['user']['id'] ?? null);
-            $expiresAt = isset($json['expires']) ? \Carbon\Carbon::parse($json['expires']) : now()->addDays(7);
+            $verified = $refresher->verifyCandidateSessionToken($rawToken);
+            if (!$verified) {
+                $this->error('Token #' . ($idx + 1) . ' rejected by ChatGPT upstream.');
+                continue;
+            }
 
-            $token = MirrorToken::create([
-                'name' => $name,
-                'email' => $email,
-                'session_token' => $sessionToken,
-                'access_token' => $accessToken,
-                'access_token_expires_at' => $expiresAt,
-                'plan_type' => $planType,
-                'account_id' => $accountId,
+            $tokenRecord = MirrorToken::create([
+                'name' => count($tokensToImport) > 1
+                    ? $this->option('name') . ' #' . ($idx + 1)
+                    : ($verified['name'] ?: $this->option('name')),
+                'session_token' => $verified['session_token'],
+                'token_hash' => hash('sha256', $verified['session_token']),
+                'access_token' => $verified['access_token'],
+                'access_token_expires_at' => $verified['expires_at'],
+                'email' => $verified['email'],
+                'account_id' => $verified['account_id'],
+                'plan_type' => $verified['plan_type'] ?? 'free',
                 'status' => 'active',
                 'last_refreshed_at' => now(),
-                'meta' => $json,
             ]);
 
-            $this->info("🎉 Successfully imported session for {$name} ({$email}) [Plan: {$planType}]!");
-            return self::SUCCESS;
-        }
-
-        $extractedTokens = $this->extractTokens($content);
-
-        if (empty($extractedTokens)) {
-            $this->error("Could not find any valid session tokens in {$filePath}.");
-            return self::FAILURE;
-        }
-
-        $this->info("Found " . count($extractedTokens) . " token(s) in file. Importing into pool...");
-
-        $successCount = 0;
-        foreach ($extractedTokens as $idx => $rawToken) {
-            $name = 'Imported Token #' . ($idx + 1);
-            $token = new MirrorToken([
-                'name' => $name,
-                'session_token' => $rawToken,
-                'status' => 'active',
-            ]);
-            $token->save();
-
-            try {
-                $refresher->refresh($token);
-                $this->line("  ✓ Token #{$token->id} ({$token->email}) validated.");
-                $successCount++;
-            } catch (Throwable $e) {
-                $this->warn("  ⚠ Token #{$token->id} saved with warning: " . $e->getMessage());
+            if (is_string($turnstile) && trim($turnstile) !== '') {
+                $tokenRecord->setTurnstileToken($turnstile);
+                $tokenRecord->save();
             }
+
+            $this->info("Token #{$tokenRecord->id} verified ({$tokenRecord->email}) and imported cleanly!");
+            $imported++;
         }
 
-        $this->newLine();
-        $this->info("🎉 Successfully imported {$successCount} token(s)!");
-
-        return self::SUCCESS;
-    }
-
-    protected function extractTokens(string $content): array
-    {
-        $tokens = [];
-        $trimmed = trim($content);
-
-        // 1. Try parsing JSON (e.g. from /api/auth/session or array of tokens)
-        $json = json_decode($trimmed, true);
-        if (is_array($json)) {
-            if (isset($json['accessToken'])) {
-                // If this is session dump, we can use accessToken or check for session cookie
-                $tokens[] = $json['accessToken'];
-            }
-            if (isset($json['tokens']) && is_array($json['tokens'])) {
-                foreach ($json['tokens'] as $t) {
-                    $tokens[] = is_string($t) ? $t : ($t['token'] ?? '');
-                }
-            }
-        }
-
-        // 2. Line by line tokens
-        if (empty($tokens)) {
-            $lines = preg_split("/\r\n|\n|\r/", $trimmed);
-            foreach ($lines as $line) {
-                $line = trim($line);
-                if (!empty($line) && !str_starts_with($line, '#')) {
-                    $tokens[] = $line;
-                }
-            }
-        }
-
-        return array_values(array_filter($tokens));
+        return $imported > 0 ? self::SUCCESS : self::FAILURE;
     }
 }

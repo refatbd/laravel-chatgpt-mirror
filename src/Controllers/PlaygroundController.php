@@ -4,199 +4,119 @@ declare(strict_types=1);
 
 namespace Refatbd\LaravelChatGptMirror\Controllers;
 
-use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
-use Illuminate\Http\Response;
 use Illuminate\Routing\Controller;
-use Refatbd\LaravelChatGptMirror\Models\MirrorConversation;
-use Refatbd\LaravelChatGptMirror\Models\MirrorToken;
+use Refatbd\LaravelChatGptMirror\Models\MirrorSetting;
+use Refatbd\LaravelChatGptMirror\Services\SecurityService;
+use Refatbd\LaravelChatGptMirror\Services\TokenPoolManager;
+use Symfony\Component\HttpFoundation\Response;
 
+/**
+ * Serves the React Playground SPA (`/mirror/playground`) and manages per-account
+ * Playground preferences (`default-system-instructions`, `hotkeys`) in SQLite.
+ */
 class PlaygroundController extends Controller
 {
-    /**
-     * Serve the Mirror API Playground SPA.
-     */
-    public function index(): Response
+    public function __construct(
+        protected SecurityService $security,
+        protected TokenPoolManager $pool
+    ) {}
+
+    public function index(Request $request): Response
     {
-        $indexPath = __DIR__ . '/../../resources/web/dist/index.html';
-        if (!file_exists($indexPath)) {
-            abort(404, 'Playground asset distribution not found.');
+        $htmlPath = __DIR__ . '/../../resources/web/dist/index.html';
+        if (!file_exists($htmlPath)) {
+            return response('Mirror Playground frontend assets not built or found.', 404);
         }
 
-        $html = file_get_contents($indexPath);
+        $html = (string) file_get_contents($htmlPath);
+        $html = str_replace('src="/mirror/assets/', 'src="/mirror/assets/', $html);
 
-        return response($html, 200, [
+        $response = response($html, 200, [
             'Content-Type' => 'text/html; charset=utf-8',
-            'Cache-Control' => 'no-cache, private',
+            'Cache-Control' => 'no-store',
         ]);
+
+        return $this->security->attachControlCookie($response, $request);
     }
 
-    /**
-     * Serve Playground static assets (.js, .css, etc.).
-     */
     public function asset(string $file): Response
     {
-        // Prevent directory traversal
-        $safeFile = basename($file);
-        $filePath = __DIR__ . '/../../resources/web/dist/assets/' . $safeFile;
+        $assetPath = realpath(__DIR__ . '/../../resources/web/dist/assets/' . basename($file));
+        $baseDir = realpath(__DIR__ . '/../../resources/web/dist/assets');
 
-        if (!file_exists($filePath)) {
-            abort(404, 'Asset not found');
+        if (!$assetPath || !$baseDir || !str_starts_with($assetPath, $baseDir) || !file_exists($assetPath)) {
+            return response('Asset not found', 404);
         }
 
-        $ext = strtolower(pathinfo($safeFile, PATHINFO_EXTENSION));
-        $contentType = match ($ext) {
-            'js' => 'application/javascript; charset=utf-8',
+        $ext = strtolower(pathinfo($assetPath, PATHINFO_EXTENSION));
+        $mimeType = match ($ext) {
+            'js', 'mjs' => 'application/javascript; charset=utf-8',
             'css' => 'text/css; charset=utf-8',
             'svg' => 'image/svg+xml',
             'png' => 'image/png',
+            'jpg', 'jpeg' => 'image/jpeg',
+            'woff2' => 'font/woff2',
+            'json' => 'application/json',
             default => 'application/octet-stream',
         };
 
-        return response(file_get_contents($filePath), 200, [
-            'Content-Type' => $contentType,
-            'Cache-Control' => 'public, max-age=31536000, immutable',
+        return response((string) file_get_contents($assetPath), 200, [
+            'Content-Type' => $mimeType,
+            'Cache-Control' => 'public, max-age=31536000',
         ]);
     }
 
-    /**
-     * Return default system instructions.
-     */
-    public function getDefaultInstructions(): JsonResponse
+    public function getDefaultInstructions(): Response
     {
-        $content = cache()->get('mirror:default_system_instructions', 'You are a helpful assistant.');
-
-        return response()->json(['content' => $content]);
-    }
-
-    /**
-     * Save default system instructions.
-     */
-    public function saveDefaultInstructions(Request $request): JsonResponse
-    {
-        $content = (string) $request->input('content', 'You are a helpful assistant.');
-        cache()->put('mirror:default_system_instructions', $content, now()->addDays(30));
-
-        return response()->json(['content' => $content]);
-    }
-
-    /**
-     * Return keyboard shortcut settings.
-     */
-    public function getHotkeys(): JsonResponse
-    {
-        $hotkeys = cache()->get('mirror:user_hotkeys', []);
-
-        return response()->json(['hotkeys' => (object) $hotkeys]);
-    }
-
-    /**
-     * Save keyboard shortcut settings.
-     */
-    public function saveHotkeys(Request $request): JsonResponse
-    {
-        $hotkeys = $request->input('hotkeys', []);
-        cache()->put('mirror:user_hotkeys', $hotkeys, now()->addDays(30));
-
-        return response()->json(['hotkeys' => $hotkeys]);
-    }
-
-    /**
-     * Return list of conversations for Playground sidebar.
-     */
-    public function conversations(Request $request): JsonResponse
-    {
-        $limit = (int) $request->input('limit', 50);
-        $offset = (int) $request->input('offset', 0);
-
-        $query = MirrorConversation::orderBy('updated_at', 'desc');
-        $total = $query->count();
-        $items = $query->skip($offset)->take($limit)->get()->map(function ($c) {
-            return [
-                'id' => $c->id,
-                'title' => $c->title ?: 'Untitled Conversation',
-                'model' => $c->model ?: 'auto',
-                'updatedAt' => $c->updated_at?->toISOString() ?? now()->toISOString(),
-            ];
-        });
+        $accountId = $this->pool->primaryAccountId();
+        $content = MirrorSetting::getValue("default_system_instructions:{$accountId}", '');
 
         return response()->json([
-            'items' => $items,
-            'total' => $total,
-            'hasMore' => ($offset + count($items)) < $total,
+            'content' => (string) $content,
         ]);
     }
 
-    /**
-     * Return single conversation detail.
-     */
-    public function conversation(string $id): JsonResponse
+    public function saveDefaultInstructions(Request $request): Response
     {
-        $conv = MirrorConversation::find($id);
+        $accountId = $this->pool->primaryAccountId();
+        $content = (string) $request->input('content', '');
+        MirrorSetting::setValue("default_system_instructions:{$accountId}", $content);
 
         return response()->json([
-            'conversation' => $conv ? [
-                'id' => $conv->id,
-                'title' => $conv->title,
-                'model' => $conv->model,
-            ] : [
-                'id' => $id,
-                'title' => 'Chat Session',
-                'model' => 'auto',
-            ],
-            'messages' => [],
-            'instructions' => null,
+            'ok' => true,
+            'content' => $content,
         ]);
     }
 
-    /**
-     * Convert /v1/responses format to /v1/chat/completions format.
-     */
-    public function responses(Request $request, OpenAiApiController $openAiController)
+    public function getHotkeys(): Response
     {
-        $input = $request->input('input');
-        $instructions = $request->input('instructions');
-        $model = $request->input('model', 'auto');
-        $stream = (bool) $request->input('stream', false);
+        $accountId = $this->pool->primaryAccountId();
+        $hotkeys = MirrorSetting::getJson("hotkeys:{$accountId}", []);
 
-        $messages = [];
-        if (!empty($instructions)) {
-            $messages[] = ['role' => 'system', 'content' => (string) $instructions];
+        return response()->json([
+            'hotkeys' => $hotkeys !== [] ? $hotkeys : new \stdClass(),
+        ]);
+    }
+
+    public function saveHotkeys(Request $request): Response
+    {
+        $accountId = $this->pool->primaryAccountId();
+        $hotkeys = $request->input('hotkeys');
+        if (!is_array($hotkeys)) {
+            $hotkeys = [];
         }
 
-        if (is_string($input)) {
-            $messages[] = ['role' => 'user', 'content' => $input];
-        } elseif (is_array($input)) {
-            foreach ($input as $item) {
-                if (is_array($item)) {
-                    $content = $item['content'] ?? '';
-                    if (is_array($content)) {
-                        $text = '';
-                        foreach ($content as $part) {
-                            $text .= $part['text'] ?? '';
-                        }
-                        $content = $text;
-                    }
-                    $messages[] = [
-                        'role' => $item['role'] ?? 'user',
-                        'content' => (string) $content,
-                    ];
-                }
-            }
-        }
+        MirrorSetting::setJson("hotkeys:{$accountId}", $hotkeys);
 
-        // Synthesize request for chatCompletions
-        $synthesizedRequest = Request::create('/v1/chat/completions', 'POST', [
-            'model' => $model,
-            'messages' => $messages,
-            'stream' => $stream,
-        ], [], [], $request->server->all(), json_encode([
-            'model' => $model,
-            'messages' => $messages,
-            'stream' => $stream,
-        ]));
-        $synthesizedRequest->headers->replace($request->headers->all());
+        return response()->json([
+            'ok' => true,
+            'hotkeys' => $hotkeys !== [] ? $hotkeys : new \stdClass(),
+        ]);
+    }
 
-        return $openAiController->chatCompletions($synthesizedRequest);
+    public function responses(Request $request): Response
+    {
+        return app(OpenAiApiController::class)->responses($request);
     }
 }

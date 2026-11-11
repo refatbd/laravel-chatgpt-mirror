@@ -4,49 +4,107 @@ declare(strict_types=1);
 
 use Illuminate\Support\Facades\Route;
 use Refatbd\LaravelChatGptMirror\Controllers\AdminController;
+use Refatbd\LaravelChatGptMirror\Controllers\ApiDocsController;
 use Refatbd\LaravelChatGptMirror\Controllers\BackendApiController;
+use Refatbd\LaravelChatGptMirror\Controllers\ConversionController;
+use Refatbd\LaravelChatGptMirror\Controllers\DecoderChallengeController;
+use Refatbd\LaravelChatGptMirror\Controllers\MirrorApiController;
 use Refatbd\LaravelChatGptMirror\Controllers\OpenAiApiController;
 use Refatbd\LaravelChatGptMirror\Controllers\PlaygroundController;
+use Refatbd\LaravelChatGptMirror\Http\Middleware\ProtectControlEndpoints;
 use Refatbd\LaravelChatGptMirror\Http\Middleware\ValidateApiKey;
 
-$openaiPrefix = config('mirror.routes.openai_prefix', 'v1');
-$backendPrefix = config('mirror.routes.backend_prefix', 'backend-api');
+$openaiPrefix = trim((string) config('mirror.routes.openai_prefix', 'v1'), '/');
+$backendPrefix = trim((string) config('mirror.routes.backend_prefix', 'backend-api'), '/');
 
-// 1. OpenAI-compatible API Endpoints
-Route::prefix($openaiPrefix)
-    ->group(function () {
-        Route::get('/models', [OpenAiApiController::class, 'models'])->middleware([ValidateApiKey::class]);
-        Route::post('/chat/completions', [OpenAiApiController::class, 'chatCompletions'])->middleware([ValidateApiKey::class]);
-        Route::post('/responses', [PlaygroundController::class, 'responses'])->middleware([ValidateApiKey::class]);
-        Route::get('/capabilities', [AdminController::class, 'capabilities']);
-    });
+// 1. OpenAI-compatible Gateway (/v1/*)
+Route::prefix($openaiPrefix)->group(function () {
+    Route::get('/models', [OpenAiApiController::class, 'models'])->middleware([ValidateApiKey::class]);
+    Route::post('/chat/completions', [OpenAiApiController::class, 'chatCompletions'])->middleware([ValidateApiKey::class]);
+    Route::post('/responses', [OpenAiApiController::class, 'responses'])->middleware([ValidateApiKey::class]);
+    Route::get('/capabilities', [AdminController::class, 'capabilities']);
+});
 
-// 2. Health, Diagnostics & Programmatic Session Management (Node.js mirror compatibility)
+// 2. Public Health & Sealed 7-day Asset Content Delivery
 Route::get('/api/health', [AdminController::class, 'health']);
-Route::get('/api/diagnostics', [AdminController::class, 'diagnostics']);
-Route::get('/api/session', [AdminController::class, 'getSession']);
-Route::post('/api/session', [AdminController::class, 'postSession']);
-Route::delete('/api/session', [AdminController::class, 'deleteSession']);
+Route::match(['GET', 'HEAD'], '/api/asset-content', [MirrorApiController::class, 'assetContent']);
 
-// 3. Playground UI Settings & History Endpoints
-Route::get('/api/settings/default-system-instructions', [PlaygroundController::class, 'getDefaultInstructions']);
-Route::put('/api/settings/default-system-instructions', [PlaygroundController::class, 'saveDefaultInstructions']);
-Route::get('/api/settings/hotkeys', [PlaygroundController::class, 'getHotkeys']);
-Route::put('/api/settings/hotkeys', [PlaygroundController::class, 'saveHotkeys']);
-Route::get('/api/conversations', [PlaygroundController::class, 'conversations']);
-Route::get('/api/conversations/{id}', [PlaygroundController::class, 'conversation']);
-
-// 4. Synthesized NextAuth Session for ChatGPT Web UI
+// 3. Synthesized NextAuth Session for ChatGPT Web UI (never leaks raw upstream JWT)
 Route::get('/api/auth/session', [BackendApiController::class, 'session']);
 
-// 5. OpenAPI schema & Interactive Swagger UI Docs
-Route::get('/mirror/openapi', [\Refatbd\LaravelChatGptMirror\Controllers\ApiDocsController::class, 'openapi']);
-Route::get('/mirror/api-docs', [\Refatbd\LaravelChatGptMirror\Controllers\ApiDocsController::class, 'ui']);
-Route::get('/mirror/api-docs/{file}', [\Refatbd\LaravelChatGptMirror\Controllers\ApiDocsController::class, 'asset'])
+// 4. Mirror Control, Playground, Conversation, File, Conversion & Challenge APIs
+Route::middleware([ProtectControlEndpoints::class])->group(function () {
+    Route::get('/api/diagnostics', [AdminController::class, 'diagnostics']);
+    Route::get('/api/session', [AdminController::class, 'getSession']);
+    Route::post('/api/session', [AdminController::class, 'postSession']);
+    Route::delete('/api/session', [AdminController::class, 'deleteSession']);
+
+    Route::get('/api/settings/default-system-instructions', [PlaygroundController::class, 'getDefaultInstructions']);
+    Route::put('/api/settings/default-system-instructions', [PlaygroundController::class, 'saveDefaultInstructions']);
+    Route::get('/api/settings/hotkeys', [PlaygroundController::class, 'getHotkeys']);
+    Route::put('/api/settings/hotkeys', [PlaygroundController::class, 'saveHotkeys']);
+
+    Route::get('/api/models', [MirrorApiController::class, 'models']);
+    Route::get('/api/gpts', [MirrorApiController::class, 'gpts']);
+    Route::post('/api/chat', [MirrorApiController::class, 'chat']);
+
+    // Note: /search must be registered BEFORE /api/conversations/{id}!
+    Route::get('/api/conversations', [MirrorApiController::class, 'conversations']);
+    Route::post('/api/conversations', [MirrorApiController::class, 'createConversation']);
+    Route::get('/api/conversations/search', [MirrorApiController::class, 'searchConversations']);
+    Route::get('/api/conversations/{id}', [MirrorApiController::class, 'showConversation']);
+    Route::patch('/api/conversations/{id}', [MirrorApiController::class, 'updateConversation']);
+    Route::delete('/api/conversations/{id}', [MirrorApiController::class, 'deleteConversation']);
+    Route::post('/api/conversations/{id}/stop', [MirrorApiController::class, 'stopConversation']);
+    Route::post('/api/conversations/{id}/branch', [MirrorApiController::class, 'branchConversation']);
+    Route::get('/api/conversations/{id}/branches', [MirrorApiController::class, 'branches']);
+    Route::get('/api/conversations/{id}/export', [MirrorApiController::class, 'exportConversation']);
+
+    Route::post('/api/files', [MirrorApiController::class, 'uploadFile']);
+    Route::get('/api/assets', [MirrorApiController::class, 'assets']);
+
+    // File-conversion codecs & Playground Convert tab
+    Route::get('/api/convert/formats', [ConversionController::class, 'formats']);
+    Route::post('/api/convert/loaf/encode', [ConversionController::class, 'loafEncode']);
+    Route::post('/api/convert/loaf/decode', [ConversionController::class, 'loafDecode']);
+    Route::post('/api/convert/loaf/verify', [ConversionController::class, 'loafVerify']);
+    Route::post('/api/convert/pngspeak/encode', [ConversionController::class, 'pngspeakEncode']);
+    Route::post('/api/convert/pngspeak/decode', [ConversionController::class, 'pngspeakDecode']);
+    Route::post('/api/convert/gptgif/encode', [ConversionController::class, 'gptgifEncode']);
+    Route::post('/api/convert/gptgif/decode', [ConversionController::class, 'gptgifDecode']);
+    Route::post('/api/convert/gptgif/calibrate', [ConversionController::class, 'gptgifCalibrate']);
+    Route::get('/api/convert/gptgif/font-preview', [ConversionController::class, 'gptgifFontPreview']);
+    Route::post('/api/convert/gptgif-v4/encode', [ConversionController::class, 'gptgifV4Encode']);
+    Route::post('/api/convert/gptgif-v4/decode', [ConversionController::class, 'gptgifV4Decode']);
+    Route::get('/api/convert/gptgif-v4/random-style', [ConversionController::class, 'gptgifV4RandomStyle']);
+    Route::get('/api/convert/gptgif-v4/default-style', [ConversionController::class, 'gptgifV4DefaultStyle']);
+    Route::post('/api/convert/gptgif-v4/font/validate', [ConversionController::class, 'gptgifV4ValidateFont']);
+    Route::post('/api/convert/gptgif-v4/palette/validate', [ConversionController::class, 'gptgifV4ValidatePalette']);
+    Route::post('/api/convert/gif89a/encode', [ConversionController::class, 'gif89aEncode']);
+    Route::post('/api/convert/gif89a/inspect', [ConversionController::class, 'gif89aInspect']);
+    Route::post('/api/convert/roundtrip', [ConversionController::class, 'roundtrip']);
+    Route::post('/api/convert/onion/encode', [ConversionController::class, 'onionEncode']);
+    Route::post('/api/convert/onion/decode', [ConversionController::class, 'onionDecode']);
+    Route::post('/api/convert/gpt-prompt', [ConversionController::class, 'gptPrompt']);
+    Route::get('/api/convert/mystery', [ConversionController::class, 'mystery']);
+    Route::get('/api/convert/fortune', [ConversionController::class, 'fortune']);
+    Route::post('/api/convert/gauntlet', [ConversionController::class, 'gauntlet']);
+
+    // Decoder challenges
+    Route::post('/api/decoder-challenges', [DecoderChallengeController::class, 'create']);
+    Route::post('/api/decoder-challenges/kit', [DecoderChallengeController::class, 'kit']);
+    Route::get('/api/decoder-challenges/{id}/artifact', [DecoderChallengeController::class, 'artifact']);
+    Route::post('/api/decoder-challenges/{id}/verify', [DecoderChallengeController::class, 'verify']);
+});
+
+// 5. OpenAPI Schema & Interactive Swagger UI Docs
+Route::get('/mirror/openapi', [ApiDocsController::class, 'openapi']);
+Route::get('/mirror/api-docs', [ApiDocsController::class, 'ui']);
+Route::get('/mirror/api-docs/{file}', [ApiDocsController::class, 'asset'])
     ->where('file', '[A-Za-z0-9._-]+');
 
-// 5. Proxied Backend Endpoints
-Route::any('/' . ltrim($backendPrefix, '/') . '/{path}', [BackendApiController::class, 'proxy'])
+// 6. Proxied ChatGPT Backend Endpoints
+Route::any('/' . $backendPrefix . '/{path}', [BackendApiController::class, 'proxy'])
     ->where('path', '.*');
 
 Route::any('/__codex-api/{path}', [BackendApiController::class, 'proxy'])

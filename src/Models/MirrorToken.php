@@ -4,15 +4,38 @@ declare(strict_types=1);
 
 namespace Refatbd\LaravelChatGptMirror\Models;
 
-use Carbon\Carbon;
 use Illuminate\Database\Eloquent\Model;
-use Illuminate\Database\Eloquent\Relations\HasMany;
+use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\Crypt;
-use Throwable;
+use Illuminate\Support\Str;
 
+/**
+ * Represents a single ChatGPT web account in the multi-account token pool.
+ */
 class MirrorToken extends Model
 {
-    protected $guarded = ['id'];
+    protected $table = 'mirror_tokens';
+
+    protected $fillable = [
+        'name',
+        'email',
+        'session_token',
+        'token_hash',
+        'access_token',
+        'access_token_expires_at',
+        'plan_type',
+        'account_id',
+        'status',
+        'active_requests',
+        'total_requests',
+        'total_tokens_used',
+        'consecutive_errors',
+        'cooldown_until',
+        'last_used_at',
+        'last_refreshed_at',
+        'last_error',
+        'meta',
+    ];
 
     protected $casts = [
         'access_token_expires_at' => 'datetime',
@@ -23,30 +46,22 @@ class MirrorToken extends Model
         'total_requests' => 'integer',
         'total_tokens_used' => 'integer',
         'consecutive_errors' => 'integer',
-        'meta' => 'array',
     ];
 
-    public function getTable()
+    protected $hidden = [
+        'session_token',
+        'access_token',
+        'meta',
+    ];
+
+    public function setSessionTokenAttribute(?string $value): void
     {
-        return config('mirror.storage.table', parent::getTable());
+        $this->attributes['session_token'] = $value !== null && $value !== '' ? Crypt::encryptString($value) : null;
+        if ($value !== null && $value !== '') {
+            $this->attributes['token_hash'] = hash('sha256', trim($value));
+        }
     }
 
-    public function conversations(): HasMany
-    {
-        return $this->hasMany(MirrorConversation::class, 'token_id');
-    }
-
-    /**
-     * Mutator: Encrypt session token before persisting.
-     */
-    public function setSessionTokenAttribute(string $value): void
-    {
-        $this->attributes['session_token'] = Crypt::encryptString($value);
-    }
-
-    /**
-     * Accessor: Decrypt session token.
-     */
     public function getSessionTokenAttribute(?string $value): ?string
     {
         if (empty($value)) {
@@ -55,22 +70,16 @@ class MirrorToken extends Model
 
         try {
             return Crypt::decryptString($value);
-        } catch (Throwable) {
-            return $value; // Fallback in case raw plaintext token was passed
+        } catch (\Throwable) {
+            return $value;
         }
     }
 
-    /**
-     * Mutator: Encrypt access token before persisting.
-     */
     public function setAccessTokenAttribute(?string $value): void
     {
-        $this->attributes['access_token'] = $value !== null ? Crypt::encryptString($value) : null;
+        $this->attributes['access_token'] = $value !== null && $value !== '' ? Crypt::encryptString($value) : null;
     }
 
-    /**
-     * Accessor: Decrypt access token.
-     */
     public function getAccessTokenAttribute(?string $value): ?string
     {
         if (empty($value)) {
@@ -79,81 +88,147 @@ class MirrorToken extends Model
 
         try {
             return Crypt::decryptString($value);
-        } catch (Throwable) {
+        } catch (\Throwable) {
             return $value;
         }
     }
 
+    public function setMetaAttribute(mixed $value): void
+    {
+        if ($value === null || $value === []) {
+            $this->attributes['meta'] = null;
+            return;
+        }
+
+        $json = is_string($value) ? $value : json_encode($value);
+        $this->attributes['meta'] = Crypt::encryptString((string) $json);
+    }
+
     /**
-     * Get or generate a persistent deviceId (UUID) required by OpenAI backend-api.
+     * @return array<string, mixed>
      */
+    public function getMetaAttribute(?string $value): array
+    {
+        if (empty($value)) {
+            return [];
+        }
+
+        try {
+            $decoded = json_decode(Crypt::decryptString($value), true);
+            return is_array($decoded) ? $decoded : [];
+        } catch (\Throwable) {
+            $decoded = json_decode($value, true);
+            return is_array($decoded) ? $decoded : [];
+        }
+    }
+
     public function getDeviceId(): string
     {
-        $meta = $this->meta ?? [];
-        if (!empty($meta['device_id'])) {
+        $meta = $this->meta;
+        if (!empty($meta['device_id']) && is_string($meta['device_id'])) {
             return $meta['device_id'];
         }
 
-        $deviceId = (string) \Illuminate\Support\Str::uuid();
+        $deviceId = (string) Str::uuid();
         $meta['device_id'] = $deviceId;
-        $this->update(['meta' => $meta]);
+        $this->meta = $meta;
+        if ($this->exists) {
+            $this->saveQuietly();
+        }
 
         return $deviceId;
     }
 
-    /**
-     * Check if the token is eligible to receive incoming traffic.
-     */
+    public function getTurnstileToken(): ?string
+    {
+        $meta = $this->meta;
+        $token = $meta['turnstile_token'] ?? null;
+        return is_string($token) && trim($token) !== '' ? trim($token) : null;
+    }
+
+    public function setTurnstileToken(?string $token): void
+    {
+        $meta = $this->meta;
+        if ($token !== null && trim($token) !== '') {
+            $meta['turnstile_token'] = trim($token);
+            $meta['turnstile_token_saved_at'] = now()->timestamp;
+        } else {
+            unset($meta['turnstile_token'], $meta['turnstile_token_saved_at']);
+        }
+        $this->meta = $meta;
+    }
+
+    public function getEffectiveAccountId(): string
+    {
+        $id = $this->account_id;
+        return is_string($id) && trim($id) !== '' ? trim($id) : 'default';
+    }
+
     public function isHealthy(): bool
     {
         if ($this->status === 'disabled' || $this->status === 'expired') {
             return false;
         }
 
-        if ($this->status === 'cooldown') {
-            if ($this->cooldown_until && $this->cooldown_until->isFuture()) {
-                return false;
-            }
-            // Cooldown has elapsed, restore to active
-            $this->update([
-                'status' => 'active',
-                'cooldown_until' => null,
-                'consecutive_errors' => 0,
-            ]);
+        if ($this->cooldown_until && $this->cooldown_until->isFuture()) {
+            return false;
         }
 
-        return true;
+        return !empty($this->session_token) || !empty($this->access_token);
     }
 
-    /**
-     * Check if cached access token needs a refresh from chatgpt.com/api/auth/session.
-     */
     public function needsRefresh(): bool
     {
-        if (empty($this->access_token) || $this->access_token_expires_at === null) {
+        if (empty($this->access_token)) {
             return true;
         }
 
-        // Refresh 2 minutes before actual expiration
-        return Carbon::now()->addMinutes(2)->gte($this->access_token_expires_at);
+        if ($this->access_token_expires_at === null) {
+            $jwtExp = self::decodeJwtExpiry($this->access_token);
+            if ($jwtExp === null) {
+                return false;
+            }
+            return ($jwtExp - time()) <= (int) config('mirror.pool.refresh_buffer_seconds', 300);
+        }
+
+        $buffer = (int) config('mirror.pool.refresh_buffer_seconds', 300);
+        return $this->access_token_expires_at->subSeconds($buffer)->isPast();
     }
 
-    /**
-     * Increment active request counter atomically.
-     */
+    public static function decodeJwtExpiry(?string $jwt): ?int
+    {
+        if (!$jwt || !str_contains($jwt, '.')) {
+            return null;
+        }
+
+        $parts = explode('.', $jwt);
+        if (count($parts) !== 3) {
+            return null;
+        }
+
+        $payload = base64_decode(strtr($parts[1], '-_', '+/'), true);
+        if (!is_string($payload) || $payload === '') {
+            return null;
+        }
+
+        $decoded = json_decode($payload, true);
+        if (!is_array($decoded) || !isset($decoded['exp']) || !is_numeric($decoded['exp'])) {
+            return null;
+        }
+
+        return (int) $decoded['exp'];
+    }
+
     public function incrementActive(): void
     {
         $this->increment('active_requests');
         $this->update(['last_used_at' => Carbon::now()]);
     }
 
-    /**
-     * Decrement active request counter and record metrics.
-     */
     public function decrementActive(bool $success = true, ?int $tokensUsed = null): void
     {
         $decrement = $this->active_requests > 0 ? 1 : 0;
-        
+
         $updates = [
             'total_requests' => $this->total_requests + 1,
         ];
@@ -164,6 +239,7 @@ class MirrorToken extends Model
 
         if ($success) {
             $updates['consecutive_errors'] = 0;
+            $updates['last_error'] = null;
             if ($tokensUsed) {
                 $updates['total_tokens_used'] = $this->total_tokens_used + $tokensUsed;
             }
@@ -174,9 +250,6 @@ class MirrorToken extends Model
         $this->update($updates);
     }
 
-    /**
-     * Put token into cooldown mode.
-     */
     public function enterCooldown(int $seconds = 60): void
     {
         $this->update([
