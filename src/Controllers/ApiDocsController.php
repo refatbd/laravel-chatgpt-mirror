@@ -62,6 +62,13 @@ class ApiDocsController extends Controller
         $docsBase = $basePath . ($docsPrefix !== '' ? '/' . $docsPrefix : '');
         $openApiUrl = json_encode($docsBase . '/openapi', JSON_UNESCAPED_SLASHES);
 
+        $clean = static fn (string $val, string $fallback): string => '/' . (trim($val, '/') !== '' ? trim($val, '/') : $fallback);
+        $homeUrl = e(($basePath !== '' ? $basePath : '') . '/');
+        $playgroundUrl = e($basePath . $clean((string) config('mirror.routes.playground_prefix', 'mirror/playground'), 'mirror/playground'));
+        $adminUrl = e($basePath . $clean((string) config('mirror.routes.admin_prefix', 'mirror/admin'), 'mirror/admin'));
+        $helpUrl = e($basePath . $clean((string) config('mirror.routes.help_prefix', 'mirror/help'), 'mirror/help'));
+        $docsUrl = e($docsBase . '/api-docs');
+
         $html = <<<HTML
 <!DOCTYPE html>
 <html lang="en">
@@ -73,9 +80,24 @@ class ApiDocsController extends Controller
     <link rel="icon" type="image/png" href="{$docsBase}/api-docs/favicon-32x32.png" sizes="32x32" />
     <style>
       .swagger-ui .topbar { display: none; }
+      .mirror-docs-nav { background:#fff; border-bottom:1px solid #e5e7eb; padding:0 24px; min-height:52px; display:flex; align-items:center; justify-content:space-between; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; flex-wrap:wrap; gap:12px; }
+      .mirror-docs-brand { font-weight:700; font-size:15px; color:#111827; display:flex; align-items:center; gap:8px; }
+      .mirror-docs-links { display:flex; gap:16px; font-size:13px; flex-wrap:wrap; }
+      .mirror-docs-links a { color:#374151; text-decoration:none; font-weight:500; }
+      .mirror-docs-links a.active { color:#000; font-weight:700; }
     </style>
   </head>
   <body>
+    <nav class="mirror-docs-nav">
+      <div class="mirror-docs-brand">Laravel ChatGPT Mirror <span style="font-size:11px;color:#059669;background:#ecfdf5;padding:2px 8px;border-radius:99px">OpenAPI 3.1</span></div>
+      <div class="mirror-docs-links">
+        <a href="{$homeUrl}">ChatGPT Web</a>
+        <a href="{$playgroundUrl}">Playground</a>
+        <a href="{$docsUrl}" class="active">API Docs</a>
+        <a href="{$adminUrl}">Settings &amp; Admin Dashboard</a>
+        <a href="{$helpUrl}">Help &amp; About</a>
+      </div>
+    </nav>
     <div id="swagger-ui"></div>
     <script src="{$docsBase}/api-docs/swagger-ui-bundle.js" charset="UTF-8"></script>
     <script src="{$docsBase}/api-docs/swagger-ui-standalone-preset.js" charset="UTF-8"></script>
@@ -139,6 +161,7 @@ HTML;
     {
         $openaiPrefix = '/' . trim((string) config('mirror.routes.openai_prefix', 'v1'), '/');
         $adminPrefix = '/' . trim((string) config('mirror.routes.admin_prefix', 'mirror/admin'), '/');
+        $helpPrefix = '/' . trim((string) config('mirror.routes.help_prefix', 'mirror/help'), '/');
         $docsPrefix = trim((string) config('mirror.routes.docs_prefix', 'mirror'), '/');
         $docsBase = $docsPrefix !== '' ? ('/' . $docsPrefix) : '';
 
@@ -147,7 +170,11 @@ HTML;
             'info' => [
                 'title' => 'Mirror API',
                 'version' => '2.1.0',
-                'description' => "Dynamic ChatGPT Web Mirror in Laravel: OpenAI-compatible gateway ({$openaiPrefix}/chat/completions, {$openaiPrefix}/responses, {$openaiPrefix}/models), Sentinel PoW + Conduit, native /api/chat & /api/conversations/*, file uploads & signed /api/asset-content links, binary codecs (/api/convert/*), decoder challenges, dynamic Redis/runtime control ({$adminPrefix}), and transparent ChatGPT web proxy.",
+                'description' => "Dynamic ChatGPT Web Mirror in Laravel: OpenAI-compatible gateway ({$openaiPrefix}/chat/completions, {$openaiPrefix}/responses, {$openaiPrefix}/models), Sentinel PoW + Conduit, native /api/chat & /api/conversations/*, file uploads & signed /api/asset-content links, binary codecs (/api/convert/*), decoder challenges, dynamic Redis/runtime control ({$adminPrefix}), complete setup guide ({$helpPrefix}), and transparent ChatGPT web proxy.",
+            ],
+            'externalDocs' => [
+                'description' => 'Complete Help, About, Features & Configuration Guide',
+                'url' => rtrim($serverUrl, '/') . $helpPrefix,
             ],
             'servers' => [['url' => $serverUrl, 'description' => 'Active Laravel Mirror instance']],
             'tags' => [

@@ -80,6 +80,7 @@ class AdminController extends Controller
             'backend' => $sub . $clean((string) config('mirror.routes.backend_prefix', '__codex-api'), '__codex-api'),
             'admin' => $sub . $clean((string) config('mirror.routes.admin_prefix', 'mirror/admin'), 'mirror/admin'),
             'playground' => $sub . $clean((string) config('mirror.routes.playground_prefix', 'mirror/playground'), 'mirror/playground'),
+            'help' => $sub . $clean((string) config('mirror.routes.help_prefix', 'mirror/help'), 'mirror/help'),
             'assets' => $sub . $clean((string) config('mirror.routes.assets_prefix', 'mirror/assets'), 'mirror/assets'),
             'api_docs' => $sub . $docsBase . '/api-docs',
             'openapi' => $sub . $docsBase . '/openapi',
@@ -338,6 +339,7 @@ class AdminController extends Controller
             'capabilities' => "{$paths['openai']}/capabilities",
             'playground' => $paths['playground'],
             'admin' => $paths['admin'],
+            'help' => $paths['help'],
             'api_docs' => $paths['api_docs'],
             'openapi' => $paths['openapi'],
             'runtime_settings' => $paths['runtime_settings'],
@@ -917,6 +919,7 @@ class AdminController extends Controller
         $safePrefix = e($paths['openai']);
         $safePlaygroundUrl = e($originUrl . $paths['playground']);
         $safeDocsUrl = e($originUrl . $paths['api_docs']);
+        $safeHelpUrl = e($originUrl . $paths['help']);
         $safeHomeUrl = e($baseUrl . '/');
         $safeDiagnosticsUrl = e($baseUrl . '/api/diagnostics');
 
@@ -1059,6 +1062,7 @@ class AdminController extends Controller
     <a href="{$safePlaygroundUrl}">Playground</a>
     <a href="{$safeDocsUrl}">API Docs</a>
     <a href="{$safeAdminBase}" class="active">Settings &amp; Admin Dashboard</a>
+    <a href="{$safeHelpUrl}">Help &amp; About</a>
   </div>
 </nav>
 <div class="container">

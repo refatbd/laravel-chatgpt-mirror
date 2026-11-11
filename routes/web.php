@@ -5,6 +5,7 @@ declare(strict_types=1);
 use Illuminate\Support\Facades\Route;
 use Refatbd\LaravelChatGptMirror\Controllers\AdminController;
 use Refatbd\LaravelChatGptMirror\Controllers\BrowserProxyController;
+use Refatbd\LaravelChatGptMirror\Controllers\HelpController;
 use Refatbd\LaravelChatGptMirror\Controllers\PlaygroundController;
 use Refatbd\LaravelChatGptMirror\Http\Middleware\PrepareMirrorRuntime;
 use Refatbd\LaravelChatGptMirror\Http\Middleware\ProtectControlEndpoints;
@@ -12,6 +13,7 @@ use Refatbd\LaravelChatGptMirror\Http\Middleware\ProtectControlEndpoints;
 $browserPrefix = trim((string) config('mirror.routes.browser_prefix', ''), '/');
 $adminPrefix = trim((string) config('mirror.routes.admin_prefix', 'mirror/admin'), '/');
 $playgroundPrefix = trim((string) config('mirror.routes.playground_prefix', 'mirror/playground'), '/');
+$helpPrefix = trim((string) config('mirror.routes.help_prefix', 'mirror/help'), '/');
 $assetsPrefix = trim((string) config('mirror.routes.assets_prefix', 'mirror/assets'), '/');
 $openaiPrefix = trim((string) config('mirror.routes.openai_prefix', 'v1'), '/');
 $backendPrefix = trim((string) config('mirror.routes.backend_prefix', 'backend-api'), '/');
@@ -24,6 +26,7 @@ $excludedFirstSegments = array_values(array_unique(array_filter([
     explode('/', $backendPrefix)[0] ?? '',
     explode('/', $adminPrefix)[0] ?? '',
     explode('/', $playgroundPrefix)[0] ?? '',
+    explode('/', $helpPrefix)[0] ?? '',
     explode('/', $assetsPrefix)[0] ?? '',
     explode('/', $docsPrefix)[0] ?? '',
 ])));
@@ -31,7 +34,7 @@ $catchAllPattern = $excludedFirstSegments !== []
     ? '^(?!(?:' . implode('|', array_map(static fn (string $s): string => preg_quote($s, '/'), $excludedFirstSegments)) . ')(?:/|$)).+'
     : '.+';
 
-Route::middleware([PrepareMirrorRuntime::class])->group(function () use ($browserPrefix, $adminPrefix, $playgroundPrefix, $assetsPrefix, $catchAllPattern): void {
+Route::middleware([PrepareMirrorRuntime::class])->group(function () use ($browserPrefix, $adminPrefix, $playgroundPrefix, $helpPrefix, $assetsPrefix, $catchAllPattern): void {
 
 // 1. Built-in Playground UI & Static Assets
 Route::get('/' . $playgroundPrefix, [PlaygroundController::class, 'index']);
@@ -57,6 +60,18 @@ Route::prefix($adminPrefix)->group(function () {
 // Friendly Settings / Admin aliases
 Route::get('/admin', fn () => redirect('/' . $adminPrefix));
 Route::get('/settings/mirror', fn () => redirect('/' . $adminPrefix));
+
+// 2b. Help, Architecture & Configuration Guide
+Route::get('/' . $helpPrefix, [HelpController::class, 'index'])->name('mirror.help.index');
+if ($helpPrefix !== 'help') {
+    Route::get('/help', fn () => redirect('/' . $helpPrefix));
+}
+if ($helpPrefix !== 'about') {
+    Route::get('/about', fn () => redirect('/' . $helpPrefix));
+}
+if ($helpPrefix !== 'mirror/about') {
+    Route::get('/mirror/about', fn () => redirect('/' . $helpPrefix));
+}
 
 // 3. Explicit Proxied ChatGPT Web Frontend Paths
 Route::prefix($browserPrefix)->group(function () {

@@ -68,6 +68,7 @@ return [
         'backend_prefix' => env('MIRROR_BACKEND_PREFIX', 'backend-api'),
         'admin_prefix' => env('MIRROR_ADMIN_PREFIX', 'mirror/admin'),
         'playground_prefix' => env('MIRROR_PLAYGROUND_PREFIX', 'mirror/playground'),
+        'help_prefix' => env('MIRROR_HELP_PREFIX', 'mirror/help'),
         'assets_prefix' => env('MIRROR_ASSETS_PREFIX', 'mirror/assets'),
         'docs_prefix' => env('MIRROR_DOCS_PREFIX', 'mirror'),
         'middleware' => ['api'],
