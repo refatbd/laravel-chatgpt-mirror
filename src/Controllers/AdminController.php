@@ -372,6 +372,8 @@ class AdminController extends Controller
             'distributed_locks' => (bool) ($cacheDiag['locks_supported'] ?? false),
             'reverse_proxy_headers' => true,
             'browser_proxy' => true,
+            'cors' => filter_var(config('mirror.cors.enabled', true), FILTER_VALIDATE_BOOLEAN),
+            'rate_limiting' => filter_var(config('mirror.rate_limit.enabled', false), FILTER_VALIDATE_BOOLEAN),
             'websocket_proxy' => false,
             'warp_egress_toggle' => false,
         ];
@@ -499,6 +501,10 @@ class AdminController extends Controller
             $input['server_trust_proxies'] = $request->boolean('server_trust_proxies');
             $input['server_disable_output_compression'] = $request->boolean('server_disable_output_compression');
             $input['clear_redis_password'] = $request->boolean('clear_redis_password');
+            if ($request->boolean('_has_gateway_controls')) {
+                $input['cors_enabled'] = $request->boolean('cors_enabled');
+                $input['rate_limit_enabled'] = $request->boolean('rate_limit_enabled');
+            }
         }
 
         return $input;
@@ -943,6 +949,9 @@ class AdminController extends Controller
         $cacheState = $dynState['cache'] ?? [];
         $serverState = $dynState['server'] ?? [];
         $poolState = $dynState['pool'] ?? [];
+        $httpState = $dynState['http'] ?? [];
+        $corsState = $dynState['cors'] ?? [];
+        $rateLimitState = $dynState['rate_limit'] ?? [];
 
         $redisModeOptions = $opt((string) ($redisState['enabled'] ?? 'auto'), [
             'auto' => 'Auto (Use Redis if configured & available)',
@@ -989,11 +998,17 @@ class AdminController extends Controller
         $safeStreamTimeout = e((string) ($serverState['stream_max_execution_time'] ?? 300));
         $safeMaxConcurrent = e((string) ($poolState['max_concurrent_per_token'] ?? 5));
         $safeCooldownSec = e((string) ($poolState['cooldown_seconds'] ?? 60));
+        $safeReadTimeout = e((string) ($httpState['read_timeout'] ?? 120));
+        $safeCorsOrigins = e((string) ($corsState['allowed_origins'] ?? '*'));
+        $safeRlMax = e((string) ($rateLimitState['max_attempts'] ?? 180));
+        $safeRlDecay = e((string) ($rateLimitState['decay_seconds'] ?? 60));
 
         $chkPersist = ($redisState['persistent'] ?? true) ? ' checked' : '';
         $chkAssetsRedis = ($cacheState['assets_in_redis'] ?? true) ? ' checked' : '';
         $chkTrustProxies = ($serverState['trust_proxies'] ?? true) ? ' checked' : '';
         $chkDisableZlib = ($serverState['disable_output_compression'] ?? true) ? ' checked' : '';
+        $chkCorsEnabled = ($corsState['enabled'] ?? true) ? ' checked' : '';
+        $chkRateLimitEnabled = ($rateLimitState['enabled'] ?? false) ? ' checked' : '';
         $overridesBadge = ((int) ($dynState['overrides_active'] ?? 0)) > 0
             ? '<span style="padding:2px 8px;border-radius:99px;background:#fef3c7;color:#92400e;font-size:11px;font-weight:600">' . (int) $dynState['overrides_active'] . ' Live DB Overrides Active</span>'
             : '<span style="padding:2px 8px;border-radius:99px;background:#f3f4f6;color:#374151;font-size:11px;font-weight:600">Using .env / Config Defaults</span>';
@@ -1096,6 +1111,7 @@ Routes:   {$safePrefix}/chat/completions, {$safePrefix}/responses, {$safePrefix}
     <p style="font-size:13px;color:var(--muted);margin-top:0">Adjust web server behavior, Redis caching, or pool routing dynamically from the database—nothing stays hardcoded, and if Redis is unavailable or disabled the app runs seamlessly on fallback storage.</p>
     <form method="POST" action="{$safeAdminBase}/runtime" id="dynamic-runtime-form">
       <input type="hidden" name="_runtime_form" value="1" />
+      <input type="hidden" name="_has_gateway_controls" value="1" />
       <div class="grid-3">
         <div>
           <label class="field-label" for="rt_redis_enabled">Redis Mode</label>
@@ -1139,6 +1155,9 @@ Routes:   {$safePrefix}/chat/completions, {$safePrefix}/responses, {$safePrefix}
           <label class="field-label" for="rt_stream_timeout">SSE Stream Max Execution (sec, 0=unlimited)</label>
           <input id="rt_stream_timeout" type="number" name="server_stream_max_execution_time" class="input" value="{$safeStreamTimeout}" min="0" max="3600" />
 
+          <label class="field-label" for="rt_read_timeout">Upstream SSE Idle Read Timeout (sec)</label>
+          <input id="rt_read_timeout" type="number" name="http_read_timeout" class="input" value="{$safeReadTimeout}" min="5" max="3600" />
+
           <label class="field-label" for="rt_cache_store">Laravel Cache Store Override</label>
           <input id="rt_cache_store" type="text" name="cache_store" class="input" value="{$safeCacheStore}" placeholder="Auto (leave blank unless pinning store)" />
 
@@ -1156,11 +1175,27 @@ Routes:   {$safePrefix}/chat/completions, {$safePrefix}/responses, {$safePrefix}
           <label class="field-label" for="rt_pool_cool">Rate-Limit Cooldown (seconds)</label>
           <input id="rt_pool_cool" type="number" name="pool_cooldown_seconds" class="input" value="{$safeCooldownSec}" min="1" max="3600" />
 
+          <label class="field-label" for="rt_cors_origins">Allowed CORS Origins (* or comma-separated)</label>
+          <input id="rt_cors_origins" type="text" name="cors_allowed_origins" class="input" value="{$safeCorsOrigins}" placeholder="* or https://app.example.com" />
+
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
+            <div>
+              <label class="field-label" for="rt_rl_max">Rate Limit Max Req</label>
+              <input id="rt_rl_max" type="number" name="rate_limit_max_attempts" class="input" value="{$safeRlMax}" min="1" max="100000" />
+            </div>
+            <div>
+              <label class="field-label" for="rt_rl_decay">Window (sec)</label>
+              <input id="rt_rl_decay" type="number" name="rate_limit_decay_seconds" class="input" value="{$safeRlDecay}" min="1" max="86400" />
+            </div>
+          </div>
+
           <div style="margin-top:10px;padding-top:10px;border-top:1px solid var(--border)">
             <label class="chk-row"><input type="checkbox" name="redis_persistent" value="1"{$chkPersist} /> Persistent Redis connections</label>
             <label class="chk-row"><input type="checkbox" name="cache_assets_in_redis" value="1"{$chkAssetsRedis} /> Store generated media in Redis when active</label>
             <label class="chk-row"><input type="checkbox" name="server_trust_proxies" value="1"{$chkTrustProxies} /> Trust reverse-proxy headers (X-Forwarded-*)</label>
             <label class="chk-row"><input type="checkbox" name="server_disable_output_compression" value="1"{$chkDisableZlib} /> Disable zlib output compression during SSE</label>
+            <label class="chk-row"><input type="checkbox" name="cors_enabled" value="1"{$chkCorsEnabled} /> Enable dynamic API CORS &amp; preflight headers</label>
+            <label class="chk-row"><input type="checkbox" name="rate_limit_enabled" value="1"{$chkRateLimitEnabled} /> Enable optional gateway rate limiting</label>
           </div>
         </div>
       </div>

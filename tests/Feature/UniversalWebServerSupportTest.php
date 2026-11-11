@@ -356,4 +356,77 @@ class UniversalWebServerSupportTest extends TestCase
             File::deleteDirectory($tempDir);
         }
     }
+
+    public function test_dynamic_cors_preflight_exposed_headers_optional_rate_limiting_and_ws_templates(): void
+    {
+        // 1. Default CORS preflight on /v1/* succeeds 204 with exposed Mirror headers
+        $preflight = $this->withHeader('Origin', 'https://client.example.com')
+            ->options('/v1/chat/completions');
+        $preflight->assertStatus(204);
+        $this->assertSame('*', $preflight->headers->get('Access-Control-Allow-Origin'));
+        $this->assertStringContainsString('X-Mirror-Conversation-Id', (string) $preflight->headers->get('Access-Control-Expose-Headers'));
+
+        // 2. Dynamically restrict CORS origin, adjust read_timeout, and enable optional gateway rate limiting
+        $put = $this->withHeader('Authorization', 'Bearer test-mirror-key-12345')
+            ->putJson('/api/settings/runtime', [
+            'http_read_timeout' => 185,
+            'cors_enabled' => true,
+            'cors_allowed_origins' => 'https://allowed.example.org',
+            'rate_limit_enabled' => true,
+            'rate_limit_max_attempts' => 2,
+            'rate_limit_decay_seconds' => 60,
+        ]);
+        $put->assertOk()
+            ->assertJsonPath('runtime_settings.http.read_timeout', 185)
+            ->assertJsonPath('runtime_settings.cors.allowed_origins', 'https://allowed.example.org')
+            ->assertJsonPath('runtime_settings.rate_limit.enabled', true)
+            ->assertJsonPath('runtime_settings.rate_limit.max_attempts', 2);
+
+        $allowedRes = $this->withHeader('Origin', 'https://allowed.example.org')
+            ->withHeader('Authorization', 'Bearer test-mirror-key-12345')
+            ->getJson('/v1/models');
+        $allowedRes->assertOk();
+        $this->assertSame('https://allowed.example.org', $allowedRes->headers->get('Access-Control-Allow-Origin'));
+        $this->assertStringContainsString('Origin', (string) $allowedRes->headers->get('Vary'));
+        $this->assertSame('2', $allowedRes->headers->get('X-RateLimit-Limit'));
+        $this->assertSame('1', $allowedRes->headers->get('X-RateLimit-Remaining'));
+
+        $blockedOriginRes = $this->withHeader('Origin', 'https://evil.example.org')
+            ->withHeader('Authorization', 'Bearer test-mirror-key-12345')
+            ->getJson('/v1/models');
+        $blockedOriginRes->assertOk();
+        $this->assertNull($blockedOriginRes->headers->get('Access-Control-Allow-Origin'));
+        $this->assertSame('0', $blockedOriginRes->headers->get('X-RateLimit-Remaining'));
+
+        // 3rd request within window must trigger dynamic 429 rate_limit_exceeded with Retry-After
+        $throttled = $this->withHeader('Origin', 'https://allowed.example.org')
+            ->withHeader('Authorization', 'Bearer test-mirror-key-12345')
+            ->getJson('/v1/models');
+        $throttled->assertStatus(429)
+            ->assertJsonPath('error.code', 'rate_limit_exceeded');
+        $this->assertNotEmpty($throttled->headers->get('Retry-After'));
+        $this->assertSame('https://allowed.example.org', $throttled->headers->get('Access-Control-Allow-Origin'));
+
+        // 3. Reset overrides via DELETE /api/settings/runtime disables optional rate limit immediately
+        $this->withHeader('Authorization', 'Bearer test-mirror-key-12345')
+            ->deleteJson('/api/settings/runtime')
+            ->assertOk()
+            ->assertJsonPath('runtime_settings.rate_limit.enabled', false);
+
+        $afterReset = $this->withHeader('Authorization', 'Bearer test-mirror-key-12345')
+            ->getJson('/v1/models');
+        $afterReset->assertOk();
+        $this->assertSame('*', $afterReset->headers->get('Access-Control-Allow-Origin'));
+
+        // 4. Universal server vhost templates include optional WebSocket upgrade proxy guidance
+        $this->artisan('mirror:server', ['target' => 'nginx', '--vhost' => true])
+            ->expectsOutputToContain('proxy_set_header Upgrade')
+            ->assertSuccessful();
+        $this->artisan('mirror:server', ['target' => 'apache', '--vhost' => true])
+            ->expectsOutputToContain('mod_proxy_wstunnel')
+            ->assertSuccessful();
+        $this->artisan('mirror:server', ['target' => 'caddy', '--vhost' => true])
+            ->expectsOutputToContain('@ws_paths')
+            ->assertSuccessful();
+    }
 }

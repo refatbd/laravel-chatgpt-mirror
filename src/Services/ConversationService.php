@@ -6,6 +6,7 @@ namespace Refatbd\LaravelChatGptMirror\Services;
 
 use GuzzleHttp\Client;
 use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Str;
 use Refatbd\LaravelChatGptMirror\Models\MirrorConversation;
 use Refatbd\LaravelChatGptMirror\Models\MirrorMessage;
@@ -191,7 +192,7 @@ class ConversationService
         $branchId = (string) Str::uuid();
         $branch = MirrorConversation::create([
             'public_id' => $branchId,
-            'conversation_id' => $source->effectiveUpstreamConversationId() ?: ('local:' . $branchId),
+            'conversation_id' => 'local:' . $branchId,
             'upstream_conversation_id' => $source->effectiveUpstreamConversationId(),
             'account_id' => $source->account_id,
             'token_id' => $source->token_id,
@@ -215,8 +216,8 @@ class ConversationService
             ->orderBy('id')
             ->get();
 
-        foreach ($all as $msg) {
-            MirrorMessage::create([
+        foreach ($all as $idx => $msg) {
+            $cloned = new MirrorMessage([
                 'id' => (string) Str::uuid(),
                 'conversation_public_id' => $branchId,
                 'upstream_node_id' => $msg->upstream_node_id,
@@ -226,6 +227,10 @@ class ConversationService
                 'events_payload' => $msg->events_payload,
                 'attachments_payload' => $msg->attachments_payload,
             ]);
+            $ts = $msg->created_at ? $msg->created_at->copy() : now()->addSeconds($idx);
+            $cloned->created_at = $ts;
+            $cloned->updated_at = $ts;
+            $cloned->save();
             if ($msg->id === $target->id) {
                 break;
             }
@@ -311,7 +316,16 @@ class ConversationService
     ): MirrorMessage {
         $publicId = $conv->public_id ?: (string) $conv->id;
 
-        MirrorMessage::create([
+        $latest = MirrorMessage::where('conversation_public_id', $publicId)
+            ->orderByDesc('created_at')
+            ->first();
+        $now = now();
+        $userTs = ($latest && $latest->created_at && $latest->created_at->greaterThanOrEqualTo($now))
+            ? $latest->created_at->copy()->addSecond()
+            : $now;
+        $assistantTs = $userTs->copy()->addSecond();
+
+        $userRow = new MirrorMessage([
             'id' => (string) Str::uuid(),
             'conversation_public_id' => $publicId,
             'upstream_node_id' => $userNodeId,
@@ -321,8 +335,11 @@ class ConversationService
             'events_payload' => [],
             'attachments_payload' => $attachments,
         ]);
+        $userRow->created_at = $userTs;
+        $userRow->updated_at = $userTs;
+        $userRow->save();
 
-        $assistant = MirrorMessage::create([
+        $assistant = new MirrorMessage([
             'id' => (string) Str::uuid(),
             'conversation_public_id' => $publicId,
             'upstream_node_id' => $assistantNodeId,
@@ -332,6 +349,9 @@ class ConversationService
             'events_payload' => $events,
             'attachments_payload' => [],
         ]);
+        $assistant->created_at = $assistantTs;
+        $assistant->updated_at = $assistantTs;
+        $assistant->save();
 
         $conv->update([
             'instructions_payload' => $instructions !== [] ? $instructions : $conv->instructions_payload,
@@ -505,7 +525,8 @@ class ConversationService
         $chain = array_reverse($chain);
 
         $publicId = $conv->public_id ?: (string) $conv->id;
-        foreach ($chain as $node) {
+        $importBase = now()->subSeconds(max(1, count($chain)));
+        foreach (array_values($chain) as $idx => $node) {
             $msg = is_array($node['message'] ?? null) ? $node['message'] : null;
             if (!$msg) {
                 continue;
@@ -520,18 +541,20 @@ class ConversationService
                 continue;
             }
 
-            MirrorMessage::updateOrCreate(
-                ['id' => (string) Str::uuid()],
-                [
-                    'conversation_public_id' => $publicId,
-                    'upstream_node_id' => (string) ($msg['id'] ?? $node['id']),
-                    'role' => $role,
-                    'content' => $text,
-                    'status' => 'done',
-                    'events_payload' => [],
-                    'attachments_payload' => [],
-                ]
-            );
+            $ts = $importBase->copy()->addSeconds($idx);
+            $row = new MirrorMessage([
+                'id' => (string) Str::uuid(),
+                'conversation_public_id' => $publicId,
+                'upstream_node_id' => (string) ($msg['id'] ?? $node['id']),
+                'role' => $role,
+                'content' => $text,
+                'status' => 'done',
+                'events_payload' => [],
+                'attachments_payload' => [],
+            ]);
+            $row->created_at = $ts;
+            $row->updated_at = $ts;
+            $row->save();
         }
 
         $conv->update([
@@ -539,5 +562,190 @@ class ConversationService
             'current_node_id' => $currentNode,
             'initialized' => true,
         ]);
+    }
+
+    /**
+     * Deterministic canonical SHA-256 fingerprint matching Node.js transcript hashing.
+     */
+    public function fingerprintValue(mixed $value): string
+    {
+        $normalized = $this->canonicalizeForHash($value);
+        return hash('sha256', (string) json_encode($normalized, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE));
+    }
+
+    /**
+     * @param array<int, array<string, mixed>> $normalizedMessages
+     */
+    public function instructionsHash(array $normalizedMessages): string
+    {
+        return $this->fingerprintValue($this->extractInstructionMessages($normalizedMessages));
+    }
+
+    /**
+     * @param array<int, array<string, mixed>> $normalizedMessages
+     * @return array<int, array{role: string, content: string}>
+     */
+    public function extractInstructionMessages(array $normalizedMessages): array
+    {
+        $out = [];
+        foreach ($normalizedMessages as $m) {
+            $role = (string) ($m['role'] ?? '');
+            if ($role === 'system' || $role === 'developer') {
+                $out[] = [
+                    'role' => $role,
+                    'content' => (string) ($m['content'] ?? ''),
+                ];
+            }
+        }
+        return $out;
+    }
+
+    /**
+     * @param array<int, array<string, mixed>> $normalizedMessages
+     * @return array<int, array{role: string, content: string}>
+     */
+    public function conversationalMessages(array $normalizedMessages): array
+    {
+        $out = [];
+        foreach ($normalizedMessages as $m) {
+            $role = (string) ($m['role'] ?? '');
+            if ($role === 'user' || $role === 'assistant') {
+                $out[] = [
+                    'role' => $role,
+                    'content' => (string) ($m['content'] ?? ''),
+                ];
+            }
+        }
+        return $out;
+    }
+
+    /**
+     * @param array<int, array{role: string, content: string}> $stored
+     * @param array<int, array{role: string, content: string}> $incoming
+     */
+    public function firstHistoryDifference(array $stored, array $incoming): int
+    {
+        $i = 0;
+        $storedCount = count($stored);
+        $incomingCount = count($incoming);
+        while (
+            $i < $storedCount &&
+            $i < $incomingCount &&
+            ($stored[$i]['role'] ?? null) === ($incoming[$i]['role'] ?? null) &&
+            ($stored[$i]['content'] ?? null) === ($incoming[$i]['content'] ?? null)
+        ) {
+            $i++;
+        }
+        return $i;
+    }
+
+    public function findConversationByTranscript(string $accountId, string $transcriptHash): ?MirrorConversation
+    {
+        if ($transcriptHash === '') {
+            return null;
+        }
+
+        return MirrorConversation::where('account_id', $accountId)
+            ->where('openai_transcript_hash', $transcriptHash)
+            ->orderByDesc('last_active_at')
+            ->orderByDesc('id')
+            ->first();
+    }
+
+    /**
+     * @return \Illuminate\Database\Eloquent\Collection<int, MirrorMessage>
+     */
+    public function getStoredMessages(MirrorConversation $conv)
+    {
+        $publicId = $conv->public_id ?: (string) $conv->id;
+
+        return MirrorMessage::where('conversation_public_id', $publicId)
+            ->orderBy('created_at')
+            ->orderBy('id')
+            ->get();
+    }
+
+    /**
+     * Replace persisted logical messages cleanly inside a transaction (preserving node metadata and order).
+     *
+     * @param array<int, array<string, mixed>> $canonicalMessages
+     */
+    public function replaceMessages(MirrorConversation $conv, array $canonicalMessages): void
+    {
+        $publicId = $conv->public_id ?: (string) $conv->id;
+        $baseTime = now()->subSeconds(max(1, count($canonicalMessages)));
+
+        DB::transaction(function () use ($publicId, $canonicalMessages, $baseTime): void {
+            MirrorMessage::where('conversation_public_id', $publicId)->delete();
+
+            foreach (array_values($canonicalMessages) as $idx => $m) {
+                $ts = $baseTime->copy()->addSeconds($idx);
+                $row = new MirrorMessage([
+                    'id' => !empty($m['id']) ? (string) $m['id'] : (string) Str::uuid(),
+                    'conversation_public_id' => $publicId,
+                    'upstream_node_id' => $m['upstream_node_id'] ?? $m['upstreamNodeId'] ?? null,
+                    'role' => (string) ($m['role'] ?? 'user'),
+                    'content' => (string) ($m['content'] ?? ''),
+                    'status' => (string) ($m['status'] ?? 'done'),
+                    'events_payload' => is_array($m['events_payload'] ?? $m['events'] ?? null)
+                        ? ($m['events_payload'] ?? $m['events'])
+                        : [],
+                    'attachments_payload' => is_array($m['attachments_payload'] ?? $m['attachments'] ?? null)
+                        ? ($m['attachments_payload'] ?? $m['attachments'])
+                        : [],
+                ]);
+                $row->created_at = $ts;
+                $row->updated_at = $ts;
+                $row->save();
+            }
+        });
+    }
+
+    /**
+     * Rebase conversation upstream pointer cleanly on user-turn edit or system-instruction change.
+     *
+     * @param array<string, mixed> $updates
+     */
+    public function rebaseConversationUpstream(MirrorConversation $conv, array $updates): void
+    {
+        $attrs = [
+            'current_node_id' => (string) ($updates['current_node_id'] ?? 'client-created-root'),
+        ];
+
+        if (!empty($updates['model'])) {
+            $attrs['model'] = (string) $updates['model'];
+        }
+        if (array_key_exists('gizmo_id', $updates)) {
+            $attrs['gizmo_id'] = $updates['gizmo_id'];
+        }
+        if (array_key_exists('is_private', $updates) && $updates['is_private'] !== null) {
+            $attrs['is_private'] = (bool) $updates['is_private'];
+        }
+        if (!empty($updates['reset_upstream'])) {
+            $publicId = $conv->public_id ?: (string) $conv->id;
+            $attrs['upstream_conversation_id'] = null;
+            $attrs['conversation_id'] = 'local:' . $publicId;
+            $attrs['initialized'] = false;
+        }
+
+        $conv->update($attrs);
+    }
+
+    protected function canonicalizeForHash(mixed $value): mixed
+    {
+        if (!is_array($value)) {
+            return $value;
+        }
+
+        if (array_is_list($value)) {
+            return array_map(fn ($item) => $this->canonicalizeForHash($item), $value);
+        }
+
+        ksort($value);
+        foreach ($value as $k => $v) {
+            $value[$k] = $this->canonicalizeForHash($v);
+        }
+
+        return $value;
     }
 }

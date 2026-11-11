@@ -31,6 +31,7 @@ return [
     'http' => [
         'proxy' => env('MIRROR_HTTP_PROXY', null),
         'timeout' => (int) env('MIRROR_REQUEST_TIMEOUT', 120),
+        'read_timeout' => (int) env('MIRROR_READ_TIMEOUT', 120),
         'connect_timeout' => (int) env('MIRROR_CONNECT_TIMEOUT', 15),
         'verify_ssl' => env('MIRROR_VERIFY_SSL', true),
         'user_agent' => env(
@@ -123,6 +124,20 @@ return [
         'force_https' => env('MIRROR_FORCE_HTTPS', null),
         'stream_max_execution_time' => (int) env('MIRROR_STREAM_MAX_EXECUTION_TIME', 300),
         'disable_output_compression' => env('MIRROR_DISABLE_OUTPUT_COMPRESSION', true),
+    ],
+
+    'cors' => [
+        'enabled' => env('MIRROR_CORS_ENABLED', true),
+        'allowed_origins' => env('MIRROR_CORS_ALLOWED_ORIGINS', '*'),
+        'allow_methods' => env('MIRROR_CORS_ALLOW_METHODS', 'GET, POST, PUT, PATCH, DELETE, OPTIONS'),
+        'allow_headers' => env('MIRROR_CORS_ALLOW_HEADERS', 'Authorization, Content-Type, X-Requested-With, X-Request-Id, Accept, Origin'),
+        'expose_headers' => env('MIRROR_CORS_EXPOSE_HEADERS', 'X-Request-Id, X-Mirror-Conversation-Id, X-RateLimit-Limit, X-RateLimit-Remaining, X-RateLimit-Reset, Retry-After'),
+    ],
+
+    'rate_limit' => [
+        'enabled' => env('MIRROR_RATE_LIMIT_ENABLED', false),
+        'max_attempts' => (int) env('MIRROR_RATE_LIMIT_MAX_ATTEMPTS', 180),
+        'decay_seconds' => (int) env('MIRROR_RATE_LIMIT_DECAY_SECONDS', 60),
     ],
 
 ];

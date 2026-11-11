@@ -25,6 +25,7 @@ class ChatGptClient
         $this->http = new Client([
             'base_uri' => rtrim((string) config('mirror.upstream', 'https://chatgpt.com'), '/'),
             'timeout' => (float) config('mirror.http.timeout', 120),
+            'read_timeout' => (float) config('mirror.http.read_timeout', 120),
             'connect_timeout' => (float) config('mirror.http.connect_timeout', 15),
             'verify' => (bool) config('mirror.http.verify_ssl', true),
             'proxy' => config('mirror.http.proxy'),
@@ -407,10 +408,13 @@ class ChatGptClient
         }
 
         try {
+            $maxExec = (int) config('mirror.server.stream_max_execution_time', 300);
             $response = $this->http->post('/backend-api/f/conversation', [
                 'headers' => $headers,
                 'json' => $payload,
                 'stream' => true,
+                'timeout' => $maxExec <= 0 ? 0.0 : (float) max($maxExec, (int) config('mirror.http.timeout', 120)),
+                'read_timeout' => (float) config('mirror.http.read_timeout', 120),
             ]);
 
             $status = $response->getStatusCode();

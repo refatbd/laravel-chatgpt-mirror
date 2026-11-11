@@ -212,4 +212,263 @@ class ResponsesAndOpenAiFeatureTest extends TestCase
         $this->assertFalse($service->isPublicHostname('192.168.1.1'));
         $this->assertTrue($service->isPublicHostname('8.8.8.8'));
     }
+
+    public function test_chat_completions_rejects_work_mode_and_supports_streaming_tools_and_role_tool_followup(): void
+    {
+        MirrorToken::create([
+            'name' => 'Tool Parity Account',
+            'email' => 'tools@example.com',
+            'account_id' => 'acct-tools-1',
+            'session_token' => 'tools-session-token-123456',
+            'access_token' => 'tools-access-token',
+            'status' => 'active',
+        ]);
+
+        // Mock upstream before any /v1/chat/completions request resolves OpenAiApiController via Laravel Route cache
+        $capturedPayloads = [];
+        $mockClient = $this->createMock(ChatGptClient::class);
+        $mockClient->method('routeModel')->willReturn(['model' => 'gpt-4o', 'gizmoId' => null, 'private' => null]);
+        $mockClient->method('prepareFollowup')->willReturn('conduit-tools');
+        $mockClient->method('buildConversationPayload')->willReturnCallback(
+            function (array $messages, string $model) use (&$capturedPayloads): array {
+                $capturedPayloads[] = $messages;
+                return ['model' => $model, 'messages' => $messages];
+            }
+        );
+
+        $callCount = 0;
+        $mockClient->method('streamConversation')->willReturnCallback(
+            function (MirrorToken $t, array $payload, callable $onChunk) use (&$callCount): void {
+                $callCount++;
+                if ($callCount === 1) {
+                    $onChunk('delta', (string) json_encode([
+                        'conversation_id' => 'up-conv-stream-tools',
+                        'message' => [
+                            'id' => 'msg-tool-call-1',
+                            'author' => ['role' => 'assistant'],
+                            'channel' => 'final',
+                            'content' => ['content_type' => 'text', 'parts' => ["```mirror_tool_calls\n{\"tool_calls\":[{\"name\":\"get_weather\",\"arguments\":{\"city\":\"Dhaka\"}}]}\n```"]],
+                        ],
+                    ]));
+                    return;
+                }
+
+                $onChunk('delta', (string) json_encode([
+                    'conversation_id' => 'up-conv-final-answer',
+                    'message' => [
+                        'id' => 'msg-final-1',
+                        'author' => ['role' => 'assistant'],
+                        'channel' => 'final',
+                        'content' => ['content_type' => 'text', 'parts' => ['The weather in Dhaka is 30C.']],
+                    ],
+                ]));
+            }
+        );
+        $this->app->instance(ChatGptClient::class, $mockClient);
+
+        // 1. Reject `-wm` Work Mode parameter cleanly with 400 unsupported_parameter
+        $wmReject = $this->withHeader('Authorization', 'Bearer test-mirror-key-12345')
+            ->postJson('/v1/chat/completions', [
+                'model' => 'gpt-5-wm',
+                'messages' => [['role' => 'user', 'content' => 'Hello']],
+            ]);
+        $wmReject->assertStatus(400)
+            ->assertJsonPath('error.code', 'unsupported_parameter');
+
+        // 2. Reject OpenAI `role: tool` on `/v1/responses` cleanly
+        $respToolReject = $this->withHeader('Authorization', 'Bearer test-mirror-key-12345')
+            ->postJson('/v1/responses', [
+                'model' => 'gpt-4o',
+                'input' => [['role' => 'tool', 'content' => '42']],
+            ]);
+        $respToolReject->assertStatus(400);
+
+        // Streamed request with tools must emit SSE `delta.tool_calls` and `finish_reason: "tool_calls"`
+        $streamTools = $this->withHeader('Authorization', 'Bearer test-mirror-key-12345')
+            ->postJson('/v1/chat/completions', [
+                'model' => 'gpt-4o',
+                'stream' => true,
+                'tools' => [[
+                    'type' => 'function',
+                    'function' => ['name' => 'get_weather', 'parameters' => ['type' => 'object']],
+                ]],
+                'messages' => [['role' => 'user', 'content' => 'Weather in Dhaka?']],
+            ]);
+
+        $streamTools->assertStatus(200);
+        $sse = $streamTools->streamedContent();
+        $this->assertStringContainsString('"tool_calls"', $sse);
+        $this->assertStringContainsString('get_weather', $sse);
+        $this->assertStringContainsString('"finish_reason":"tool_calls"', $sse);
+        $this->assertStringContainsString('data: [DONE]', $sse);
+
+        // Multi-turn follow-up carrying assistant tool_calls + role=tool must embed tool results and complete
+        $followup = $this->withHeader('Authorization', 'Bearer test-mirror-key-12345')
+            ->postJson('/v1/chat/completions', [
+                'model' => 'gpt-4o',
+                'tools' => [[
+                    'type' => 'function',
+                    'function' => ['name' => 'get_weather', 'parameters' => ['type' => 'object']],
+                ]],
+                'messages' => [
+                    ['role' => 'user', 'content' => 'Weather in Dhaka?'],
+                    [
+                        'role' => 'assistant',
+                        'content' => null,
+                        'tool_calls' => [[
+                            'id' => 'call_dhaka_1',
+                            'type' => 'function',
+                            'function' => ['name' => 'get_weather', 'arguments' => '{"city":"Dhaka"}'],
+                        ]],
+                    ],
+                    [
+                        'role' => 'tool',
+                        'tool_call_id' => 'call_dhaka_1',
+                        'name' => 'get_weather',
+                        'content' => '{"temp":"30C"}',
+                    ],
+                ],
+            ]);
+
+        $followup->assertStatus(200)
+            ->assertJsonPath('choices.0.message.content', 'The weather in Dhaka is 30C.');
+        $this->assertCount(2, $capturedPayloads);
+        $this->assertStringContainsString('role=tool results are included here', (string) ($capturedPayloads[1][0]['content'] ?? ''));
+        $this->assertStringContainsString('call_dhaka_1', (string) ($capturedPayloads[1][0]['content'] ?? ''));
+        $this->assertStringContainsString('30C', (string) ($capturedPayloads[1][0]['content'] ?? ''));
+    }
+
+    public function test_chat_completions_full_history_inference_assistant_edit_guard_and_user_history_rebase(): void
+    {
+        MirrorToken::create([
+            'name' => 'History Parity Account',
+            'email' => 'hist@example.com',
+            'account_id' => 'acct-hist-1',
+            'session_token' => 'hist-session-token-123456',
+            'access_token' => 'hist-access-token',
+            'status' => 'active',
+        ]);
+
+        $capturedUpstreamArgs = [];
+        $turn = 0;
+        $mockClient = $this->createMock(ChatGptClient::class);
+        $mockClient->method('routeModel')->willReturn(['model' => 'gpt-4o', 'gizmoId' => null, 'private' => null]);
+        $mockClient->method('prepareFollowup')->willReturn('conduit-hist');
+        $mockClient->method('buildConversationPayload')->willReturnCallback(
+            function (array $messages, string $model, ?string $upstreamConvId, string $parentNodeId) use (&$capturedUpstreamArgs): array {
+                $capturedUpstreamArgs[] = [
+                    'messages' => $messages,
+                    'upstreamConvId' => $upstreamConvId,
+                    'parentNodeId' => $parentNodeId,
+                ];
+                return ['model' => $model, 'messages' => $messages];
+            }
+        );
+
+        $mockClient->method('streamConversation')->willReturnCallback(
+            function (MirrorToken $t, array $payload, callable $onChunk) use (&$turn): void {
+                $turn++;
+                if ($turn === 3) {
+                    throw new \RuntimeException('Simulated transient upstream glitch during rebase');
+                }
+                $reply = match ($turn) {
+                    1 => 'Answer One',
+                    2 => 'Answer Two',
+                    default => 'Answer Two Revised',
+                };
+                $onChunk('delta', (string) json_encode([
+                    'conversation_id' => 'up-conv-hist-1',
+                    'message' => [
+                        'id' => 'msg-hist-' . $turn,
+                        'author' => ['role' => 'assistant'],
+                        'channel' => 'final',
+                        'content' => ['content_type' => 'text', 'parts' => [$reply]],
+                    ],
+                ]));
+            }
+        );
+        $this->app->instance(ChatGptClient::class, $mockClient);
+
+        // Turn 1: [system, user]
+        $t1 = $this->withHeader('Authorization', 'Bearer test-mirror-key-12345')
+            ->postJson('/v1/chat/completions', [
+                'model' => 'gpt-4o',
+                'messages' => [
+                    ['role' => 'system', 'content' => 'Be concise'],
+                    ['role' => 'user', 'content' => 'Question One'],
+                ],
+            ]);
+        $t1->assertStatus(200)->assertJsonPath('choices.0.message.content', 'Answer One');
+        $convId = (string) $t1->json('metadata.conversation_id');
+        $this->assertNotEmpty($convId);
+
+        // Turn 2: Omit conversation_id and send full history -> must auto-infer & reuse Turn 1 conversation
+        $t2 = $this->withHeader('Authorization', 'Bearer test-mirror-key-12345')
+            ->postJson('/v1/chat/completions', [
+                'model' => 'gpt-4o',
+                'messages' => [
+                    ['role' => 'system', 'content' => 'Be concise'],
+                    ['role' => 'user', 'content' => 'Question One'],
+                    ['role' => 'assistant', 'content' => 'Answer One'],
+                    ['role' => 'user', 'content' => 'Question Two'],
+                ],
+            ]);
+        $t2->assertStatus(200)->assertJsonPath('choices.0.message.content', 'Answer Two');
+        $this->assertSame($convId, $t2->json('metadata.conversation_id'));
+        $this->assertSame('up-conv-hist-1', $capturedUpstreamArgs[1]['upstreamConvId']);
+        $this->assertSame('msg-hist-1', $capturedUpstreamArgs[1]['parentNodeId']);
+
+        // Assistant-message edit guard must reject tampering with 400
+        $editAssistant = $this->withHeader('Authorization', 'Bearer test-mirror-key-12345')
+            ->postJson('/v1/chat/completions', [
+                'model' => 'gpt-4o',
+                'metadata' => ['conversation_id' => $convId],
+                'messages' => [
+                    ['role' => 'system', 'content' => 'Be concise'],
+                    ['role' => 'user', 'content' => 'Question One'],
+                    ['role' => 'assistant', 'content' => 'TAMPERED ANSWER'],
+                    ['role' => 'user', 'content' => 'Question Three'],
+                ],
+            ]);
+        $editAssistant->assertStatus(400);
+        $this->assertStringContainsString('Assistant messages', (string) $editAssistant->json('error.message'));
+
+        // User-turn edit that hits an upstream failure must roll back original conversation rows cleanly
+        $editUserFail = $this->withHeader('Authorization', 'Bearer test-mirror-key-12345')
+            ->postJson('/v1/chat/completions', [
+                'model' => 'gpt-4o',
+                'metadata' => ['conversation_id' => $convId],
+                'messages' => [
+                    ['role' => 'system', 'content' => 'Be concise'],
+                    ['role' => 'user', 'content' => 'Question One'],
+                    ['role' => 'assistant', 'content' => 'Answer One'],
+                    ['role' => 'user', 'content' => 'Question Two Edited'],
+                ],
+            ]);
+        $editUserFail->assertStatus(502);
+
+        $convModel = \Refatbd\LaravelChatGptMirror\Models\MirrorConversation::where('public_id', $convId)->firstOrFail();
+        $rowsAfterRollback = $convModel->messages()->orderBy('created_at')->pluck('content')->all();
+        $this->assertSame(['Question One', 'Answer One', 'Question Two', 'Answer Two'], $rowsAfterRollback);
+
+        // Succeeding user-turn edit creates backup branch and rewinds parent node to Answer One (`msg-hist-1`)
+        $editUserOk = $this->withHeader('Authorization', 'Bearer test-mirror-key-12345')
+            ->postJson('/v1/chat/completions', [
+                'model' => 'gpt-4o',
+                'metadata' => ['conversation_id' => $convId],
+                'messages' => [
+                    ['role' => 'system', 'content' => 'Be concise'],
+                    ['role' => 'user', 'content' => 'Question One'],
+                    ['role' => 'assistant', 'content' => 'Answer One'],
+                    ['role' => 'user', 'content' => 'Question Two Edited'],
+                ],
+            ]);
+        $editUserOk->assertStatus(200)->assertJsonPath('choices.0.message.content', 'Answer Two Revised');
+        $this->assertSame('up-conv-hist-1', $capturedUpstreamArgs[3]['upstreamConvId']);
+        $this->assertSame('msg-hist-1', $capturedUpstreamArgs[3]['parentNodeId']);
+
+        $rowsAfterRebase = $convModel->fresh()->messages()->orderBy('created_at')->orderBy('id')->pluck('content')->all();
+        $this->assertSame(['Question One', 'Answer One', 'Question Two Edited', 'Answer Two Revised'], $rowsAfterRebase);
+        $this->assertGreaterThanOrEqual(1, \Refatbd\LaravelChatGptMirror\Models\MirrorConversation::where('branched_from_id', $convModel->public_id)->count());
+    }
 }

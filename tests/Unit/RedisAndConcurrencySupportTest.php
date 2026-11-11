@@ -238,4 +238,33 @@ class RedisAndConcurrencySupportTest extends TestCase
         $this->assertSame('auto', config('mirror.redis.enabled'));
         $this->assertSame('least_busy', config('mirror.pool.strategy'));
     }
+
+    public function test_dynamic_config_service_persists_timeout_cors_and_rate_limit_overrides(): void
+    {
+        /** @var DynamicConfigService $dynamic */
+        $dynamic = $this->app->make(DynamicConfigService::class);
+
+        $state = $dynamic->saveOverrides([
+            'http_read_timeout' => 240,
+            'cors_enabled' => false,
+            'cors_allowed_origins' => 'https://studio.example.net',
+            'rate_limit_enabled' => true,
+            'rate_limit_max_attempts' => 90,
+            'rate_limit_decay_seconds' => 30,
+        ]);
+
+        $this->assertSame(240, $state['http']['read_timeout']);
+        $this->assertFalse($state['cors']['enabled']);
+        $this->assertSame('https://studio.example.net', $state['cors']['allowed_origins']);
+        $this->assertTrue($state['rate_limit']['enabled']);
+        $this->assertSame(90, $state['rate_limit']['max_attempts']);
+        $this->assertSame(30, $state['rate_limit']['decay_seconds']);
+        $this->assertSame(240, config('mirror.http.read_timeout'));
+        $this->assertTrue(config('mirror.rate_limit.enabled'));
+
+        $dynamic->resetOverrides();
+        $this->assertSame(120, config('mirror.http.read_timeout'));
+        $this->assertTrue(config('mirror.cors.enabled'));
+        $this->assertFalse(config('mirror.rate_limit.enabled'));
+    }
 }

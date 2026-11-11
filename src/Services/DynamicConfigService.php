@@ -200,6 +200,33 @@ class DynamicConfigService
             $next['pool.cooldown_seconds'] = max(1, min(3600, (int) ($input['pool_cooldown_seconds'] ?? $input['pool.cooldown_seconds'])));
         }
 
+        if (array_key_exists('http_read_timeout', $input) || array_key_exists('http.read_timeout', $input)) {
+            $next['http.read_timeout'] = max(5, min(3600, (int) ($input['http_read_timeout'] ?? $input['http.read_timeout'])));
+        }
+
+        if (array_key_exists('cors_enabled', $input) || array_key_exists('cors.enabled', $input)) {
+            $rawCors = $input['cors_enabled'] ?? $input['cors.enabled'];
+            $next['cors.enabled'] = filter_var($rawCors, FILTER_VALIDATE_BOOLEAN);
+        }
+
+        if (array_key_exists('cors_allowed_origins', $input) || array_key_exists('cors.allowed_origins', $input)) {
+            $origins = trim((string) ($input['cors_allowed_origins'] ?? $input['cors.allowed_origins'] ?? '*'));
+            $next['cors.allowed_origins'] = $origins !== '' ? $origins : '*';
+        }
+
+        if (array_key_exists('rate_limit_enabled', $input) || array_key_exists('rate_limit.enabled', $input)) {
+            $rawRl = $input['rate_limit_enabled'] ?? $input['rate_limit.enabled'];
+            $next['rate_limit.enabled'] = filter_var($rawRl, FILTER_VALIDATE_BOOLEAN);
+        }
+
+        if (array_key_exists('rate_limit_max_attempts', $input) || array_key_exists('rate_limit.max_attempts', $input)) {
+            $next['rate_limit.max_attempts'] = max(1, min(100000, (int) ($input['rate_limit_max_attempts'] ?? $input['rate_limit.max_attempts'])));
+        }
+
+        if (array_key_exists('rate_limit_decay_seconds', $input) || array_key_exists('rate_limit.decay_seconds', $input)) {
+            $next['rate_limit.decay_seconds'] = max(1, min(86400, (int) ($input['rate_limit_decay_seconds'] ?? $input['rate_limit.decay_seconds'])));
+        }
+
         // If admin explicitly enabled Redis without typing a host/url yet, default host gracefully.
         if (($next['redis.enabled'] ?? null) === 'enabled' && empty($next['redis.host']) && empty($next['redis.url']) && empty(config('mirror.redis.host')) && empty(config('mirror.redis.url'))) {
             $next['redis.host'] = '127.0.0.1';
@@ -485,6 +512,19 @@ class DynamicConfigService
                 'strategy' => (string) config('mirror.pool.strategy', 'least_busy'),
                 'max_concurrent_per_token' => (int) config('mirror.pool.max_concurrent_per_token', 5),
                 'cooldown_seconds' => (int) config('mirror.pool.cooldown_seconds', 60),
+            ],
+            'http' => [
+                'timeout' => (int) config('mirror.http.timeout', 120),
+                'read_timeout' => (int) config('mirror.http.read_timeout', 120),
+            ],
+            'cors' => [
+                'enabled' => (bool) config('mirror.cors.enabled', true),
+                'allowed_origins' => (string) config('mirror.cors.allowed_origins', '*'),
+            ],
+            'rate_limit' => [
+                'enabled' => (bool) config('mirror.rate_limit.enabled', false),
+                'max_attempts' => (int) config('mirror.rate_limit.max_attempts', 180),
+                'decay_seconds' => (int) config('mirror.rate_limit.decay_seconds', 60),
             ],
         ];
     }

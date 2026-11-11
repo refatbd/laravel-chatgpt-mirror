@@ -29,6 +29,10 @@ Route::prefix($openaiPrefix)->group(function () {
     Route::get('/capabilities', [AdminController::class, 'capabilities']);
 });
 
+// CORS preflight handlers for dynamic browser/SDK origins across custom prefixes
+Route::options('/' . $openaiPrefix . '/{any?}', fn () => response('', 204))->where('any', '.*');
+Route::options('/api/{any?}', fn () => response('', 204))->where('any', '.*');
+
 // 2. Public Health & Sealed 7-day Asset Content Delivery
 Route::get('/api/health', [AdminController::class, 'health']);
 Route::match(['GET', 'HEAD'], '/api/asset-content', [MirrorApiController::class, 'assetContent']);
