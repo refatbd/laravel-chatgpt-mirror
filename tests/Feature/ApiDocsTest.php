@@ -18,6 +18,8 @@ class ApiDocsTest extends TestCase
         $response->assertSee('/mirror/openapi', false);
         $response->assertSee('/mirror/api-docs/swagger-ui-bundle.js', false);
         $response->assertSee('/mirror/api-docs/swagger-ui.css', false);
+        $response->assertSee('<meta name="color-scheme" content="light" />', false);
+        $response->assertSee('pre.microlight { background:#f8fafc !important', false);
     }
 
     public function test_swagger_ui_static_assets_are_served_locally(): void

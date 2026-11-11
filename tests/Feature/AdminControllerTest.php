@@ -35,6 +35,10 @@ class AdminControllerTest extends TestCase
         $response->assertSee('test@example.com');
         $response->assertSee('Active Accounts');
         $response->assertSee('Direct OpenAI Gateway');
+        $response->assertSee('<meta name="color-scheme" content="light" />', false);
+        $response->assertSee('color-scheme:light', false);
+        $response->assertDontSee('pre { background:#0f172a', false);
+        $response->assertDontSee('background:#111827', false);
         $response->assertDontSee('WARP: Off');
         $response->assertDontSee('WARP: Disabled');
     }

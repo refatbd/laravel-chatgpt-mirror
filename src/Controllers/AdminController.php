@@ -1022,35 +1022,45 @@ class AdminController extends Controller
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width,initial-scale=1.0" />
+<meta name="color-scheme" content="light" />
 <title>Laravel ChatGPT Mirror - Settings & Admin Dashboard</title>
 <style>
-  :root { --bg:#fafafa; --card:#fff; --text:#111827; --muted:#6b7280; --border:#e5e7eb; --accent:#111827; }
+  :root { color-scheme:light; --bg:#f8fafc; --card:#ffffff; --text:#0f172a; --muted:#475569; --soft:#64748b; --border:#e2e8f0; --accent:#2563eb; --accent-hover:#1d4ed8; }
   * { box-sizing:border-box; }
+  html, body { color-scheme:light; }
   body { margin:0; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; background:var(--bg); color:var(--text); }
-  .nav { background:#fff; border-bottom:1px solid var(--border); padding:0 24px; height:56px; display:flex; align-items:center; justify-content:space-between; }
-  .nav-brand { font-weight:700; font-size:15px; display:flex; align-items:center; gap:10px; }
-  .nav-links { display:flex; gap:18px; font-size:13px; }
-  .nav-links a { color:#374151; text-decoration:none; font-weight:500; }
-  .nav-links a.active { color:#000; font-weight:700; }
+  .nav { background:#ffffff; border-bottom:1px solid var(--border); padding:0 24px; min-height:56px; display:flex; align-items:center; justify-content:space-between; gap:14px; flex-wrap:wrap; }
+  .nav-brand { font-weight:700; font-size:15px; color:var(--text); display:flex; align-items:center; gap:10px; }
+  .nav-links { display:flex; gap:18px; font-size:13px; flex-wrap:wrap; align-items:center; }
+  .nav-links a { color:#475569; text-decoration:none; font-weight:500; padding:6px 2px; border-bottom:2px solid transparent; }
+  .nav-links a:hover { color:#0f172a; }
+  .nav-links a.active { color:#1d4ed8; font-weight:700; border-bottom-color:#2563eb; }
   .container { max-width:1160px; margin:24px auto; padding:0 20px; }
   .stats { display:grid; grid-template-columns:repeat(4,1fr); gap:14px; margin-bottom:20px; }
-  .card { background:var(--card); border:1px solid var(--border); border-radius:12px; padding:18px; margin-bottom:18px; }
-  .stat-val { font-size:26px; font-weight:700; margin-top:4px; }
-  .stat-lbl { font-size:12px; color:var(--muted); text-transform:uppercase; letter-spacing:.04em; }
-  h2 { font-size:16px; margin:0 0 12px 0; display:flex; align-items:center; justify-content:space-between; gap:8px; flex-wrap:wrap; }
-  table { width:100%; border-collapse:collapse; font-size:13px; }
+  .card { background:var(--card); border:1px solid var(--border); border-radius:12px; padding:18px; margin-bottom:18px; box-shadow:0 1px 2px rgba(15,23,42,.03); }
+  .stat-val { font-size:26px; font-weight:700; margin-top:4px; color:var(--text); }
+  .stat-lbl { font-size:12px; color:var(--soft); text-transform:uppercase; letter-spacing:.04em; }
+  h2 { font-size:16px; margin:0 0 12px 0; color:var(--text); display:flex; align-items:center; justify-content:space-between; gap:8px; flex-wrap:wrap; }
+  table { width:100%; border-collapse:collapse; font-size:13px; background:#ffffff; }
   th,td { text-align:left; padding:10px 12px; border-bottom:1px solid var(--border); vertical-align:middle; }
-  th { font-size:11px; text-transform:uppercase; color:var(--muted); background:#f9fafb; }
-  .btn { padding:8px 14px; border-radius:8px; border:1px solid var(--border); background:#111827; color:#fff; font-weight:600; font-size:12px; cursor:pointer; }
+  th { font-size:11px; text-transform:uppercase; color:var(--soft); background:#f8fafc; }
+  .btn { padding:8px 14px; border-radius:8px; border:1px solid var(--accent); background:var(--accent); color:#ffffff; font-weight:600; font-size:12px; cursor:pointer; transition:background .15s,border-color .15s; }
+  .btn:hover { background:var(--accent-hover); border-color:var(--accent-hover); }
   .btn-sm { padding:4px 9px; font-size:11px; }
-  .btn-danger { background:#dc2626; border-color:#dc2626; }
-  .btn-light { background:#fff; color:#111827; }
-  .input { width:100%; padding:9px 11px; border:1px solid var(--border); border-radius:8px; font-size:13px; margin-bottom:10px; background:#fff; color:var(--text); }
-  .field-label { display:block; font-size:11px; font-weight:600; color:var(--muted); margin-bottom:4px; text-transform:uppercase; letter-spacing:.03em; }
-  .chk-row { display:flex; align-items:center; gap:8px; font-size:13px; margin:6px 0; cursor:pointer; }
+  .btn-danger { background:#fef2f2; border-color:#fecaca; color:#b91c1c; }
+  .btn-danger:hover { background:#fee2e2; border-color:#fca5a5; }
+  .btn-light { background:#ffffff; color:#0f172a; border-color:#cbd5e1; }
+  .btn-light:hover { background:#f8fafc; border-color:#94a3b8; }
+  .input { width:100%; padding:9px 11px; border:1px solid #cbd5e1; border-radius:8px; font-size:13px; margin-bottom:10px; background:#ffffff; color:var(--text); color-scheme:light; }
+  .input:focus { outline:none; border-color:var(--accent); box-shadow:0 0 0 3px rgba(37,99,235,.12); }
+  input[type="checkbox"] { accent-color:var(--accent); }
+  input[type="file"]::file-selector-button { background:#f1f5f9; color:#0f172a; border:1px solid #cbd5e1; border-radius:6px; padding:5px 10px; font-size:12px; font-weight:600; cursor:pointer; margin-right:8px; }
+  .field-label { display:block; font-size:11px; font-weight:600; color:var(--soft); margin-bottom:4px; text-transform:uppercase; letter-spacing:.03em; }
+  .chk-row { display:flex; align-items:center; gap:8px; font-size:13px; margin:6px 0; cursor:pointer; color:var(--text); }
   .grid-2 { display:grid; grid-template-columns:1fr 1fr; gap:18px; }
   .grid-3 { display:grid; grid-template-columns:repeat(3,1fr); gap:14px; }
-  pre { background:#0f172a; color:#f8fafc; padding:12px; border-radius:8px; font-size:12px; overflow:auto; margin:0; }
+  code { font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size:12px; background:#f1f5f9; color:#0f172a; padding:2px 6px; border-radius:5px; border:1px solid #e2e8f0; }
+  pre { background:#f8fafc; color:#0f172a; border:1px solid var(--border); padding:12px 14px; border-radius:8px; font-size:12px; line-height:1.5; overflow:auto; margin:0; }
   @media(max-width:768px) { .stats,.grid-2,.grid-3 { grid-template-columns:1fr; } }
 </style>
 </head>

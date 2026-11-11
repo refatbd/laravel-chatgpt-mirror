@@ -74,17 +74,24 @@ class ApiDocsController extends Controller
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="light" />
     <title>Laravel ChatGPT Mirror API Docs</title>
     <link rel="stylesheet" type="text/css" href="{$docsBase}/api-docs/swagger-ui.css" />
     <link rel="stylesheet" type="text/css" href="{$docsBase}/api-docs/index.css" />
     <link rel="icon" type="image/png" href="{$docsBase}/api-docs/favicon-32x32.png" sizes="32x32" />
     <style>
+      html, body { color-scheme:light; background:#f8fafc; color:#0f172a; margin:0; }
       .swagger-ui .topbar { display: none; }
-      .mirror-docs-nav { background:#fff; border-bottom:1px solid #e5e7eb; padding:0 24px; min-height:52px; display:flex; align-items:center; justify-content:space-between; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; flex-wrap:wrap; gap:12px; }
-      .mirror-docs-brand { font-weight:700; font-size:15px; color:#111827; display:flex; align-items:center; gap:8px; }
-      .mirror-docs-links { display:flex; gap:16px; font-size:13px; flex-wrap:wrap; }
-      .mirror-docs-links a { color:#374151; text-decoration:none; font-weight:500; }
-      .mirror-docs-links a.active { color:#000; font-weight:700; }
+      .mirror-docs-nav { background:#ffffff; border-bottom:1px solid #e2e8f0; padding:0 24px; min-height:56px; display:flex; align-items:center; justify-content:space-between; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; flex-wrap:wrap; gap:14px; }
+      .mirror-docs-brand { font-weight:700; font-size:15px; color:#0f172a; display:flex; align-items:center; gap:8px; }
+      .mirror-docs-links { display:flex; gap:18px; font-size:13px; flex-wrap:wrap; align-items:center; }
+      .mirror-docs-links a { color:#475569; text-decoration:none; font-weight:500; padding:6px 2px; border-bottom:2px solid transparent; }
+      .mirror-docs-links a:hover { color:#0f172a; }
+      .mirror-docs-links a.active { color:#1d4ed8; font-weight:700; border-bottom-color:#2563eb; }
+      .swagger-ui .highlight-code > .microlight,
+      .swagger-ui pre.microlight { background:#f8fafc !important; color:#0f172a !important; border:1px solid #e2e8f0 !important; border-radius:8px; }
+      .swagger-ui .microlight span { color:#0f172a !important; }
     </style>
   </head>
   <body>

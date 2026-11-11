@@ -56,8 +56,12 @@ class HelpPageTest extends TestCase
             ->assertSee('MIRROR_HELP_PREFIX', false)
             ->assertSee('php artisan mirror:server', false);
 
-        // Strict public security guarantees: zero secret or WARP disclosure
-        $response->assertDontSee('WARP', false)
+        // Strict public security guarantees & light-mode enforcement
+        $response->assertSee('<meta name="color-scheme" content="light" />', false)
+            ->assertSee('--code-bg:#f8fafc', false)
+            ->assertDontSee('--code-bg:#0f172a', false)
+            ->assertDontSee('#0f172a 0%,#1e293b', false)
+            ->assertDontSee('WARP', false)
             ->assertDontSee('test-mirror-key-12345', false)
             ->assertDontSee('super-secret-redis-pass-987', false)
             ->assertDontSee('Secret-Account-Alpha', false)
