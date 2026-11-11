@@ -14,9 +14,17 @@ class TokenPoolManager implements TokenPoolInterface
 {
     public function __construct(
         protected TokenRefresher $refresher,
-        protected ?MirrorCache $cache = null
+        protected ?MirrorCache $cache = null,
+        protected ?TokenInputParser $parser = null
     ) {
         $this->cache ??= $this->resolveCache();
+    }
+
+    protected function parser(): TokenInputParser
+    {
+        return $this->parser ??= (function_exists('app') && app()->bound(TokenInputParser::class)
+            ? app(TokenInputParser::class)
+            : new TokenInputParser());
     }
 
     protected function cache(): MirrorCache
@@ -247,6 +255,25 @@ class TokenPoolManager implements TokenPoolInterface
      */
     public function syncStaticEnvTokens(): void
     {
+        $rawEnv = trim((string) config('mirror.pool.static_tokens_raw', ''));
+        if ($rawEnv !== '') {
+            $parsed = $this->parser()->parseMany($rawEnv);
+            $hasStructuredJsonOrCookie = count($parsed) > 0 && ($parsed[0]['source_format'] ?? 'raw_session_token') !== 'raw_session_token';
+            if ($hasStructuredJsonOrCookie) {
+                foreach (array_values($parsed) as $idx => $candidate) {
+                    if (!empty($candidate['session_token'])) {
+                        $this->createOrGetStaticToken((string) $candidate['session_token'], $idx + 1, $candidate);
+                    }
+                }
+                return;
+            }
+
+            foreach ($this->parser()->parseStaticTokens($rawEnv) as $idx => $rawToken) {
+                $this->createOrGetStaticToken($rawToken, $idx + 1);
+            }
+            return;
+        }
+
         $staticTokens = config('mirror.pool.static_tokens', []);
         if (!is_array($staticTokens) || $staticTokens === []) {
             return;
@@ -261,7 +288,10 @@ class TokenPoolManager implements TokenPoolInterface
         }
     }
 
-    protected function createOrGetStaticToken(string $rawToken, int $index = 1): MirrorToken
+    /**
+     * @param array<string, mixed> $metadata
+     */
+    protected function createOrGetStaticToken(string $rawToken, int $index = 1, array $metadata = []): MirrorToken
     {
         $hash = hash('sha256', trim($rawToken));
         $existing = MirrorToken::where('token_hash', $hash)->first();
@@ -269,7 +299,7 @@ class TokenPoolManager implements TokenPoolInterface
             return $existing;
         }
 
-        return $this->cache()->lock("sync_static:{$hash}", 10, function () use ($rawToken, $index, $hash): MirrorToken {
+        return $this->cache()->lock("sync_static:{$hash}", 10, function () use ($rawToken, $index, $hash, $metadata): MirrorToken {
             $rechecked = MirrorToken::where('token_hash', $hash)->first();
             if ($rechecked) {
                 return $rechecked;
@@ -286,12 +316,24 @@ class TokenPoolManager implements TokenPoolInterface
                 }
             }
 
-            return MirrorToken::create([
-                'name' => $index === 1 ? 'Env Fallback Token' : "Env Fallback Token #{$index}",
+            $token = MirrorToken::create([
+                'name' => !empty($metadata['name']) ? (string) $metadata['name'] : ($index === 1 ? 'Env Fallback Token' : "Env Fallback Token #{$index}"),
+                'email' => $metadata['email'] ?? null,
                 'session_token' => $rawToken,
                 'token_hash' => $hash,
+                'access_token' => $metadata['access_token'] ?? null,
+                'access_token_expires_at' => $metadata['expires_at'] ?? null,
+                'account_id' => $metadata['account_id'] ?? null,
+                'plan_type' => $metadata['plan_type'] ?? 'free',
                 'status' => 'active',
             ]);
+
+            if (!empty($metadata['turnstile_token'])) {
+                $token->setTurnstileToken((string) $metadata['turnstile_token']);
+                $token->save();
+            }
+
+            return $token;
         }, 5);
     }
 

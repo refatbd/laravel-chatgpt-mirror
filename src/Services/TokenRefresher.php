@@ -17,9 +17,13 @@ use Refatbd\LaravelChatGptMirror\Models\MirrorToken;
 class TokenRefresher
 {
     protected Client $http;
+    protected ?TokenInputParser $parser;
+    protected ?int $lastVerificationStatus = null;
+    protected bool $lastVerificationExplicitReject = false;
 
-    public function __construct()
+    public function __construct(?TokenInputParser $parser = null)
     {
+        $this->parser = $parser;
         $this->http = new Client([
             'base_uri' => config('mirror.upstream', 'https://chatgpt.com'),
             'timeout' => (float) config('mirror.http.timeout', 30),
@@ -35,9 +39,26 @@ class TokenRefresher
         ]);
     }
 
+    protected function parser(): TokenInputParser
+    {
+        return $this->parser ??= (function_exists('app') && app()->bound(TokenInputParser::class)
+            ? app(TokenInputParser::class)
+            : new TokenInputParser());
+    }
+
+    public function lastVerificationStatus(): ?int
+    {
+        return $this->lastVerificationStatus;
+    }
+
+    public function lastVerificationWasTransientFailure(): bool
+    {
+        return $this->lastVerificationStatus !== null && !$this->lastVerificationExplicitReject;
+    }
+
     /**
-     * Verify a raw candidate session token against upstream /api/auth/session + /backend-api/me
-     * before storing it in the token pool.
+     * Verify a raw candidate session token (or full token.txt / Cookie / cURL payload)
+     * against upstream /api/auth/session + /backend-api/me before storing it in the pool.
      *
      * @return array{
      *   session_token: string,
@@ -46,13 +67,22 @@ class TokenRefresher
      *   email: ?string,
      *   name: ?string,
      *   account_id: ?string,
-     *   plan_type: ?string
+     *   plan_type: ?string,
+     *   turnstile_token?: ?string
      * }|null
      */
     public function verifyCandidateSessionToken(string $sessionToken): ?array
     {
-        $cleanToken = trim($sessionToken);
+        $this->lastVerificationStatus = null;
+        $this->lastVerificationExplicitReject = false;
+
+        $parsed = $this->parser()->parse($sessionToken);
+        $cleanToken = trim((string) ($parsed['session_token'] ?? ''));
+        if ($cleanToken === '' && $parsed === null) {
+            $cleanToken = trim($sessionToken);
+        }
         if ($cleanToken === '') {
+            $this->lastVerificationExplicitReject = true;
             return null;
         }
 
@@ -63,7 +93,11 @@ class TokenRefresher
                 ],
             ]);
 
-            if ($response->getStatusCode() !== 200) {
+            $status = $response->getStatusCode();
+            $this->lastVerificationStatus = $status;
+
+            if ($status !== 200) {
+                $this->lastVerificationExplicitReject = ($status === 401);
                 return null;
             }
 
@@ -72,18 +106,19 @@ class TokenRefresher
 
             $data = json_decode((string) $response->getBody(), true);
             if (!is_array($data) || empty($data['accessToken'])) {
+                $this->lastVerificationExplicitReject = true;
                 return null;
             }
 
             $accessToken = (string) $data['accessToken'];
-            $expiresAt = $this->resolveExpiry($accessToken, $data['expires'] ?? null);
+            $expiresAt = $this->resolveExpiry($accessToken, $data['expires'] ?? ($parsed['expires_at']?->toIso8601String() ?? null));
             $user = is_array($data['user'] ?? null) ? $data['user'] : [];
             $account = is_array($data['account'] ?? null) ? $data['account'] : [];
 
-            $email = isset($user['email']) ? (string) $user['email'] : null;
-            $name = isset($user['name']) ? (string) $user['name'] : null;
-            $accountId = $account['id'] ?? $user['id'] ?? $data['accountId'] ?? null;
-            $planType = isset($account['planType']) ? (string) $account['planType'] : ($user['planType'] ?? null);
+            $email = isset($user['email']) ? (string) $user['email'] : ($parsed['email'] ?? null);
+            $name = isset($user['name']) ? (string) $user['name'] : ($parsed['name'] ?? null);
+            $accountId = $account['id'] ?? $user['id'] ?? $data['accountId'] ?? ($parsed['account_id'] ?? null);
+            $planType = isset($account['planType']) ? (string) $account['planType'] : ($user['planType'] ?? ($parsed['plan_type'] ?? null));
 
             // Confirm via /backend-api/me to resolve accurate accountId/email when available.
             $me = $this->fetchMe($accessToken, $accountId ? (string) $accountId : null);
@@ -104,7 +139,7 @@ class TokenRefresher
                 }
             }
 
-            return [
+            $result = [
                 'session_token' => $persistedSession,
                 'access_token' => $accessToken,
                 'expires_at' => $expiresAt,
@@ -113,7 +148,14 @@ class TokenRefresher
                 'account_id' => $accountId ? (string) $accountId : null,
                 'plan_type' => $planType ? (string) $planType : null,
             ];
+            if (!empty($parsed['turnstile_token'])) {
+                $result['turnstile_token'] = $parsed['turnstile_token'];
+            }
+
+            return $result;
         } catch (\Throwable $e) {
+            $this->lastVerificationStatus = 0;
+            $this->lastVerificationExplicitReject = false;
             Log::warning('Mirror candidate session verification error', ['error' => $e->getMessage()]);
             return null;
         }

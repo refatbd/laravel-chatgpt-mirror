@@ -6,45 +6,45 @@ namespace Refatbd\LaravelChatGptMirror\Commands;
 
 use Illuminate\Console\Command;
 use Refatbd\LaravelChatGptMirror\Models\MirrorToken;
+use Refatbd\LaravelChatGptMirror\Services\TokenInputParser;
 use Refatbd\LaravelChatGptMirror\Services\TokenRefresher;
 
 class ImportTokenCommand extends Command
 {
     protected $signature = 'mirror:import-token
-                            {file? : Optional path to a file containing session tokens (one per line)}
+                            {file? : Optional path to token.txt, cookies.json, or multi-token text file}
                             {--name=Imported Account : Default name prefix}
                             {--turnstile= : Optional Cloudflare Turnstile token}';
 
-    protected $description = 'Bulk import or interactively paste ChatGPT __Secure-next-auth.session-token credentials';
+    protected $description = 'Import ChatGPT session credentials (supports full token.txt /api/auth/session JSON, cookies JSON, Netscape, Cookie headers, or raw tokens)';
 
-    public function handle(TokenRefresher $refresher): int
+    public function handle(TokenRefresher $refresher, TokenInputParser $parser): int
     {
         $file = $this->argument('file');
-        $tokensToImport = [];
+        $rawContent = '';
 
         if ($file && is_string($file) && file_exists($file)) {
-            $lines = file($file, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
-            if ($lines) {
-                $tokensToImport = array_map('trim', $lines);
-            }
+            $rawContent = (string) file_get_contents($file);
         } else {
-            $this->info('Paste your __Secure-next-auth.session-token value:');
-            $token = trim((string) $this->secret('Session Token'));
-            if ($token !== '') {
-                $tokensToImport[] = $token;
-            }
+            $this->info('Paste your __Secure-next-auth.session-token or full token.txt JSON content:');
+            $rawContent = (string) $this->secret('Session Token / token.txt');
         }
 
-        $tokensToImport = array_values(array_filter(array_map('trim', $tokensToImport)));
-        if ($tokensToImport === []) {
-            $this->error('No valid tokens provided.');
+        $candidates = array_values(array_filter(
+            $parser->parseMany($rawContent),
+            static fn (array $c): bool => strlen((string) ($c['session_token'] ?? '')) >= 20
+        ));
+
+        if ($candidates === []) {
+            $this->error('No valid session tokens could be extracted.');
             return self::FAILURE;
         }
 
-        $turnstile = $this->option('turnstile');
+        $turnstileOpt = trim((string) ($this->option('turnstile') ?? ''));
         $imported = 0;
 
-        foreach ($tokensToImport as $idx => $rawToken) {
+        foreach ($candidates as $idx => $candidate) {
+            $rawToken = (string) $candidate['session_token'];
             $hash = hash('sha256', $rawToken);
             if (MirrorToken::where('token_hash', $hash)->exists()) {
                 $this->warn('Skipped duplicate session token #' . ($idx + 1));
@@ -53,31 +53,46 @@ class ImportTokenCommand extends Command
 
             $verified = $refresher->verifyCandidateSessionToken($rawToken);
             if (!$verified) {
-                $this->error('Token #' . ($idx + 1) . ' rejected by ChatGPT upstream.');
-                continue;
+                if ($refresher->lastVerificationWasTransientFailure() && !empty($candidate['access_token'])) {
+                    $verified = [
+                        'session_token' => $rawToken,
+                        'access_token' => (string) $candidate['access_token'],
+                        'expires_at' => $candidate['expires_at'] ?? now()->addHours(12),
+                        'email' => $candidate['email'] ?? null,
+                        'name' => $candidate['name'] ?? null,
+                        'account_id' => $candidate['account_id'] ?? null,
+                        'plan_type' => $candidate['plan_type'] ?? 'free',
+                    ];
+                    $this->warn('Token #' . ($idx + 1) . ': upstream session check hit temporary WAF/network error; imported using embedded token.txt metadata.');
+                } else {
+                    $this->error('Token #' . ($idx + 1) . ' rejected by ChatGPT upstream.');
+                    continue;
+                }
             }
 
+            $resolvedName = $verified['name'] ?: ($candidate['name'] ?? null);
             $tokenRecord = MirrorToken::create([
-                'name' => count($tokensToImport) > 1
-                    ? $this->option('name') . ' #' . ($idx + 1)
-                    : ($verified['name'] ?: $this->option('name')),
+                'name' => count($candidates) > 1
+                    ? ($resolvedName ?: ($this->option('name') . ' #' . ($idx + 1)))
+                    : ($resolvedName ?: $this->option('name')),
                 'session_token' => $verified['session_token'],
                 'token_hash' => hash('sha256', $verified['session_token']),
                 'access_token' => $verified['access_token'],
                 'access_token_expires_at' => $verified['expires_at'],
-                'email' => $verified['email'],
-                'account_id' => $verified['account_id'],
-                'plan_type' => $verified['plan_type'] ?? 'free',
+                'email' => $verified['email'] ?: ($candidate['email'] ?? null),
+                'account_id' => $verified['account_id'] ?: ($candidate['account_id'] ?? null),
+                'plan_type' => $verified['plan_type'] ?: ($candidate['plan_type'] ?? 'free'),
                 'status' => 'active',
                 'last_refreshed_at' => now(),
             ]);
 
-            if (is_string($turnstile) && trim($turnstile) !== '') {
-                $tokenRecord->setTurnstileToken($turnstile);
+            $effectiveTurnstile = $turnstileOpt !== '' ? $turnstileOpt : (string) ($candidate['turnstile_token'] ?? '');
+            if ($effectiveTurnstile !== '') {
+                $tokenRecord->setTurnstileToken($effectiveTurnstile);
                 $tokenRecord->save();
             }
 
-            $this->info("Token #{$tokenRecord->id} verified ({$tokenRecord->email}) and imported cleanly!");
+            $this->info("Token #{$tokenRecord->id} verified ({$tokenRecord->email}) and imported cleanly from " . ($candidate['source_format'] ?? 'input') . '!');
             $imported++;
         }
 

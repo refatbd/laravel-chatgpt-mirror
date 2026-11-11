@@ -6,6 +6,7 @@ namespace Refatbd\LaravelChatGptMirror\Controllers;
 
 use Illuminate\Http\Request;
 use Illuminate\Routing\Controller;
+use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Str;
 use Refatbd\LaravelChatGptMirror\Models\MirrorConversation;
@@ -14,6 +15,7 @@ use Refatbd\LaravelChatGptMirror\Services\DynamicConfigService;
 use Refatbd\LaravelChatGptMirror\Services\FailureTracker;
 use Refatbd\LaravelChatGptMirror\Services\MirrorCache;
 use Refatbd\LaravelChatGptMirror\Services\SecurityService;
+use Refatbd\LaravelChatGptMirror\Services\TokenInputParser;
 use Refatbd\LaravelChatGptMirror\Services\TokenPoolManager;
 use Refatbd\LaravelChatGptMirror\Services\TokenRefresher;
 use Symfony\Component\HttpFoundation\Cookie;
@@ -33,15 +35,24 @@ class AdminController extends Controller
         protected FailureTracker $failures,
         protected SecurityService $security,
         protected ?MirrorCache $cache = null,
-        protected ?DynamicConfigService $dynamicConfig = null
+        protected ?DynamicConfigService $dynamicConfig = null,
+        protected ?TokenInputParser $tokenParser = null
     ) {
         $this->cache ??= app()->bound(MirrorCache::class) ? app(MirrorCache::class) : new MirrorCache();
         $this->dynamicConfig ??= app()->bound(DynamicConfigService::class) ? app(DynamicConfigService::class) : new DynamicConfigService();
+        $this->tokenParser ??= app()->bound(TokenInputParser::class) ? app(TokenInputParser::class) : new TokenInputParser();
     }
 
     protected function cache(): MirrorCache
     {
         return $this->cache ??= app()->bound(MirrorCache::class) ? app(MirrorCache::class) : new MirrorCache();
+    }
+
+    protected function tokenParser(): TokenInputParser
+    {
+        return $this->tokenParser ??= app()->bound(TokenInputParser::class)
+            ? app(TokenInputParser::class)
+            : new TokenInputParser();
     }
 
     protected function dynamicConfig(): DynamicConfigService
@@ -99,60 +110,82 @@ class AdminController extends Controller
 
     public function addToken(Request $request): Response
     {
-        $sessionToken = trim((string) $request->input('session_token', ''));
+        $rawInput = trim((string) $request->input('session_token', ''));
+        if ($request->hasFile('token_file')) {
+            $uploaded = $request->file('token_file');
+            if ($uploaded && $uploaded->isValid() && $uploaded->getSize() <= 2 * 1024 * 1024) {
+                $fileContent = (string) @file_get_contents((string) $uploaded->getRealPath());
+                if (trim($fileContent) !== '') {
+                    $rawInput = $rawInput !== '' ? ($rawInput . "\n" . $fileContent) : $fileContent;
+                }
+            }
+        }
+
         $turnstileToken = trim((string) $request->input('turnstile_token', ''));
         $customName = trim((string) $request->input('name', ''));
 
-        if (strlen($sessionToken) < 20) {
-            return $this->redirectWithFlash('error', 'Session token must be at least 20 characters.');
+        $candidates = $this->tokenParser()->parseMany($rawInput);
+        $validCandidates = array_values(array_filter(
+            $candidates,
+            static fn (array $c): bool => strlen((string) ($c['session_token'] ?? '')) >= 20
+        ));
+
+        if ($validCandidates === []) {
+            $hasOnlyAccess = !empty($candidates[0]['access_token']);
+            $errMsg = $hasOnlyAccess
+                ? 'Extracted accessToken only without __Secure-next-auth.session-token (sessionToken). Paste full token.txt (/api/auth/session JSON) or Cookie containing sessionToken.'
+                : 'Session token must be at least 20 characters (supports full token.txt JSON, Cookie headers, cURL, or raw token).';
+            return $this->redirectWithFlash('error', $errMsg, $request);
         }
 
-        $verified = $this->refresher->verifyCandidateSessionToken($sessionToken);
-        if (!$verified) {
-            $this->failures->record('invalid_session_token', $request->header('x-request-id'), 'session_verification_failed');
-            return $this->redirectWithFlash('error', 'ChatGPT upstream rejected this __Secure-next-auth.session-token.');
+        if (count($validCandidates) === 1) {
+            $res = $this->verifyAndPersistCandidate($validCandidates[0], $customName, $turnstileToken, $request);
+            if (!$res['ok']) {
+                return $this->redirectWithFlash('error', $res['error'], $request);
+            }
+
+            /** @var MirrorToken $token */
+            $token = $res['token'];
+            $label = $token->email ?: $token->name;
+            $note = $res['mode'] === 'session_bundle_fallback'
+                ? "Extracted & saved account: {$label} (using embedded token.txt accessToken because upstream session check hit temporary WAF/network error)."
+                : "Verified and saved account: {$label}";
+
+            return $this->redirectWithFlash('success', $note, $request);
         }
 
-        $hash = hash('sha256', $verified['session_token']);
-        $token = MirrorToken::where('token_hash', $hash)->first();
-
-        $attributes = [
-            'name' => $customName !== '' ? $customName : ($verified['name'] ?: 'Account ' . Str::random(4)),
-            'session_token' => $verified['session_token'],
-            'token_hash' => $hash,
-            'access_token' => $verified['access_token'],
-            'access_token_expires_at' => $verified['expires_at'],
-            'email' => $verified['email'],
-            'account_id' => $verified['account_id'],
-            'plan_type' => $verified['plan_type'] ?? 'free',
-            'status' => 'active',
-            'consecutive_errors' => 0,
-            'cooldown_until' => null,
-            'last_refreshed_at' => now(),
-            'last_error' => null,
-        ];
-
-        if ($token) {
-            $token->update($attributes);
-        } else {
-            $token = MirrorToken::create($attributes);
+        $savedCount = 0;
+        $rejectedCount = 0;
+        $labels = [];
+        foreach ($validCandidates as $idx => $candidate) {
+            $labelForRow = $customName !== '' ? ($customName . ' #' . ($idx + 1)) : '';
+            $res = $this->verifyAndPersistCandidate($candidate, $labelForRow, $turnstileToken, $request);
+            if ($res['ok']) {
+                $savedCount++;
+                /** @var MirrorToken $savedToken */
+                $savedToken = $res['token'];
+                $labels[] = $savedToken->email ?: $savedToken->name;
+            } else {
+                $rejectedCount++;
+            }
         }
 
-        if ($turnstileToken !== '') {
-            $token->setTurnstileToken($turnstileToken);
-            $token->save();
+        if ($savedCount === 0) {
+            return $this->redirectWithFlash('error', 'ChatGPT upstream rejected all extracted session tokens.', $request);
         }
 
-        $this->pool->invalidateDiscoveryCaches($token->getEffectiveAccountId());
+        $summary = "Extracted and saved {$savedCount} account(s): " . implode(', ', array_slice($labels, 0, 5));
+        if ($rejectedCount > 0) {
+            $summary .= " ({$rejectedCount} rejected by upstream)";
+        }
 
-        $label = $token->email ?: $token->name;
-        return $this->redirectWithFlash('success', "Verified and saved account: {$label}", $request);
+        return $this->redirectWithFlash('success', $summary, $request);
     }
 
     public function refreshToken(Request $request, int|string $id): Response
     {
         $token = MirrorToken::findOrFail($id);
-        $ok = $this->refresher->refresh($token);
+        $ok = $this->resolveRefresher()->refresh($token);
         if ($ok) {
             $this->pool->invalidateDiscoveryCaches($token->getEffectiveAccountId());
         }
@@ -497,25 +530,132 @@ class AdminController extends Controller
 
     public function postSession(Request $request): Response
     {
-        $sessionToken = trim((string) ($request->input('sessionToken') ?? $request->input('session_token') ?? ''));
+        $rawSessionInput = $request->input('sessionToken') ?? $request->input('session_token');
         $turnstileToken = trim((string) ($request->input('turnstileToken') ?? $request->input('turnstile_token') ?? ''));
         $name = trim((string) ($request->input('name') ?? ''));
 
-        if (strlen($sessionToken) < 20) {
+        $candidate = null;
+        if (is_string($rawSessionInput) && trim($rawSessionInput) !== '') {
+            $candidate = $this->tokenParser()->parse($rawSessionInput);
+            // If user sent `{"sessionToken": "...", "accessToken": "...", "user": {...}}` directly, merge outer metadata
+            if ($candidate !== null && ($request->has('accessToken') || $request->has('user') || $request->has('account'))) {
+                $outer = $this->tokenParser()->parseSessionArray($request->all());
+                if ($outer !== null) {
+                    foreach (['access_token', 'expires_at', 'email', 'name', 'account_id', 'plan_type', 'turnstile_token'] as $field) {
+                        if (empty($candidate[$field]) && !empty($outer[$field])) {
+                            $candidate[$field] = $outer[$field];
+                        }
+                    }
+                    if (($candidate['source_format'] ?? 'raw_session_token') === 'raw_session_token' && !empty($outer['source_format'])) {
+                        $candidate['source_format'] = $outer['source_format'];
+                    }
+                }
+            }
+        } elseif ($request->has('accessToken') || $request->has('cookies') || $request->has('__Secure-next-auth.session-token')) {
+            $candidate = $this->tokenParser()->parseSessionArray($request->all());
+        } elseif (trim((string) $request->getContent()) !== '') {
+            $candidate = $this->tokenParser()->parse((string) $request->getContent());
+        }
+
+        if ($candidate === null || strlen((string) ($candidate['session_token'] ?? '')) < 20) {
             return response()->json(['error' => 'That does not look like a valid sessionToken (minimum 20 characters).'], 400);
         }
 
-        $verified = $this->refresher->verifyCandidateSessionToken($sessionToken);
+        $res = $this->verifyAndPersistCandidate($candidate, $name, $turnstileToken, $request, rotateAssets: true);
+        if (!$res['ok']) {
+            return response()->json(['error' => 'Failed to verify session token with ChatGPT upstream'], 401);
+        }
+
+        /** @var MirrorToken $token */
+        $token = $res['token'];
+
+        return response()->json([
+            'ok' => true,
+            'id' => $token->id,
+            'accountId' => $token->account_id,
+            'email' => $token->email,
+            'plan_type' => $token->plan_type,
+            'source_format' => $candidate['source_format'] ?? 'raw_session_token',
+            'verification_mode' => $res['mode'],
+            'account' => [
+                'id' => $token->id,
+                'name' => $token->name,
+                'email' => $token->email,
+                'accountId' => $token->account_id,
+                'plan' => $token->plan_type,
+                'status' => $token->status,
+            ],
+        ]);
+    }
+
+    protected function resolveRefresher(): TokenRefresher
+    {
+        if (function_exists('app') && app()->bound(TokenRefresher::class)) {
+            $bound = app(TokenRefresher::class);
+            if ($bound instanceof TokenRefresher) {
+                return $bound;
+            }
+        }
+
+        return $this->refresher;
+    }
+
+    /**
+     * Verify a parsed session candidate against ChatGPT upstream (falling back cleanly to
+     * embedded unexpired JWT from full `token.txt` JSON only on non-401 WAF/transport errors).
+     *
+     * @param array<string, mixed> $candidate
+     * @return array{ok: true, token: MirrorToken, mode: string}|array{ok: false, error: string}
+     */
+    protected function verifyAndPersistCandidate(
+        array $candidate,
+        string $customName,
+        string $explicitTurnstile,
+        Request $request,
+        bool $rotateAssets = false
+    ): array {
+        $refresher = $this->resolveRefresher();
+        $sessionToken = trim((string) ($candidate['session_token'] ?? ''));
+        $verified = $refresher->verifyCandidateSessionToken($sessionToken);
+        $mode = 'upstream';
+
+        if ($verified) {
+            foreach (['email', 'name', 'account_id', 'plan_type'] as $metaField) {
+                if (empty($verified[$metaField]) && !empty($candidate[$metaField])) {
+                    $verified[$metaField] = $candidate[$metaField];
+                }
+            }
+        } elseif ($refresher->lastVerificationWasTransientFailure() && !empty($candidate['access_token'])) {
+            $jwt = (string) $candidate['access_token'];
+            $jwtExp = MirrorToken::decodeJwtExpiry($jwt);
+            $expCarbon = $candidate['expires_at'] instanceof Carbon
+                ? $candidate['expires_at']
+                : ($jwtExp !== null ? Carbon::createFromTimestamp($jwtExp) : null);
+
+            if (($jwtExp !== null && $jwtExp > time() + 60) || ($expCarbon !== null && $expCarbon->isFuture())) {
+                $verified = [
+                    'session_token' => $sessionToken,
+                    'access_token' => $jwt,
+                    'expires_at' => $expCarbon ?? now()->addHours(12),
+                    'email' => $candidate['email'] ?? null,
+                    'name' => $candidate['name'] ?? null,
+                    'account_id' => $candidate['account_id'] ?? null,
+                    'plan_type' => $candidate['plan_type'] ?? 'free',
+                ];
+                $mode = 'session_bundle_fallback';
+            }
+        }
+
         if (!$verified) {
             $this->failures->record('invalid_session_token', $request->header('x-request-id'), 'session_verification_failed');
-            return response()->json(['error' => 'Failed to verify session token with ChatGPT upstream'], 401);
+            return ['ok' => false, 'error' => 'ChatGPT upstream rejected this __Secure-next-auth.session-token.'];
         }
 
         $hash = hash('sha256', $verified['session_token']);
         $token = MirrorToken::where('token_hash', $hash)->first();
 
-        $attrs = [
-            'name' => $name !== '' ? $name : ($verified['name'] ?: 'API Session Account'),
+        $attributes = [
+            'name' => $customName !== '' ? $customName : ($verified['name'] ?: 'Account ' . Str::random(4)),
             'session_token' => $verified['session_token'],
             'token_hash' => $hash,
             'access_token' => $verified['access_token'],
@@ -531,34 +671,25 @@ class AdminController extends Controller
         ];
 
         if ($token) {
-            $token->update($attrs);
+            $token->update($attributes);
         } else {
-            $token = MirrorToken::create($attrs);
+            $token = MirrorToken::create($attributes);
         }
 
-        if ($turnstileToken !== '') {
-            $token->setTurnstileToken($turnstileToken);
+        $effectiveTurnstile = $explicitTurnstile !== ''
+            ? $explicitTurnstile
+            : (string) ($candidate['turnstile_token'] ?? ($verified['turnstile_token'] ?? ''));
+        if ($effectiveTurnstile !== '') {
+            $token->setTurnstileToken($effectiveTurnstile);
             $token->save();
         }
 
-        $this->security->rotateAssetLinkGeneration();
+        if ($rotateAssets) {
+            $this->security->rotateAssetLinkGeneration();
+        }
         $this->pool->invalidateDiscoveryCaches($token->getEffectiveAccountId());
 
-        return response()->json([
-            'ok' => true,
-            'id' => $token->id,
-            'accountId' => $token->account_id,
-            'email' => $token->email,
-            'plan_type' => $token->plan_type,
-            'account' => [
-                'id' => $token->id,
-                'name' => $token->name,
-                'email' => $token->email,
-                'accountId' => $token->account_id,
-                'plan' => $token->plan_type,
-                'status' => $token->status,
-            ],
-        ]);
+        return ['ok' => true, 'token' => $token, 'mode' => $mode];
     }
 
     public function deleteSession(): Response
@@ -927,11 +1058,13 @@ class AdminController extends Controller
   <div class="grid-2">
     <div class="card">
       <h2>Add ChatGPT Account Token</h2>
-      <form method="POST" action="{$safeAdminBase}/tokens">
+      <form method="POST" action="{$safeAdminBase}/tokens" enctype="multipart/form-data">
         <input type="text" name="name" class="input" placeholder="Account label (optional, auto-detected if empty)" />
-        <textarea name="session_token" rows="3" class="input" placeholder="Paste __Secure-next-auth.session-token value here..." required></textarea>
+        <textarea id="token_paste_input" name="session_token" rows="4" class="input" placeholder="Paste entire token.txt (/api/auth/session JSON), Cookie header, cURL, or raw __Secure-next-auth.session-token value here..."></textarea>
+        <div style="font-size:11px;color:var(--muted);margin:-4px 0 8px 0">Supports full <code>chatgpt.com/api/auth/session</code> JSON (<code>token.txt</code>), browser cookies JSON, Netscape cookies, HTTP <code>Cookie:</code> headers, or raw token — extra fields are extracted automatically.</div>
+        <input type="file" id="token_file_input" name="token_file" accept=".txt,.json,.cookie,.cookies,text/plain,application/json" style="font-size:12px;margin-bottom:10px;display:block" />
         <input type="text" name="turnstile_token" class="input" placeholder="Optional Turnstile token (if Sentinel requires it)" />
-        <button type="submit" class="btn">Verify &amp; Save Account</button>
+        <button type="submit" class="btn">Extract, Verify &amp; Save Account</button>
       </form>
     </div>
     <div class="card">
@@ -1070,6 +1203,22 @@ Routes:   {$safePrefix}/chat/completions, {$safePrefix}/responses, {$safePrefix}
 </div>
 <script>
 (function () {
+  var fileInput = document.getElementById('token_file_input');
+  var pasteInput = document.getElementById('token_paste_input');
+  if (fileInput && pasteInput && window.FileReader) {
+    fileInput.addEventListener('change', function () {
+      var f = fileInput.files && fileInput.files[0];
+      if (!f) return;
+      var reader = new FileReader();
+      reader.onload = function (ev) {
+        if (ev && ev.target && typeof ev.target.result === 'string') {
+          pasteInput.value = ev.target.result;
+        }
+      };
+      reader.readAsText(f);
+    });
+  }
+
   var btn = document.getElementById('test-redis-btn');
   var out = document.getElementById('redis-test-result');
   if (!btn || !out) return;

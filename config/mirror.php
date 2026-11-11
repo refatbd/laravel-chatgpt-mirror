@@ -49,6 +49,7 @@ return [
         'max_concurrent_per_token' => (int) env('MIRROR_MAX_CONCURRENT_PER_TOKEN', 5),
         'cooldown_seconds' => (int) env('MIRROR_COOLDOWN_SECONDS', 60),
         'refresh_buffer_seconds' => (int) env('MIRROR_REFRESH_BUFFER_SECONDS', 300),
+        'static_tokens_raw' => (string) env('MIRROR_SESSION_TOKENS', ''),
         'static_tokens' => array_values(array_filter(array_map(
             'trim',
             explode(',', (string) env('MIRROR_SESSION_TOKENS', ''))

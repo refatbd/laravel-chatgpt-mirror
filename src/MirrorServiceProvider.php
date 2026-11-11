@@ -33,6 +33,7 @@ use Refatbd\LaravelChatGptMirror\Services\ProofOfWorkSolver;
 use Refatbd\LaravelChatGptMirror\Services\RichOutputService;
 use Refatbd\LaravelChatGptMirror\Services\SecurityService;
 use Refatbd\LaravelChatGptMirror\Services\StreamTransformer;
+use Refatbd\LaravelChatGptMirror\Services\TokenInputParser;
 use Refatbd\LaravelChatGptMirror\Services\TokenPoolManager;
 use Refatbd\LaravelChatGptMirror\Services\TokenRefresher;
 use Refatbd\LaravelChatGptMirror\Services\ToolBridgeService;
@@ -58,7 +59,10 @@ class MirrorServiceProvider extends ServiceProvider
             $app->make(SecurityService::class)
         ));
 
-        $this->app->singleton(TokenRefresher::class, fn () => new TokenRefresher());
+        $this->app->singleton(TokenInputParser::class, fn () => new TokenInputParser());
+        $this->app->singleton(TokenRefresher::class, fn ($app) => new TokenRefresher(
+            $app->make(TokenInputParser::class)
+        ));
         $this->app->singleton(ChatGptClient::class, fn ($app) => new ChatGptClient(
             $app->make(ProofOfWorkSolver::class)
         ));
@@ -71,7 +75,8 @@ class MirrorServiceProvider extends ServiceProvider
 
         $this->app->singleton(TokenPoolInterface::class, fn ($app) => new TokenPoolManager(
             $app->make(TokenRefresher::class),
-            $app->make(MirrorCache::class)
+            $app->make(MirrorCache::class),
+            $app->make(TokenInputParser::class)
         ));
         $this->app->singleton(TokenPoolManager::class, fn ($app) => $app->make(TokenPoolInterface::class));
 

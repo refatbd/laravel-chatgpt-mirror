@@ -156,29 +156,31 @@ You can manage accounts either via the **Web Admin Dashboard** (`http://127.0.0.
 
 ### Option A: Via Web Admin Dashboard
 1. Open `http://127.0.0.1:8000/mirror/admin` in your browser.
-2. In the **Add Account to Pool** box, paste your session token or the full session JSON from `chatgpt.com/api/auth/session`.
-3. Click **+ Add Account to Concurrency Pool**.
-4. To serve 100–200 concurrent users without rate limits, add 3 to 5 separate session tokens. The `least_busy` load balancer will automatically distribute queries across healthy accounts.
+2. In the **Add ChatGPT Account Token** card, either paste the entire `token.txt` (`chatgpt.com/api/auth/session` JSON dump), browser Cookie JSON / `Cookie:` header / cURL / Netscape cookies, or choose the `token.txt` file directly — the extractor automatically pulls out `sessionToken`, `accessToken`, `email`, `name`, `accountId`, and `planType`.
+3. Click **Extract, Verify & Save Account**.
+4. To serve 100–200 concurrent users without rate limits, add 3 to 5 separate session tokens (you can even paste a JSON array or multi-line dump to bulk-import in one click). The `least_busy` load balancer will automatically distribute queries across healthy accounts.
 
 ### Option B: Via Artisan CLI
 
-#### 1. Add a Token Interactively
+#### 1. Add a Token Interactively or from `token.txt`
 ```bash
 php artisan mirror:token:add
+# Or pass token.txt directly:
+php artisan mirror:token:add --file=token.txt
 ```
-Or with inline arguments:
+Or pass inline token/header arguments:
 ```bash
 php artisan mirror:token:add "your-session-token-here" --name="Team Account 1"
 ```
 
 > **How to get your session token:**
 > 1. Sign in to [chatgpt.com](https://chatgpt.com) in your browser.
-> 2. Open `https://chatgpt.com/api/auth/session` or check DevTools Application Cookies for `__Secure-next-auth.session-token`.
-> 3. Copy the token value.
+> 2. Open `https://chatgpt.com/api/auth/session`, save/copy the entire JSON into `token.txt` (or paste directly into `/mirror/admin`), or copy `__Secure-next-auth.session-token` / DevTools `Cookie:` header.
+> 3. Paste all of it directly — no manual trimming needed.
 
-#### 2. Bulk Import Tokens from a File
+#### 2. Bulk Import Tokens from `token.txt` / `cookies.json`
 ```bash
-php artisan mirror:token:import token.txt
+php artisan mirror:import-token token.txt
 ```
 
 #### 3. View Real-Time Pool Metrics

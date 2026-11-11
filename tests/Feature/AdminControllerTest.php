@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Refatbd\LaravelChatGptMirror\Tests\Feature;
 
+use Illuminate\Http\UploadedFile;
 use Refatbd\LaravelChatGptMirror\Models\MirrorToken;
 use Refatbd\LaravelChatGptMirror\Services\SecurityService;
 use Refatbd\LaravelChatGptMirror\Services\TokenRefresher;
@@ -199,5 +200,112 @@ class AdminControllerTest extends TestCase
         $this->assertDatabaseMissing('mirror_tokens', [
             'id' => $token->id,
         ]);
+    }
+
+    public function test_admin_and_post_session_extract_full_token_txt_json_and_uploaded_file(): void
+    {
+        $extractedSession = 'sess_extracted_' . str_repeat('q', 32);
+        $b64 = static fn (array $d): string => rtrim(strtr(base64_encode((string) json_encode($d)), '+/', '-_'), '=');
+        $jwt = $b64(['alg' => 'RS256']) . '.' . $b64([
+            'iss' => 'https://auth.openai.com/',
+            'exp' => time() + 7200,
+            'https://api.openai.com/auth' => ['user_id' => 'u-bundle-1'],
+        ]) . '.sig12345';
+
+        $fullTokenTxtPayload = json_encode([
+            'user' => ['id' => 'u-bundle-1', 'name' => 'Bundle User', 'email' => 'bundle@example.com'],
+            'account' => ['id' => 'acct-bundle-1', 'planType' => 'plus'],
+            'expires' => '2027-02-08T02:07:02.327Z',
+            'accessToken' => $jwt,
+            'sessionToken' => $extractedSession,
+            'WARNING_BANNER' => 'Never share this session JSON.',
+        ], JSON_UNESCAPED_SLASHES);
+
+        // Mock TokenRefresher verifying that ONLY the clean extracted session_token was sent upstream
+        $mockRefresher = $this->createMock(TokenRefresher::class);
+        $mockRefresher->method('verifyCandidateSessionToken')
+            ->with($extractedSession)
+            ->willReturn([
+                'session_token' => $extractedSession,
+                'access_token' => $jwt,
+                'expires_at' => now()->addHour(),
+                'email' => null, // omit upstream email to prove metadata backfills from token.txt
+                'name' => null,
+                'account_id' => 'acct-bundle-1',
+                'plan_type' => null,
+            ]);
+        $this->app->instance(TokenRefresher::class, $mockRefresher);
+
+        // 1. Pasting entire token.txt into /mirror/admin/tokens textarea
+        $postAdmin = $this->withHeader('Authorization', 'Bearer test-mirror-key-12345')
+            ->post('/mirror/admin/tokens', [
+                'session_token' => (string) $fullTokenTxtPayload,
+            ]);
+        $postAdmin->assertRedirect();
+
+        $saved = MirrorToken::where('account_id', 'acct-bundle-1')->first();
+        $this->assertNotNull($saved);
+        $this->assertSame($extractedSession, $saved->session_token);
+        $this->assertSame('bundle@example.com', $saved->email);
+        $this->assertSame('Bundle User', $saved->name);
+        $this->assertSame('plus', $saved->plan_type);
+
+        // 2. Uploading token.txt via multipart file input
+        $uploadedFile = UploadedFile::fake()->createWithContent('token.txt', (string) $fullTokenTxtPayload);
+        $this->withHeader('Authorization', 'Bearer test-mirror-key-12345')
+            ->post('/mirror/admin/tokens', [
+                'name' => 'Uploaded File Override',
+                'token_file' => $uploadedFile,
+            ])
+            ->assertRedirect();
+        $this->assertSame('Uploaded File Override', $saved->fresh()->name);
+
+        // 3. POSTing entire /api/auth/session JSON directly to /api/session
+        $apiRes = $this->withHeader('Authorization', 'Bearer test-mirror-key-12345')
+            ->postJson('/api/session', json_decode((string) $fullTokenTxtPayload, true));
+        $apiRes->assertOk()
+            ->assertJsonPath('ok', true)
+            ->assertJsonPath('email', 'bundle@example.com')
+            ->assertJsonPath('source_format', 'session_json');
+    }
+
+    public function test_session_bundle_fallback_works_only_on_transient_error_not_on_401_reject(): void
+    {
+        $b64 = static fn (array $d): string => rtrim(strtr(base64_encode((string) json_encode($d)), '+/', '-_'), '=');
+        $validJwt = $b64(['alg' => 'RS256']) . '.' . $b64([
+            'iss' => 'https://auth.openai.com/',
+            'exp' => time() + 7200,
+        ]) . '.sig12345';
+
+        $bundleJson = (string) json_encode([
+            'user' => ['email' => 'waf@example.com', 'name' => 'WAF Fallback User'],
+            'account' => ['id' => 'acct-waf-1', 'planType' => 'pro'],
+            'accessToken' => $validJwt,
+            'sessionToken' => 'sess_waf_fallback_' . str_repeat('f', 24),
+        ]);
+
+        // Case A: Upstream explicitly rejects (401 -> transient=false) => MUST reject with 401
+        $rejectMock = $this->createMock(TokenRefresher::class);
+        $rejectMock->method('verifyCandidateSessionToken')->willReturn(null);
+        $rejectMock->method('lastVerificationWasTransientFailure')->willReturn(false);
+        $this->app->instance(TokenRefresher::class, $rejectMock);
+
+        $this->withHeader('Authorization', 'Bearer test-mirror-key-12345')
+            ->postJson('/api/session', ['sessionToken' => $bundleJson])
+            ->assertStatus(401);
+
+        // Case B: Upstream hits WAF/network transient failure (transient=true) + valid unexpired JWT => fallback saves cleanly
+        $wafMock = $this->createMock(TokenRefresher::class);
+        $wafMock->method('verifyCandidateSessionToken')->willReturn(null);
+        $wafMock->method('lastVerificationWasTransientFailure')->willReturn(true);
+        $this->app->instance(TokenRefresher::class, $wafMock);
+
+        $fallbackRes = $this->withHeader('Authorization', 'Bearer test-mirror-key-12345')
+            ->postJson('/api/session', ['sessionToken' => $bundleJson]);
+        $fallbackRes->assertOk()
+            ->assertJsonPath('ok', true)
+            ->assertJsonPath('verification_mode', 'session_bundle_fallback')
+            ->assertJsonPath('email', 'waf@example.com')
+            ->assertJsonPath('plan_type', 'pro');
     }
 }
