@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 use Illuminate\Support\Facades\Route;
 use Refatbd\LaravelChatGptMirror\Controllers\AdminController;
+use Refatbd\LaravelChatGptMirror\Controllers\BackendApiController;
 use Refatbd\LaravelChatGptMirror\Controllers\BrowserProxyController;
 use Refatbd\LaravelChatGptMirror\Controllers\HelpController;
 use Refatbd\LaravelChatGptMirror\Controllers\PlaygroundController;
@@ -130,7 +131,7 @@ $registerWebRoutes = static function () use (
                 Route::get('/c/{id}', [BrowserProxyController::class, 'proxy'])->where('id', '.*');
                 Route::any('/_next/{path}', [BrowserProxyController::class, 'proxy'])->where('path', '.*');
                 Route::any('/cdn/{path}', [BrowserProxyController::class, 'proxy'])->where('path', '.*');
-                Route::any('/public-api/{path}', [BrowserProxyController::class, 'proxy'])->where('path', '.*');
+                Route::any('/public-api/{path}', [BackendApiController::class, 'publicApiProxy'])->where('path', '.*');
                 Route::any('/ces/{path}', [BrowserProxyController::class, 'proxy'])->where('path', '.*');
                 Route::any('/assets/{path}', [BrowserProxyController::class, 'proxy'])->where('path', '.*');
                 Route::any('/fonts/{path}', [BrowserProxyController::class, 'proxy'])->where('path', '.*');

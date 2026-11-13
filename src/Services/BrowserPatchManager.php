@@ -57,13 +57,20 @@ class BrowserPatchManager
     /**
      * Rewrite upstream origins and inject EARLY_PATCH before application JS runs.
      */
-    public function patchHtml(string $html, ?string $localOrigin = null): string
-    {
+    public function patchHtml(
+        string $html,
+        ?string $localOrigin = null,
+        string $basePath = '',
+        ?string $extraUpstreamOrigin = null
+    ): string {
+        // Strip any pre-existing early patch injected by an upstream remote mirror node so ours stays authoritative.
+        $html = preg_replace('#<script\s+data-mirror-patch="early">[\s\S]*?</script>#i', '', $html) ?? $html;
+
         if ($localOrigin !== null && $localOrigin !== '') {
-            $html = $this->rewriter->rewriteText($html, $localOrigin, 'text/html');
+            $html = $this->rewriter->rewriteText($html, $localOrigin, 'text/html', $extraUpstreamOrigin, $basePath);
         }
 
-        $script = $this->buildEarlyPatchScript($localOrigin ?: '');
+        $script = $this->buildEarlyPatchScript($localOrigin ?: '', $basePath, $extraUpstreamOrigin ?: '');
 
         if (preg_match('/<head[^>]*>/i', $html, $matches, PREG_OFFSET_CAPTURE)) {
             $pos = $matches[0][1] + strlen($matches[0][0]);
@@ -73,9 +80,16 @@ class BrowserPatchManager
         return $script . "\n" . $html;
     }
 
-    protected function buildEarlyPatchScript(string $localOrigin): string
+    protected function buildEarlyPatchScript(string $localOrigin, string $basePath = '', string $extraUpstreamOrigin = ''): string
     {
+        $normalizedBase = $basePath !== '' ? '/' . trim($basePath, '/') : '';
+        if ($normalizedBase === '/') {
+            $normalizedBase = '';
+        }
+
         $jsonOrigin = json_encode(rtrim($localOrigin, '/'), JSON_UNESCAPED_SLASHES);
+        $jsonBasePath = json_encode($normalizedBase, JSON_UNESCAPED_SLASHES);
+        $jsonExtraOrigin = json_encode(rtrim($extraUpstreamOrigin, '/'), JSON_UNESCAPED_SLASHES);
         $backendPrefix = json_encode('/' . trim((string) config('mirror.routes.backend_prefix', 'backend-api'), '/') . '/', JSON_UNESCAPED_SLASHES);
 
         return <<<HTML
@@ -83,6 +97,9 @@ class BrowserPatchManager
 (function(){
   try {
     var localOrigin = {$jsonOrigin} || window.location.origin;
+    var basePath = {$jsonBasePath};
+    var extraUpstream = {$jsonExtraOrigin};
+    var localRoot = localOrigin + (basePath || '');
     var backendPrefix = {$backendPrefix};
     var localWs = localOrigin.replace(/^http/i, 'ws');
     function rewriteUrl(u) {
@@ -90,9 +107,20 @@ class BrowserPatchManager
       if (u.indexOf('/__codex-api/') !== -1) {
         u = u.replace(/\/__codex-api\//g, backendPrefix);
       }
-      u = u.replace(/^https:\/\/(?:chat\.openai\.com|chatgpt\.com)/i, localOrigin);
+      if (extraUpstream && u.indexOf(extraUpstream) === 0) {
+        u = localOrigin + u.slice(extraUpstream.length);
+      }
+      u = u.replace(/^https:\/\/(?:chat\.openai\.com|chatgpt\.com)/i, localRoot);
       u = u.replace(/^https:\/\/cdn\.oaistatic\.com/i, localOrigin + '/cdn');
       u = u.replace(/^wss:\/\/(?:ws\.)?chatgpt\.com/i, localWs);
+      if (basePath) {
+        if (u.indexOf('/backend-api/') === 0 || u.indexOf('/api/') === 0 || u.indexOf('/public-api/') === 0 || u.indexOf('/cdn/') === 0) {
+          return localOrigin + u;
+        }
+        if (u.charAt(0) === '/' && u.charAt(1) !== '/' && u.indexOf(basePath + '/') !== 0 && u.indexOf('/_unigpt/') !== 0 && u.indexOf('/ces/') !== 0) {
+          u = basePath + u;
+        }
+      }
       if (u.indexOf('https://ab.chatgpt.com') === 0 || u.indexOf('https://rum.browser-intake-datadoghq.com') === 0) {
         return localOrigin + '/ces/noop';
       }
@@ -151,6 +179,20 @@ class BrowserPatchManager
       window.WebSocket.OPEN = OrigWS.OPEN;
       window.WebSocket.CLOSING = OrigWS.CLOSING;
       window.WebSocket.CLOSED = OrigWS.CLOSED;
+    }
+
+    if (basePath && window.history) {
+      ['pushState', 'replaceState'].forEach(function(fn) {
+        var orig = window.history[fn];
+        if (typeof orig === 'function') {
+          window.history[fn] = function(state, title, url) {
+            if (typeof url === 'string' && url.charAt(0) === '/' && url.charAt(1) !== '/' && url.indexOf(basePath + '/') !== 0 && url !== basePath) {
+              url = basePath + url;
+            }
+            return orig.call(this, state, title, url);
+          };
+        }
+      });
     }
 
     // Remove the script element so Next.js / React hydration does not observe DOM mismatch.

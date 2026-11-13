@@ -28,6 +28,30 @@ class Mirror
     /** @var (callable(\Illuminate\Http\Request): bool)|null */
     protected static $adminAuthorizer = null;
 
+    /** @var (callable(\Illuminate\Http\Request): ?bool)|null */
+    protected static $proxyRequestGuard = null;
+
+    /** @var (callable(\Illuminate\Http\Request): ?array)|null */
+    protected static $webContextResolver = null;
+
+    /** @var (callable(array, \Illuminate\Http\Request, mixed): array)|null */
+    protected static $browserSessionCustomizer = null;
+
+    /** @var (callable(\Illuminate\Http\Request, string, array): mixed)|null */
+    protected static $backendRequestInterceptor = null;
+
+    /** @var (callable(string, array, \Illuminate\Http\Request, string, array): void)|null */
+    protected static $backendStreamObserver = null;
+
+    /** @var (callable(\Symfony\Component\HttpFoundation\Response, \Illuminate\Http\Request, string, array): \Symfony\Component\HttpFoundation\Response)|null */
+    protected static $backendResponseFilter = null;
+
+    /** @var (callable(string, \Illuminate\Http\Request, array): string)|null */
+    protected static $browserHtmlInjector = null;
+
+    /** @var (callable(array, \Illuminate\Http\Request, array): array)|null */
+    protected static $browserResponseHeadersFilter = null;
+
     public function __construct(
         protected TokenPoolManager $poolManager,
         protected ChatGptClient $client,
@@ -97,12 +121,165 @@ class Mirror
         return static::$adminAuthorizer;
     }
 
+    /**
+     * Dynamic host/path matcher callback compatible with compiled `route:cache`.
+     *
+     * @param (callable(\Illuminate\Http\Request): ?bool)|null $callback
+     */
+    public static function shouldProxyRequestUsing(?callable $callback): void
+    {
+        static::$proxyRequestGuard = $callback;
+    }
+
+    /**
+     * @return (callable(\Illuminate\Http\Request): ?bool)|null
+     */
+    public static function resolveProxyRequestGuard(): ?callable
+    {
+        return static::$proxyRequestGuard;
+    }
+
+    /**
+     * Resolve per-request server/tenant proxy context (scoped MirrorToken, remote upstream_url, proxy, base_path).
+     *
+     * @param (callable(\Illuminate\Http\Request): ?array)|null $callback
+     */
+    public static function resolveWebContextUsing(?callable $callback): void
+    {
+        static::$webContextResolver = $callback;
+    }
+
+    /**
+     * @return (callable(\Illuminate\Http\Request): ?array)|null
+     */
+    public static function resolveWebContextResolver(): ?callable
+    {
+        return static::$webContextResolver;
+    }
+
+    /**
+     * Customize `/api/auth/session` JSON returned to ChatGPT Web UI (e.g. mask shared account identity).
+     *
+     * @param (callable(array, \Illuminate\Http\Request, mixed): array)|null $callback
+     */
+    public static function customizeBrowserSessionUsing(?callable $callback): void
+    {
+        static::$browserSessionCustomizer = $callback;
+    }
+
+    /**
+     * @return (callable(array, \Illuminate\Http\Request, mixed): array)|null
+     */
+    public static function resolveBrowserSessionCustomizer(): ?callable
+    {
+        return static::$browserSessionCustomizer;
+    }
+
+    /**
+     * Pre-flight request interceptor before `/backend-api/*` is forwarded upstream.
+     * Return a Response to short-circuit (e.g. quota exceeded or blocked settings path).
+     *
+     * @param (callable(\Illuminate\Http\Request, string, array): mixed)|null $callback
+     */
+    public static function interceptBackendRequestUsing(?callable $callback): void
+    {
+        static::$backendRequestInterceptor = $callback;
+    }
+
+    /**
+     * @return (callable(\Illuminate\Http\Request, string, array): mixed)|null
+     */
+    public static function resolveBackendRequestInterceptor(): ?callable
+    {
+        return static::$backendRequestInterceptor;
+    }
+
+    /**
+     * Real-time observer for parsed SSE lifecycle events during `/backend-api/*` streaming.
+     *
+     * @param (callable(string, array, \Illuminate\Http\Request, string, array): void)|null $callback
+     */
+    public static function observeBackendStreamUsing(?callable $callback): void
+    {
+        static::$backendStreamObserver = $callback;
+    }
+
+    /**
+     * @return (callable(string, array, \Illuminate\Http\Request, string, array): void)|null
+     */
+    public static function resolveBackendStreamObserver(): ?callable
+    {
+        return static::$backendStreamObserver;
+    }
+
+    /**
+     * Post-process or filter non-streaming `/backend-api/*` responses (e.g. conversation isolation).
+     *
+     * @param (callable(\Symfony\Component\HttpFoundation\Response, \Illuminate\Http\Request, string, array): \Symfony\Component\HttpFoundation\Response)|null $callback
+     */
+    public static function filterBackendResponseUsing(?callable $callback): void
+    {
+        static::$backendResponseFilter = $callback;
+    }
+
+    /**
+     * @return (callable(\Symfony\Component\HttpFoundation\Response, \Illuminate\Http\Request, string, array): \Symfony\Component\HttpFoundation\Response)|null
+     */
+    public static function resolveBackendResponseFilter(): ?callable
+    {
+        return static::$backendResponseFilter;
+    }
+
+    /**
+     * Inject isolated HTML/JS (such as a Shadow-DOM floating quota pill) into proxied `text/html` pages.
+     *
+     * @param (callable(string, \Illuminate\Http\Request, array): string)|null $callback
+     */
+    public static function injectBrowserHtmlUsing(?callable $callback): void
+    {
+        static::$browserHtmlInjector = $callback;
+    }
+
+    /**
+     * @return (callable(string, \Illuminate\Http\Request, array): string)|null
+     */
+    public static function resolveBrowserHtmlInjector(): ?callable
+    {
+        return static::$browserHtmlInjector;
+    }
+
+    /**
+     * Customize cleaned response headers on proxied browser responses (e.g. framing policy).
+     *
+     * @param (callable(array, \Illuminate\Http\Request, array): array)|null $callback
+     */
+    public static function filterBrowserResponseHeadersUsing(?callable $callback): void
+    {
+        static::$browserResponseHeadersFilter = $callback;
+    }
+
+    /**
+     * @return (callable(array, \Illuminate\Http\Request, array): array)|null
+     */
+    public static function resolveBrowserResponseHeadersFilter(): ?callable
+    {
+        return static::$browserResponseHeadersFilter;
+    }
+
     public static function resetConfigurationHooks(): void
     {
         static::$runsMigrations = true;
         static::$registersRoutes = true;
         static::$apiKeyAuthenticator = null;
         static::$adminAuthorizer = null;
+        static::$proxyRequestGuard = null;
+        static::$webContextResolver = null;
+        static::$browserSessionCustomizer = null;
+        static::$backendRequestInterceptor = null;
+        static::$backendStreamObserver = null;
+        static::$backendResponseFilter = null;
+        static::$browserHtmlInjector = null;
+        static::$browserResponseHeadersFilter = null;
     }
 
     public function pool(): TokenPoolManager

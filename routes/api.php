@@ -165,7 +165,13 @@ $registerApiRoutes = static function () use (
         Route::any('/' . $backendPrefix . '/{path}', [BackendApiController::class, 'proxy'])
             ->where('path', '.*');
 
-        Route::any('/__codex-api/{path}', [BackendApiController::class, 'proxy'])
+        Route::any('/__codex-api/{path}', [BackendApiController::class, 'codexProxy'])
+            ->where('path', '.*');
+
+        Route::any('/public-api/{path}', [BackendApiController::class, 'publicApiProxy'])
+            ->where('path', '.*');
+
+        Route::any('/api/{path}', [BackendApiController::class, 'apiProxy'])
             ->where('path', '.*');
     }
 };

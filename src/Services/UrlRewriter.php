@@ -13,29 +13,54 @@ class UrlRewriter
 {
     public const BROWSER_TOKEN = 'mirror-proxied-session';
 
-    public function rewriteText(string $body, string $localOrigin, string $contentType = 'text/html'): string
-    {
+    public function rewriteText(
+        string $body,
+        string $localOrigin,
+        string $contentType = 'text/html',
+        ?string $extraUpstreamOrigin = null,
+        string $basePath = ''
+    ): string {
         $origin = rtrim($localOrigin, '/');
         if ($origin === '' || $body === '') {
             return $body;
         }
 
-        $wsOrigin = preg_replace('/^http/i', 'ws', $origin) ?: $origin;
-        $escapedOrigin = str_replace('/', '\\/', $origin);
+        $normalizedBase = $basePath !== '' ? '/' . trim($basePath, '/') : '';
+        if ($normalizedBase === '/') {
+            $normalizedBase = '';
+        }
+        $localRoot = $origin . $normalizedBase;
+
+        $wsOrigin = preg_replace('/^http/i', 'ws', $localRoot) ?: $localRoot;
+        $escapedOrigin = str_replace('/', '\\/', $localRoot);
+        $escapedPlainOrigin = str_replace('/', '\\/', $origin);
         $escapedWsOrigin = str_replace('/', '\\/', $wsOrigin);
 
         $replacements = [
-            'https://chatgpt.com' => $origin,
-            'https://chat.openai.com' => $origin,
+            'https://chatgpt.com' => $localRoot,
+            'https://chat.openai.com' => $localRoot,
             'https://cdn.oaistatic.com' => $origin . '/cdn',
             'wss://chatgpt.com' => $wsOrigin,
             'wss://ws.chatgpt.com' => $wsOrigin,
             'https:\\/\\/chatgpt.com' => $escapedOrigin,
             'https:\\/\\/chat.openai.com' => $escapedOrigin,
-            'https:\\/\\/cdn.oaistatic.com' => $escapedOrigin . '\\/cdn',
+            'https:\\/\\/cdn.oaistatic.com' => $escapedPlainOrigin . '\\/cdn',
             'wss:\\/\\/chatgpt.com' => $escapedWsOrigin,
             'wss:\\/\\/ws.chatgpt.com' => $escapedWsOrigin,
         ];
+
+        $extraOrigin = $extraUpstreamOrigin !== null ? rtrim(trim($extraUpstreamOrigin), '/') : '';
+        if ($extraOrigin !== '' && $extraOrigin !== $localRoot) {
+            $extraWs = preg_replace('/^http/i', 'ws', $extraOrigin) ?: $extraOrigin;
+            $escapedExtra = str_replace('/', '\\/', $extraOrigin);
+            $escapedExtraWs = str_replace('/', '\\/', $extraWs);
+            $replacements[$extraOrigin . '/cdn'] = $origin . '/cdn';
+            $replacements[$extraOrigin] = $localRoot;
+            $replacements[$extraWs] = $wsOrigin;
+            $replacements[$escapedExtra . '\\/cdn'] = $escapedPlainOrigin . '\\/cdn';
+            $replacements[$escapedExtra] = $escapedOrigin;
+            $replacements[$escapedExtraWs] = $escapedWsOrigin;
+        }
 
         $rewritten = strtr($body, $replacements);
 
