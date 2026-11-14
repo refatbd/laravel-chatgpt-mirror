@@ -64,6 +64,18 @@ class UrlRewriter
 
         $rewritten = strtr($body, $replacements);
 
+        // Rewrite any remaining ChatGPT subdomains (e.g. ab.chatgpt.com, ws.chatgpt.com, tcr9i.chat.openai.com) matching defcron-mirror
+        $chatGptHostsPattern = '(?:[a-z0-9-]+\.)*(?:chatgpt\.com|chat\.openai\.com)';
+        $rewritten = preg_replace('#https://' . $chatGptHostsPattern . '#i', $localRoot, $rewritten) ?? $rewritten;
+        $rewritten = preg_replace('#wss://' . $chatGptHostsPattern . '#i', $wsOrigin, $rewritten) ?? $rewritten;
+        $rewritten = preg_replace('#https:(?:\\\\/){2}' . $chatGptHostsPattern . '#i', $escapedOrigin, $rewritten) ?? $rewritten;
+        $rewritten = preg_replace('#wss:(?:\\\\/){2}' . $chatGptHostsPattern . '#i', $escapedWsOrigin, $rewritten) ?? $rewritten;
+
+        // Disable bundled Datadog initialization in JS payloads so proxy domains never crash
+        if (stripos($contentType, 'javascript') !== false) {
+            $rewritten = preg_replace('/(?<![.\w])((?:[$\w]+\.)*init\(\{applicationId:)/', 'false&&$1', $rewritten) ?? $rewritten;
+        }
+
         // Rewrite subdomain endpoints like https://ab.chatgpt.com or https://tcr9i.chat.openai.com cleanly if they carry /cdn or backend paths.
         if (stripos($contentType, 'html') !== false || stripos($contentType, 'json') !== false) {
             // Never leak raw OpenAI JWTs from SSR __NEXT_DATA__ or Remix inline scripts.

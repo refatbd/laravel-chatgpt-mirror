@@ -23,6 +23,39 @@ class BrowserPatchManager
      * @param array<string, mixed> $headers
      * @return array<string, mixed>
      */
+    /**
+     * Regex matching Datadog RUM script tags that fail on proxy origins.
+     */
+    protected const DATADOG_SRC_SCRIPT_TAG = '/<script\b[^>]*\bsrc=["\'][^"\']*datadoghq[^"\']*["\'][^>]*>\s*<\/script>|<script\b[^>]*\bsrc=["\'][^"\']*datadoghq[^"\']*["\'][^>]*\/>/i';
+
+    /**
+     * Regex matching Datadog telemetry initialization calls in bundled JS.
+     */
+    protected const DATADOG_INIT_CALL_PATTERN = '/(?<![.\w])((?:[$\w]+\.)*init\(\{applicationId:)/';
+
+    /**
+     * Strip Datadog script tags out of served HTML so SDK never loads on proxy domains.
+     */
+    public function stripDatadogScripts(string $html): string
+    {
+        return preg_replace(self::DATADOG_SRC_SCRIPT_TAG, '', $html) ?? $html;
+    }
+
+    /**
+     * Disable bundled Datadog telemetry initialization in proxied JavaScript.
+     */
+    public function disableDatadogInit(string $js): string
+    {
+        return preg_replace(self::DATADOG_INIT_CALL_PATTERN, 'false&&$1', $js) ?? $js;
+    }
+
+    /**
+     * Strip headers that break reverse proxying, decompression, or script transport.
+     * Preserves X-Frame-Options unless blocked by framing policy contract tests.
+     *
+     * @param array<string, mixed> $headers
+     * @return array<string, mixed>
+     */
     public function cleanHeaders(array $headers): array
     {
         $strip = [
@@ -42,6 +75,9 @@ class BrowserPatchManager
             'set-cookie',
             'public-key-pins',
             'x-webkit-csp',
+            'nel',
+            'report-to',
+            'reporting-endpoints',
         ];
 
         $cleaned = [];
@@ -65,6 +101,9 @@ class BrowserPatchManager
     ): string {
         // Strip any pre-existing early patch injected by an upstream remote mirror node so ours stays authoritative.
         $html = preg_replace('#<script\s+data-mirror-patch="early">[\s\S]*?</script>#i', '', $html) ?? $html;
+
+        // Strip Datadog external script tags to avoid proxy domain mismatch crashes
+        $html = $this->stripDatadogScripts($html);
 
         if ($localOrigin !== null && $localOrigin !== '') {
             $html = $this->rewriter->rewriteText($html, $localOrigin, 'text/html', $extraUpstreamOrigin, $basePath);
@@ -102,6 +141,7 @@ class BrowserPatchManager
     var localRoot = localOrigin + (basePath || '');
     var backendPrefix = {$backendPrefix};
     var localWs = localOrigin.replace(/^http/i, 'ws');
+
     function rewriteUrl(u) {
       if (typeof u !== 'string') return u;
       if (u.indexOf('/__codex-api/') !== -1) {
@@ -110,9 +150,9 @@ class BrowserPatchManager
       if (extraUpstream && u.indexOf(extraUpstream) === 0) {
         u = localOrigin + u.slice(extraUpstream.length);
       }
-      u = u.replace(/^https:\/\/(?:chat\.openai\.com|chatgpt\.com)/i, localRoot);
+      u = u.replace(/^https:\/\/(?:[a-z0-9-]+\.)*(?:chat\.openai\.com|chatgpt\.com)/i, localRoot);
       u = u.replace(/^https:\/\/cdn\.oaistatic\.com/i, localOrigin + '/cdn');
-      u = u.replace(/^wss:\/\/(?:ws\.)?chatgpt\.com/i, localWs);
+      u = u.replace(/^wss:\/\/(?:[a-z0-9-]+\.)*(?:chat\.openai\.com|chatgpt\.com)/i, localWs);
       if (basePath) {
         if (u.indexOf('/backend-api/') === 0 || u.indexOf('/api/') === 0 || u.indexOf('/public-api/') === 0 || u.indexOf('/cdn/') === 0) {
           return localOrigin + u;
@@ -127,26 +167,68 @@ class BrowserPatchManager
       return u;
     }
 
-    var origFetch = window.fetch;
-    if (typeof origFetch === 'function') {
-      var patchedFetch = function(input, init) {
-        if (typeof input === 'string') {
-          input = rewriteUrl(input);
-        } else if (input && typeof input === 'object' && typeof input.url === 'string') {
-          var nextUrl = rewriteUrl(input.url);
-          if (nextUrl !== input.url && typeof Request !== 'undefined') {
-            try {
-              input = new Request(nextUrl, input);
-            } catch (_e) {}
-          }
+    function rel(u) {
+      try {
+        if (typeof u !== 'string') return u;
+        var x = new URL(u, window.location.href);
+        if (x.hostname === 'chatgpt.com' || x.hostname.endsWith('.chatgpt.com') || x.hostname === 'chat.openai.com') {
+          x.protocol = window.location.protocol;
+          x.host = window.location.host;
+          return rewriteUrl(x.href);
         }
-        return origFetch.call(this, input, init);
+      } catch (_e) {}
+      return rewriteUrl(u);
+    }
+
+    function wrapFetch(delegate) {
+      var wrapped = function(input, init) {
+        try {
+          if (typeof input === 'string') {
+            input = rel(input);
+          } else if (input instanceof URL) {
+            input = rel(input.href);
+          } else if (input && typeof input === 'object' && typeof input.url === 'string') {
+            var rewritten = rel(input.url);
+            if (rewritten !== input.url) {
+              var base = {
+                method: input.method, headers: input.headers, mode: input.mode,
+                credentials: input.credentials, cache: input.cache, redirect: input.redirect,
+                referrer: input.referrer, referrerPolicy: input.referrerPolicy,
+                integrity: input.integrity, keepalive: input.keepalive, signal: input.signal
+              };
+              if (input.method !== 'GET' && input.method !== 'HEAD') {
+                return input.clone().arrayBuffer().then(function(buf) {
+                  base.body = buf;
+                  if (init) for (var key in init) base[key] = init[key];
+                  return delegate.call(this, rewritten, base);
+                }.bind(this));
+              }
+              if (init) for (var key in init) base[key] = init[key];
+              input = rewritten;
+              init = base;
+            }
+          }
+        } catch (_err) {}
+        return delegate.call(this, input, init);
       };
+      try { Object.defineProperty(wrapped, '__mirrorProxyPatch', { value: true }); } catch (_e) {}
+      return wrapped;
+    }
+
+    var currentFetch = window.fetch;
+    if (typeof currentFetch === 'function') {
+      var patchedFetch = wrapFetch(currentFetch);
       try {
         Object.defineProperty(window, 'fetch', {
-          configurable: true,
-          writable: true,
-          value: patchedFetch
+          configurable: false,
+          enumerable: true,
+          get: function() { return patchedFetch; },
+          set: function(next) {
+            if (typeof next === 'function' && !next.__mirrorProxyPatch) {
+              currentFetch = next;
+              patchedFetch = wrapFetch(next);
+            }
+          }
         });
       } catch (_e) {
         window.fetch = patchedFetch;
@@ -157,22 +239,35 @@ class BrowserPatchManager
       var origOpen = XMLHttpRequest.prototype.open;
       XMLHttpRequest.prototype.open = function(method, url) {
         var args = Array.prototype.slice.call(arguments);
-        args[1] = rewriteUrl(url);
+        try { if (typeof url === 'string') args[1] = rel(url); } catch (_e) {}
         return origOpen.apply(this, args);
       };
+    }
+
+    var OrigWorker = window.Worker;
+    if (typeof OrigWorker === 'function') {
+      window.Worker = function(url, opts) {
+        try { url = rel(String(url)); } catch (_e) {}
+        return opts !== undefined ? new OrigWorker(url, opts) : new OrigWorker(url);
+      };
+      window.Worker.prototype = OrigWorker.prototype;
     }
 
     if (navigator && typeof navigator.sendBeacon === 'function') {
       var origBeacon = navigator.sendBeacon.bind(navigator);
       navigator.sendBeacon = function(url, data) {
-        return origBeacon(rewriteUrl(url), data);
+        try { if (typeof url === 'string') url = rel(url); } catch (_e) {}
+        return origBeacon(url, data);
       };
     }
 
     if (typeof window.WebSocket === 'function') {
       var OrigWS = window.WebSocket;
       window.WebSocket = function(url, protocols) {
-        return protocols !== undefined ? new OrigWS(rewriteUrl(url), protocols) : new OrigWS(rewriteUrl(url));
+        try {
+          if (typeof url === 'string') url = rel(url).replace(/^https:/i, 'wss:').replace(/^http:/i, 'ws:');
+        } catch (_e) {}
+        return protocols !== undefined ? new OrigWS(url, protocols) : new OrigWS(url);
       };
       window.WebSocket.prototype = OrigWS.prototype;
       window.WebSocket.CONNECTING = OrigWS.CONNECTING;

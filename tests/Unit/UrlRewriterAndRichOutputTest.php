@@ -27,6 +27,18 @@ class UrlRewriterAndRichOutputTest extends TestCase
         $this->assertStringNotContainsString('eyJhbGciOiJSUzI1NiJ9', $out);
     }
 
+    public function test_url_rewriter_rewrites_subdomains_like_ab_chatgpt_and_disables_datadog_init(): void
+    {
+        $rewriter = new UrlRewriter();
+        $input = 'const abUrl = "https://ab.chatgpt.com/v1/initialize"; const tcr = "https://tcr9i.chat.openai.com/v2/api.js"; window.DD_RUM.init({applicationId:"xyz"});';
+
+        $out = $rewriter->rewriteText($input, 'http://127.0.0.1:8000', 'application/javascript');
+
+        $this->assertStringContainsString('http://127.0.0.1:8000/v1/initialize', $out);
+        $this->assertStringContainsString('http://127.0.0.1:8000/v2/api.js', $out);
+        $this->assertStringContainsString('false&&window.DD_RUM.init({applicationId:', $out);
+    }
+
     public function test_asset_ticket_service_verifies_and_revokes_on_generation_rotation(): void
     {
         /** @var SecurityService $security */

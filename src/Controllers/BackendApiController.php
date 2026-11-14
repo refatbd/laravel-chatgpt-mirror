@@ -212,18 +212,41 @@ class BackendApiController extends Controller
                 ];
             }
 
-            foreach ([
-                'openai-sentinel-chat-requirements-token',
-                'openai-sentinel-proof-token',
-                'openai-sentinel-turnstile-token',
-                'x-conduit-token',
-                'x-oai-turn-trace-id',
-                'oai-device-id',
-            ] as $headerName) {
-                $val = $request->header($headerName);
-                if ($val) {
-                    $headers[$headerName] = $val;
+            // Forward browser client-hints and dynamic telemetry/auth prefixes matching defcron-mirror
+            $forwardPrefixes = ['chatgpt-', 'oai-', 'openai-', 'x-conduit-', 'x-oai-', 'x-openai-'];
+            $forwardExact = [
+                'baggage', 'cache-control', 'pragma', 'priority', 'range', 'sentry-trace',
+                'dnt', 'sec-ch-ua', 'sec-ch-ua-mobile', 'sec-ch-ua-platform',
+                'sec-fetch-dest', 'sec-fetch-mode', 'sec-fetch-site', 'sec-fetch-user',
+            ];
+            foreach ($request->headers->all() as $rawHeaderName => $headerVals) {
+                $lowerName = strtolower($rawHeaderName);
+                $matchesPrefix = false;
+                foreach ($forwardPrefixes as $pfx) {
+                    if (str_starts_with($lowerName, $pfx)) {
+                        $matchesPrefix = true;
+                        break;
+                    }
                 }
+                if ($matchesPrefix || in_array($lowerName, $forwardExact, true)) {
+                    $headers[$rawHeaderName] = is_array($headerVals) ? implode(', ', $headerVals) : (string) $headerVals;
+                }
+            }
+
+            // Set explicit backend-api target path & route headers required by OpenAI
+            $pathOnly = explode('?', $targetPath, 2)[0];
+            $headers['X-OpenAI-Target-Path'] = $pathOnly;
+            $headers['X-OpenAI-Target-Route'] = $pathOnly;
+            $headers['Origin'] = 'https://chatgpt.com';
+            $headers['Host'] = 'chatgpt.com';
+
+            // Preserve deep page referer (e.g. /c/<conversation_id>) matching defcron-mirror
+            $clientReferer = $request->header('Referer');
+            if ($clientReferer && is_string($clientReferer)) {
+                $refParts = parse_url($clientReferer);
+                $headers['Referer'] = 'https://chatgpt.com' . ($refParts['path'] ?? '/') . (!empty($refParts['query']) ? '?' . $refParts['query'] : '');
+            } else {
+                $headers['Referer'] = 'https://chatgpt.com/';
             }
 
             foreach ($ctx['upstream_headers'] as $hk => $hv) {
@@ -273,12 +296,14 @@ class BackendApiController extends Controller
                 $rawHeaders[$k] = $vals[0] ?? '';
             }
             $cleanedHeaders = $this->patcher->cleanHeaders($rawHeaders);
+            $cleanedHeaders['Alt-Svc'] = 'clear';
             $contentType = (string) ($cleanedHeaders['Content-Type'] ?? $cleanedHeaders['content-type'] ?? 'application/json');
 
             if (stripos($contentType, 'text/event-stream') !== false) {
                 $observer = Mirror::resolveBackendStreamObserver();
                 $streamHeaders = $this->security->streamingHeaders((string) ($request->header('X-Request-Id') ?: ''));
                 $streamHeaders['Cache-Control'] = 'no-cache, no-transform';
+                $streamHeaders['Alt-Svc'] = 'clear';
 
                 return response()->stream(function () use ($upstream, $status, $releaseOnce, $observer, $request, $path, $ctx): void {
                     $telemetry = [

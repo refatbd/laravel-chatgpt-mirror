@@ -180,13 +180,41 @@ class BrowserProxyController extends Controller
             $upstreamTarget = $baseOverride ?: (string) config('mirror.upstream', 'https://chatgpt.com');
             $upstreamHost = parse_url($upstreamTarget, PHP_URL_HOST) ?: 'chatgpt.com';
 
+            $clientReferer = $request->header('Referer');
+            $deepReferer = 'https://' . $upstreamHost . '/';
+            if ($clientReferer && is_string($clientReferer)) {
+                $refParts = parse_url($clientReferer);
+                $deepReferer = 'https://' . $upstreamHost . ($refParts['path'] ?? '/') . (!empty($refParts['query']) ? '?' . $refParts['query'] : '');
+            }
+
             $headers = [
                 'User-Agent' => (string) config('mirror.http.user_agent', $request->userAgent() ?: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'),
                 'Accept' => (string) $request->header('Accept', 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'),
                 'Accept-Language' => 'en-US,en;q=0.9',
                 'Origin' => 'https://' . $upstreamHost,
-                'Referer' => 'https://' . $upstreamHost . '/',
+                'Referer' => $deepReferer,
             ];
+
+            // Forward browser client-hints matching defcron-mirror
+            $forwardPrefixes = ['chatgpt-', 'oai-', 'openai-', 'x-conduit-', 'x-oai-', 'x-openai-'];
+            $forwardExact = [
+                'baggage', 'cache-control', 'pragma', 'priority', 'range', 'sentry-trace',
+                'dnt', 'sec-ch-ua', 'sec-ch-ua-mobile', 'sec-ch-ua-platform',
+                'sec-fetch-dest', 'sec-fetch-mode', 'sec-fetch-site', 'sec-fetch-user',
+            ];
+            foreach ($request->headers->all() as $rawHeaderName => $headerVals) {
+                $lowerName = strtolower($rawHeaderName);
+                $matchesPrefix = false;
+                foreach ($forwardPrefixes as $pfx) {
+                    if (str_starts_with($lowerName, $pfx)) {
+                        $matchesPrefix = true;
+                        break;
+                    }
+                }
+                if ($matchesPrefix || in_array($lowerName, $forwardExact, true)) {
+                    $headers[$rawHeaderName] = is_array($headerVals) ? implode(', ', $headerVals) : (string) $headerVals;
+                }
+            }
 
             if ($remoteBase === null && !($isCdnRoute && $isStaticGetOrHead)) {
                 $cookies = [];
