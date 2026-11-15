@@ -88,7 +88,7 @@ class BrowserProxyController extends Controller
         $isCdnRoute = str_starts_with($targetPath, '/cdn/') || str_starts_with($rawRequestPath, '/cdn/');
         $isStaticGetOrHead = ($request->isMethod('get') || $request->isMethod('head')) && $isStaticAsset && !str_starts_with($targetPath, '/api/');
         $localOrigin = $this->security->resolveOrigin($request);
-        $query = $request->getQueryString();
+        $query = (string) ($request->server->get('QUERY_STRING') ?: (explode('?', (string) $request->server->get('REQUEST_URI', ''), 2)[1] ?? $request->getQueryString()));
         $assetsInRedis = (bool) config('mirror.cache.assets_in_redis', true) && $this->isRedisCacheDriver();
 
         // Fast-path for cached public /cdn/* static assets BEFORE auth/token-pool/session DB queries.

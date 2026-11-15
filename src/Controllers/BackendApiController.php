@@ -189,9 +189,9 @@ class BackendApiController extends Controller
                 }
             }
 
-            $query = $request->getQueryString();
-            if ($query) {
-                $targetPath .= (str_contains($targetPath, '?') ? '&' : '?') . $query;
+            $rawQuery = (string) ($request->server->get('QUERY_STRING') ?: (explode('?', (string) $request->server->get('REQUEST_URI', ''), 2)[1] ?? $request->getQueryString()));
+            if ($rawQuery !== '') {
+                $targetPath .= (str_contains($targetPath, '?') ? '&' : '?') . $rawQuery;
             }
 
             $remoteBase = $ctx['upstream_url'];
