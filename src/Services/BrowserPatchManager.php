@@ -150,12 +150,16 @@ class BrowserPatchManager
       if (extraUpstream && u.indexOf(extraUpstream) === 0) {
         u = localOrigin + u.slice(extraUpstream.length);
       }
-      u = u.replace(/^https:\/\/(?:[a-z0-9-]+\.)*(?:chat\.openai\.com|chatgpt\.com)/i, localRoot);
+      u = u.replace(/^https:\/\/(?:[a-z0-9-]+\.)*(?:chat\.openai\.com|chatgpt\.com)/i, localOrigin);
       u = u.replace(/^https:\/\/cdn\.oaistatic\.com/i, localOrigin + '/cdn');
       u = u.replace(/^wss:\/\/(?:[a-z0-9-]+\.)*(?:chat\.openai\.com|chatgpt\.com)/i, localWs);
       if (basePath) {
         if (u.indexOf('/backend-api/') === 0 || u.indexOf('/api/') === 0 || u.indexOf('/public-api/') === 0 || u.indexOf('/cdn/') === 0) {
           return localOrigin + u;
+        }
+        // Preserve native React 19 client-side SPA routes so React Router matches and transitions in ~120ms without hard reload
+        if (u.indexOf('/c/') === 0 || u.indexOf('/g/') === 0 || u.indexOf('/library') === 0 || u.indexOf('/plugins') === 0 || u.indexOf('/gpts') === 0) {
+          return u;
         }
         if (u.charAt(0) === '/' && u.charAt(1) !== '/' && u.indexOf(basePath + '/') !== 0 && u.indexOf('/_unigpt/') !== 0 && u.indexOf('/ces/') !== 0) {
           u = basePath + u;
