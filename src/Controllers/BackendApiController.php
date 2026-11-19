@@ -167,6 +167,13 @@ class BackendApiController extends Controller
 
         $token = $ctx['token'];
         if (!$token && empty($ctx['skip_token_pool'])) {
+            if (($ctx['meta']['pool_status'] ?? null) === 'busy') {
+                return response()->json([
+                    'detail' => 'This workspace is busy. Please try again in a moment.',
+                    'code' => 'unigpt_pool_busy',
+                ], 503, ['Retry-After' => '1', 'X-UniGPT-Pool-Status' => 'busy', 'Cache-Control' => 'no-store']);
+            }
+
             return response()->json(['detail' => 'No active ChatGPT session token in pool'], 503);
         }
 
@@ -258,7 +265,7 @@ class BackendApiController extends Controller
             }
 
             $acceptStream = str_contains((string) $request->header('Accept', ''), 'text/event-stream')
-                || str_contains($path, 'conversation');
+                || ($request->isMethod('post') && in_array(trim($path, '/'), ['conversation', 'f/conversation'], true));
             $isBackgroundPoll = str_contains($path, 'celsius/ws') || str_contains($path, 'ws/user');
 
             $options = [
@@ -284,7 +291,9 @@ class BackendApiController extends Controller
                 $options['body'] = $request->getContent();
             }
 
+            $upstreamStarted = hrtime(true);
             $upstream = $this->http->request($request->method(), $requestUrl, $options);
+            $upstreamHeadersMs = round((hrtime(true) - $upstreamStarted) / 1_000_000, 1);
             $status = $upstream->getStatusCode();
 
             if ($status === 429 && $token instanceof MirrorToken) {
@@ -304,6 +313,7 @@ class BackendApiController extends Controller
                 $streamHeaders = $this->security->streamingHeaders((string) ($request->header('X-Request-Id') ?: ''));
                 $streamHeaders['Cache-Control'] = 'no-cache, no-transform';
                 $streamHeaders['Alt-Svc'] = 'clear';
+                $streamHeaders['Server-Timing'] = 'mirror_upstream_headers;dur='.$upstreamHeadersMs;
 
                 return response()->stream(function () use ($upstream, $status, $releaseOnce, $observer, $request, $path, $ctx): void {
                     $telemetry = [
@@ -319,16 +329,22 @@ class BackendApiController extends Controller
                         'bytes_sent' => 0,
                     ];
 
-                    if ($observer !== null) {
-                        $observer('started', $telemetry, $request, $path, $ctx);
-                    }
-
                     $lineBuffer = '';
+                    $transportSucceeded = false;
+                    $body = null;
                     try {
                         $body = $upstream->getBody();
+                        if ($observer !== null) {
+                            $observer('started', $telemetry, $request, $path, $ctx);
+                        }
+
                         while (!$body->eof()) {
                             $chunk = $body->read(1024);
                             if ($chunk === '') {
+                                if ($body->getMetadata('timed_out')) {
+                                    break;
+                                }
+
                                 continue;
                             }
 
@@ -338,6 +354,9 @@ class BackendApiController extends Controller
                                 @ob_flush();
                             }
                             @flush();
+                            if (connection_aborted()) {
+                                break;
+                            }
 
                             if ($observer !== null) {
                                 $lineBuffer .= $chunk;
@@ -356,6 +375,7 @@ class BackendApiController extends Controller
                             $this->inspectSseLine(trim($lineBuffer), $telemetry, $observer, $request, $path, $ctx);
                         }
 
+                        $transportSucceeded = $status < 400 && ($body->eof() || $telemetry['saw_done']);
                         $telemetry['image_count'] = $this->computeImageCount($telemetry);
 
                         if ($observer !== null) {
@@ -365,7 +385,11 @@ class BackendApiController extends Controller
                             $observer($eventType, $telemetry, $request, $path, $ctx);
                         }
                     } finally {
-                        $releaseOnce($status < 400);
+                        try {
+                            $body?->close();
+                        } finally {
+                            $releaseOnce($transportSucceeded);
+                        }
                     }
                 }, $status, $streamHeaders);
             }

@@ -26,6 +26,52 @@ use Symfony\Component\HttpFoundation\Response;
 
 class V22SaaSHooksTest extends TestCase
 {
+    public function test_saturated_workspace_exposes_a_retryable_busy_response(): void
+    {
+        Mirror::resolveWebContextUsing(fn () => ['meta' => ['pool_status' => 'busy']]);
+
+        $this->getJson('/backend-api/gizmos/snorlax/sidebar')
+            ->assertStatus(503)
+            ->assertHeader('Retry-After', '1')
+            ->assertHeader('X-UniGPT-Pool-Status', 'busy')
+            ->assertJsonPath('code', 'unigpt_pool_busy');
+    }
+
+    public function test_stream_releases_its_slot_when_the_start_observer_throws(): void
+    {
+        $mock = new MockHandler([new Psr7Response(200, ['Content-Type' => 'text/event-stream'], "data: [DONE]\n\n")]);
+        $this->app->instance(BackendApiController::class, new BackendApiController(
+            app(TokenPoolManager::class),
+            app(ChatGptClient::class),
+            app(BrowserPatchManager::class),
+            new Client(['handler' => HandlerStack::create($mock)]),
+        ));
+
+        $releases = [];
+        Mirror::resolveWebContextUsing(function () use (&$releases): array {
+            return [
+                'skip_token_pool' => true,
+                'release' => function (bool $success) use (&$releases): void {
+                    $releases[] = $success;
+                },
+            ];
+        });
+        Mirror::observeBackendStreamUsing(function (): void {
+            throw new \RuntimeException('Fixture observer failed');
+        });
+
+        $response = $this->postJson('/backend-api/f/conversation')->assertOk();
+        $this->assertNotNull($response->headers->get('Server-Timing'));
+        try {
+            ($response->baseResponse->getCallback())();
+            $this->fail('The start observer should throw.');
+        } catch (\RuntimeException $error) {
+            $this->assertSame('Fixture observer failed', $error->getMessage());
+        }
+
+        $this->assertSame([false], $releases);
+    }
+
     protected function tearDown(): void
     {
         Mirror::resetConfigurationHooks();
