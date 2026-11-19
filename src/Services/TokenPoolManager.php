@@ -59,9 +59,11 @@ class TokenPoolManager implements TokenPoolInterface
         $maxConcurrent = max(1, (int) config('mirror.pool.max_concurrent_per_token', 5));
         $strategy = (string) config('mirror.pool.strategy', 'least_busy');
 
+        $accountScoped = $accountId !== null && $accountId !== '' && $accountId !== 'default';
+
         if ($preferredTokenId !== null && $preferredTokenId !== '') {
             $preferred = MirrorToken::find($preferredTokenId);
-            if ($preferred && $preferred->isHealthy() && $preferred->active_requests < $maxConcurrent) {
+            if ($preferred && (!$accountScoped || $preferred->getEffectiveAccountId() === $accountId) && $preferred->isHealthy() && $preferred->active_requests < $maxConcurrent) {
                 if ($this->ensureTokenFreshness($preferred) && $preferred->tryAcquireSlot($maxConcurrent)) {
                     return $preferred;
                 }
@@ -77,21 +79,11 @@ class TokenPoolManager implements TokenPoolInterface
             })
             ->where('active_requests', '<', $maxConcurrent);
 
-        if ($accountId !== null && $accountId !== '' && $accountId !== 'default') {
+        if ($accountScoped) {
             $query->where('account_id', $accountId);
         }
 
         $tokens = $query->get();
-
-        // Fallback if specific account query had no matches (e.g. legacy null account_id token).
-        if ($tokens->isEmpty() && $accountId !== null && $accountId !== '' && $accountId !== 'default') {
-            $tokens = MirrorToken::whereIn('status', ['active', 'cooldown'])
-                ->where(function ($q): void {
-                    $q->whereNull('cooldown_until')->orWhere('cooldown_until', '<=', Carbon::now());
-                })
-                ->where('active_requests', '<', $maxConcurrent)
-                ->get();
-        }
 
         if ($tokens->isEmpty()) {
             return null;
@@ -197,7 +189,9 @@ class TokenPoolManager implements TokenPoolInterface
         }
 
         if (empty($token->session_token)) {
-            return !empty($token->access_token);
+            $expiresAt = $token->access_token_expires_at?->getTimestamp() ?? MirrorToken::decodeJwtExpiry($token->access_token);
+
+            return !empty($token->access_token) && ($expiresAt === null || $expiresAt > time());
         }
 
         $lockTtl = max(5, (int) config('mirror.cache.lock_ttl', 15));

@@ -112,4 +112,33 @@ class TokenPoolManagerTest extends TestCase
         $this->assertNotNull($fresh->cooldown_until);
         $this->assertTrue($fresh->cooldown_until->isFuture());
     }
+    public function test_explicit_account_scope_cannot_acquire_a_different_preferred_account(): void
+    {
+        $manager = new TokenPoolManager(Mockery::mock(TokenRefresher::class));
+        $other = MirrorToken::create([
+            'name' => 'Other account',
+            'session_token' => 'fixture-session',
+            'access_token' => 'fixture-access',
+            'account_id' => 'other',
+            'status' => 'active',
+        ]);
+
+        $this->assertNull($manager->acquireForAccount((string) $other->id, 'requested'));
+        $this->assertSame(0, $other->fresh()->active_requests);
+        $this->assertSame($other->id, $manager->acquire()?->id);
+    }
+
+    public function test_access_only_credentials_are_usable_until_actual_expiry(): void
+    {
+        $manager = new TokenPoolManager(Mockery::mock(TokenRefresher::class));
+        $token = new MirrorToken([
+            'access_token' => 'fixture-access',
+            'access_token_expires_at' => Carbon::now()->subMinute(),
+        ]);
+
+        $this->assertFalse($manager->ensureTokenFreshness($token));
+
+        $token->access_token_expires_at = Carbon::now()->addMinute();
+        $this->assertTrue($manager->ensureTokenFreshness($token));
+    }
 }
