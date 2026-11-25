@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Refatbd\LaravelChatGptMirror\Controllers;
 
 use GuzzleHttp\Client;
+use GuzzleHttp\Psr7\Response as UpstreamResponse;
 use Illuminate\Http\Request;
 use Illuminate\Routing\Controller;
 use Illuminate\Support\Facades\File;
@@ -85,14 +86,22 @@ class BrowserProxyController extends Controller
         $request->attributes->set('mirror_is_static_asset', $isStaticAsset);
 
         $rawRequestPath = '/' . ltrim($request->path(), '/');
+        if (str_starts_with($rawRequestPath, '/cdn/v2/assets/')) {
+            $targetPath = '/cdn' . substr($rawRequestPath, strlen('/cdn/v2'));
+        }
         $isCdnRoute = str_starts_with($targetPath, '/cdn/') || str_starts_with($rawRequestPath, '/cdn/');
         $isStaticGetOrHead = ($request->isMethod('get') || $request->isMethod('head')) && $isStaticAsset && !str_starts_with($targetPath, '/api/');
         $localOrigin = $this->security->resolveOrigin($request);
         $query = (string) ($request->server->get('QUERY_STRING') ?: (explode('?', (string) $request->server->get('REQUEST_URI', ''), 2)[1] ?? $request->getQueryString()));
         $assetsInRedis = (bool) config('mirror.cache.assets_in_redis', true) && $this->isRedisCacheDriver();
 
+        // The browser adds a retry nonce to force a fresh fetch without changing the CDN module.
+        if ($isCdnRoute && $isStaticGetOrHead && preg_match('#^/cdn/(?:v2/)?assets/[\w.-]+\.[a-f0-9]{8,64}\.m?js$#iD', $rawRequestPath) === 1) {
+            $query = implode('&', array_filter(explode('&', $query), static fn (string $param): bool => !str_starts_with($param, '__codex_import_retry=')));
+        }
+
         // Fast-path for cached public /cdn/* static assets BEFORE auth/token-pool/session DB queries.
-        if ($isCdnRoute && $isStaticGetOrHead) {
+        if ($isCdnRoute && $isStaticGetOrHead && !str_starts_with($rawRequestPath, '/cdn/v2/')) {
             $fastTargetPath = str_starts_with($targetPath, '/cdn/') ? substr($targetPath, 4) : $targetPath;
             $fastFullPath = $fastTargetPath . ($query ? '?' . $query : '');
             $fastCacheKey = md5($localOrigin . '||' . $fastFullPath);
@@ -121,12 +130,15 @@ class BrowserProxyController extends Controller
         $basePath = (string) ($ctx['base_path'] ?? '');
 
         try {
-            if (str_starts_with($targetPath, '/cdn/')) {
-                $baseOverride = ($remoteBase !== null && !empty($ctx['relay_cdn']))
+            if ($isCdnRoute) {
+                $relayCdn = $remoteBase !== null && !empty($ctx['relay_cdn']);
+                $baseOverride = $relayCdn
                     ? $remoteBase
                     : 'https://cdn.oaistatic.com';
-                if (!(!empty($ctx['relay_cdn']) && $remoteBase !== null)) {
+                if (!$relayCdn && str_starts_with($targetPath, '/cdn/')) {
                     $targetPath = substr($targetPath, 4);
+                } elseif ($relayCdn && !str_starts_with($targetPath, '/cdn/')) {
+                    $targetPath = '/cdn' . $targetPath;
                 }
             } else {
                 $baseOverride = $remoteBase;
@@ -138,7 +150,8 @@ class BrowserProxyController extends Controller
             $assetsMaxBytes = max(1024, (int) config('mirror.cache.assets_redis_max_bytes', 262144));
 
             if ($isStaticGetOrHead) {
-                $cacheKey = md5($localOrigin . '|' . $basePath . '|' . ($baseOverride ?: '') . $fullPath);
+                $assetVariant = config('mirror.browser.proxy_cdn_assets', false) ? 'proxy' : 'direct';
+                $cacheKey = md5('v2|' . $assetVariant . '|' . $localOrigin . '|' . $basePath . '|' . ($baseOverride ?: '') . $fullPath);
                 $redisKey = 'asset:' . $cacheKey;
 
                 $cacheDir = storage_path('framework/mirror-assets');
@@ -172,6 +185,9 @@ class BrowserProxyController extends Controller
             }
 
             if (!$token && empty($ctx['skip_token_pool']) && !empty($ctx['meta']['fail_on_missing_token'])) {
+                if (($ctx['meta']['pool_status'] ?? null) === 'busy') {
+                    return $this->workspaceBusyResponse($request, $ctx);
+                }
                 return response()->json([
                     'error' => 'No active workspace session token is currently available on this server.',
                 ], 503);
@@ -184,7 +200,10 @@ class BrowserProxyController extends Controller
             $deepReferer = 'https://' . $upstreamHost . '/';
             if ($clientReferer && is_string($clientReferer)) {
                 $refParts = parse_url($clientReferer);
-                $deepReferer = 'https://' . $upstreamHost . ($refParts['path'] ?? '/') . (!empty($refParts['query']) ? '?' . $refParts['query'] : '');
+                $refPath = $refParts['path'] ?? '/';
+                if (!str_starts_with($refPath, '/_unigpt/')) {
+                    $deepReferer = 'https://' . $upstreamHost . $refPath . (!empty($refParts['query']) ? '?' . $refParts['query'] : '');
+                }
             }
 
             $headers = [
@@ -223,10 +242,15 @@ class BrowserProxyController extends Controller
                 }
                 $clientCookie = $request->header('Cookie');
                 if ($clientCookie) {
-                    $filtered = preg_replace('/(?:^|;\s*)mirror_control=[^;]*/i', '', $clientCookie);
-                    $filtered = trim((string) $filtered, "; \t");
-                    if ($filtered !== '') {
-                        $cookies[] = $filtered;
+                    $localNames = ['mirror_control', 'unigpt_proxy_session', 'unigpt_device_uuid', 'xsrf-token', strtolower((string) config('session.cookie'))];
+                    foreach (explode(';', $clientCookie) as $cookie) {
+                        $cookie = trim($cookie);
+                        $name = strtolower(trim(explode('=', $cookie, 2)[0]));
+                        if (!in_array($name, $localNames, true)
+                            && !str_starts_with($name, 'remember_')
+                            && !preg_match('/^(?:__secure-|__host-)?next-auth\.session-token(?:\.\d+)?$/D', $name)) {
+                            $cookies[] = $cookie;
+                        }
                     }
                 }
                 if ($cookies !== []) {
@@ -257,9 +281,48 @@ class BrowserProxyController extends Controller
             }
 
             $upstreamUrl = $baseOverride ? (rtrim($baseOverride, '/') . $fullPath) : $fullPath;
-            $response = $this->http->request($request->method(), $upstreamUrl, $options);
+            // Cache only anonymous, fingerprinted assets from the official CDN before origin rewriting.
+            $rawAssetFile = $request->isMethod('get') && $isCdnRoute && $remoteBase === null
+                && $baseOverride === 'https://cdn.oaistatic.com' && $query === ''
+                && $options['verify'] && empty($ctx['upstream_headers']) && !$request->headers->has('Range')
+                && preg_match('#^/assets/(?:async/)?[\w.-]*[a-f0-9]{8,64}\.(?:m?js|css)$#iD', $targetPath) === 1
+                ? storage_path('framework/mirror-assets/raw-v2-' . hash('sha256', $targetPath))
+                : null;
+            $response = $rawAssetFile === null ? null : $this->readPublicCdnAsset($rawAssetFile);
+            $miss = $response === null;
+            if ($rawAssetFile !== null) {
+                $options['headers'] = [
+                    'User-Agent' => $headers['User-Agent'],
+                    'Accept' => '*/*',
+                    'Origin' => 'https://chatgpt.com',
+                    'Referer' => 'https://chatgpt.com/',
+                ];
+            }
+            $response ??= $this->http->request($request->method(), $upstreamUrl, $options);
             $status = $response->getStatusCode();
             $body = (string) $response->getBody();
+            if ($miss && $rawAssetFile !== null && $status === 200) {
+                $type = $response->getHeaderLine('Content-Type');
+                $cacheControl = $response->getHeaderLine('Cache-Control');
+                if (preg_match('#^(?:application/(?:x-)?(?:java|ecma)script|text/(?:javascript|css))(?:\s*;|$)#i', $type)
+                    && preg_match('/\bpublic\b/i', $cacheControl)
+                    && !preg_match('/\b(?:private|no-store|no-cache)\b/i', $cacheControl)
+                    && preg_match('/(?:^|,\s*)max-age\s*=\s*([1-9][0-9]*)\b/i', $cacheControl, $age) === 1
+                    && !preg_match('/(?:^|,\s*)s-maxage\s*=\s*0(?:\s*,|\s*$)/i', $cacheControl)
+                    && preg_match('/^(?:(?:accept-encoding|origin)(?:\s*,\s*|$))*$/iD', $response->getHeaderLine('Vary')) === 1
+                    && !str_contains($type, "\n") && $body !== '' && strlen($body) <= 8 * 1024 * 1024) {
+                    try {
+                        File::ensureDirectoryExists(dirname($rawAssetFile));
+                        $metadata = json_encode([
+                            'type' => $type,
+                            'expires' => time() + min($assetsTtl, (int) $age[1]),
+                        ], JSON_THROW_ON_ERROR);
+                        File::replace($rawAssetFile, $metadata . "\n" . $body);
+                    } catch (\Throwable) {
+                        // Asset delivery can continue when the local cache is unavailable.
+                    }
+                }
+            }
 
             $rawHeaders = [];
             foreach ($response->getHeaders() as $k => $vals) {
@@ -283,6 +346,11 @@ class BrowserProxyController extends Controller
             }
 
             $contentType = (string) ($cleanedHeaders['Content-Type'] ?? $cleanedHeaders['content-type'] ?? $this->guessMimeType($targetPath));
+
+            if ($isCdnRoute && $isStaticGetOrHead && $status !== 200 && $status !== 304) {
+                $cleanedHeaders['Cache-Control'] = 'no-store';
+                return response($body, $status, $cleanedHeaders);
+            }
 
             if (stripos($contentType, 'text/html') !== false) {
                 $body = $this->patcher->patchHtml($body, $localOrigin, $basePath, $remoteBase);
@@ -308,7 +376,7 @@ class BrowserProxyController extends Controller
                 stripos($contentType, 'application/json') !== false
             ) {
                 $body = $this->rewriter->rewriteText($body, $localOrigin, $contentType, $remoteBase, $basePath);
-                if ($isCdnRoute && $isStaticGetOrHead) {
+                if ($isCdnRoute && $isStaticGetOrHead && $status === 200) {
                     $cleanedHeaders['Cache-Control'] = $this->staticCacheControl($targetPath, $contentType, true);
                     unset($cleanedHeaders['Set-Cookie'], $cleanedHeaders['set-cookie'], $cleanedHeaders['Pragma'], $cleanedHeaders['pragma'], $cleanedHeaders['Expires'], $cleanedHeaders['expires']);
                 } else {
@@ -329,8 +397,8 @@ class BrowserProxyController extends Controller
 
                 try {
                     File::ensureDirectoryExists(dirname($cacheFile));
-                    File::put($cacheFile, $body);
-                    File::put($metaFile, json_encode(['content_type' => $contentType]));
+                    File::replace($cacheFile, $body);
+                    File::replace($metaFile, json_encode(['content_type' => $contentType]));
                 } catch (\Throwable) {
                 }
             }
@@ -345,14 +413,74 @@ class BrowserProxyController extends Controller
         }
     }
 
-    protected function staticCacheControl(string $targetPath, string $contentType, bool $isCdnRoute): string
+    private function workspaceBusyResponse(Request $request, array $ctx): Response
     {
-        if ($isCdnRoute) {
-            $isJson = str_ends_with(strtolower($targetPath), '.json') || stripos($contentType, 'application/json') !== false;
-            return $isJson ? 'public, max-age=86400' : 'public, max-age=604800, immutable';
+        $headers = ['Retry-After' => '1', 'X-UniGPT-Pool-Status' => 'busy', 'Cache-Control' => 'private, no-store'];
+        if (!$request->isMethod('get') || $request->expectsJson() || !str_contains((string) $request->header('Accept'), 'text/html')) {
+            return response()->json([
+                'error' => 'This workspace is busy. Please try again in a moment.',
+                'code' => 'unigpt_pool_busy',
+            ], 503, $headers);
         }
 
-        return str_contains($contentType, 'javascript') ? 'no-store' : 'public, max-age=86400';
+        $wait = max(0, min(60, (int) ($ctx['meta']['pool_busy_wait_seconds'] ?? 0)));
+        $page = <<<HTML
+        <!doctype html><html lang="en"><meta charset="utf-8"><title>Workspace busy</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <style>body{font:1rem system-ui;margin:10vh auto;padding:0 1rem;max-width:32rem}button{font:inherit;padding:.4rem .7rem}</style>
+        <body data-wait="{$wait}">
+        <h1>Workspace busy</h1><p role="status">The workspace is handling other requests.</p>
+        <button type="button" onclick="location.reload()">Try again</button>
+        <script>
+        try {
+            const key = 'mirror.workspace-busy';
+            const path = location.pathname + location.search;
+            const now = Date.now();
+            const old = JSON.parse(sessionStorage.getItem(key) || 'null');
+            const run = old?.path === path && now - old.started < 120000 ? old : {path, started: now, count: 0};
+            const delay = Math.min(1000 + run.count * 500, 4000);
+            if (now - run.started + delay <= Number(document.body.dataset.wait) * 1000) {
+                run.count++;
+                sessionStorage.setItem(key, JSON.stringify(run));
+                document.querySelector('[role=status]').textContent = 'Retrying this page…';
+                setTimeout(() => location.reload(), delay);
+            }
+        } catch {}
+        </script></body></html>
+        HTML;
+
+        return response($page, 503, $headers + ['Content-Type' => 'text/html; charset=utf-8']);
+    }
+
+    protected function staticCacheControl(string $targetPath, string $contentType, bool $isCdnRoute): string
+    {
+        if (preg_match('#\.(?:m?js|css|json)$#iD', $targetPath) === 1
+            || preg_match('#javascript|ecmascript|text/css|application/(?:[a-z0-9.+-]+\+)?json#i', $contentType) === 1
+        ) {
+            return 'no-store';
+        }
+
+        if ($isCdnRoute) {
+            return 'public, max-age=604800, immutable';
+        }
+
+        return 'public, max-age=86400';
+    }
+
+    private function readPublicCdnAsset(string $path): ?UpstreamResponse
+    {
+        $cached = @file_get_contents($path);
+        if (!is_string($cached) || !str_contains($cached, "\n")) {
+            return null;
+        }
+
+        [$header, $body] = explode("\n", $cached, 2);
+        $metadata = json_decode($header, true);
+        if (!is_string($metadata['type'] ?? null) || ($metadata['expires'] ?? 0) <= time()) {
+            return null;
+        }
+
+        return new UpstreamResponse(200, ['Content-Type' => $metadata['type']], $body);
     }
 
     protected function isRedisCacheDriver(): bool

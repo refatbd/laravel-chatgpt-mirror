@@ -168,6 +168,7 @@ class BackendApiController extends Controller
         $token = $ctx['token'];
         if (!$token && empty($ctx['skip_token_pool'])) {
             if (($ctx['meta']['pool_status'] ?? null) === 'busy') {
+                $request->attributes->set('unigpt_local_pool_busy', true);
                 return response()->json([
                     'detail' => 'This workspace is busy. Please try again in a moment.',
                     'code' => 'unigpt_pool_busy',
@@ -267,6 +268,8 @@ class BackendApiController extends Controller
             $acceptStream = str_contains((string) $request->header('Accept', ''), 'text/event-stream')
                 || ($request->isMethod('post') && in_array(trim($path, '/'), ['conversation', 'f/conversation'], true));
             $isBackgroundPoll = str_contains($path, 'celsius/ws') || str_contains($path, 'ws/user');
+            $writer = $request->attributes->get('mirror_live_reply_writer');
+            $streamTimeout = max(0, (int) config('mirror.server.stream_max_execution_time', 300));
 
             $options = [
                 'headers' => $headers,
@@ -284,7 +287,10 @@ class BackendApiController extends Controller
             } elseif (!$acceptStream) {
                 $options['timeout'] = (float) config('mirror.http.timeout', 15);
             } else {
-                $options['read_timeout'] = (float) config('mirror.http.read_timeout', 120);
+                $options['timeout'] = min(120, (float) config('mirror.http.timeout', 120));
+                $options['read_timeout'] = is_callable($writer) && $streamTimeout > 0
+                    ? min(2100, $streamTimeout)
+                    : (float) config('mirror.http.read_timeout', 120);
             }
 
             if ($request->isMethod('post') || $request->isMethod('put') || $request->isMethod('patch')) {
@@ -311,11 +317,16 @@ class BackendApiController extends Controller
             if (stripos($contentType, 'text/event-stream') !== false) {
                 $observer = Mirror::resolveBackendStreamObserver();
                 $streamHeaders = $this->security->streamingHeaders((string) ($request->header('X-Request-Id') ?: ''));
-                $streamHeaders['Cache-Control'] = 'no-cache, no-transform';
+                $streamHeaders['Cache-Control'] = 'private, no-store, no-transform';
                 $streamHeaders['Alt-Svc'] = 'clear';
                 $streamHeaders['Server-Timing'] = 'mirror_upstream_headers;dur='.$upstreamHeadersMs;
+                $relay = is_callable($writer);
+                if ($relay) {
+                    $streamHeaders['Content-Type'] = 'application/octet-stream';
+                    $streamHeaders['X-UniGPT-Live-Relay'] = '1';
+                }
 
-                return response()->stream(function () use ($upstream, $status, $releaseOnce, $observer, $request, $path, $ctx): void {
+                return response()->stream(function () use ($upstream, $status, $releaseOnce, $observer, $request, $path, $ctx, $writer, $relay, $streamTimeout): void {
                     $telemetry = [
                         'status' => $status,
                         'conversation_id' => null,
@@ -332,29 +343,43 @@ class BackendApiController extends Controller
                     $lineBuffer = '';
                     $transportSucceeded = false;
                     $body = null;
+                    $keepRunning = $relay;
+                    $previousAbortMode = $keepRunning ? ignore_user_abort(true) : null;
+                    $deadline = $streamTimeout > 0 ? microtime(true) + $streamTimeout : INF;
+                    @set_time_limit(0);
+                    $write = static function (string $event, string $chunk, array $telemetry) use (&$writer): void {
+                        if (!is_callable($writer)) {
+                            return;
+                        }
+                        try {
+                            $writer($event, $chunk, $telemetry);
+                        } catch (\Throwable $error) {
+                            report($error);
+                            $writer = null;
+                        }
+                    };
                     try {
                         $body = $upstream->getBody();
+                        $write('started', '', $telemetry);
                         if ($observer !== null) {
                             $observer('started', $telemetry, $request, $path, $ctx);
                         }
 
-                        while (!$body->eof()) {
+                        while (!$body->eof() && microtime(true) < $deadline) {
                             $chunk = $body->read(1024);
                             if ($chunk === '') {
-                                if ($body->getMetadata('timed_out')) {
-                                    break;
+                                break;
+                            }
+
+                            if (!$relay && !connection_aborted()) {
+                                $telemetry['bytes_sent'] += strlen($chunk);
+                                echo $chunk;
+                                if (ob_get_level() > 0) {
+                                    @ob_flush();
                                 }
-
-                                continue;
+                                @flush();
                             }
-
-                            $telemetry['bytes_sent'] += strlen($chunk);
-                            echo $chunk;
-                            if (ob_get_level() > 0) {
-                                @ob_flush();
-                            }
-                            @flush();
-                            if (connection_aborted()) {
+                            if (connection_aborted() && (!$keepRunning || !is_callable($writer))) {
                                 break;
                             }
 
@@ -369,6 +394,7 @@ class BackendApiController extends Controller
                                     $this->inspectSseLine($line, $telemetry, $observer, $request, $path, $ctx);
                                 }
                             }
+                            $write('chunk', $chunk, $telemetry);
                         }
 
                         if ($observer !== null && trim($lineBuffer) !== '') {
@@ -386,9 +412,16 @@ class BackendApiController extends Controller
                         }
                     } finally {
                         try {
+                            $write($transportSucceeded ? 'completed' : 'failed', '', $telemetry);
                             $body?->close();
                         } finally {
-                            $releaseOnce($transportSucceeded);
+                            try {
+                                $releaseOnce($transportSucceeded);
+                            } finally {
+                                if ($previousAbortMode !== null) {
+                                    ignore_user_abort((bool) $previousAbortMode);
+                                }
+                            }
                         }
                     }
                 }, $status, $streamHeaders);

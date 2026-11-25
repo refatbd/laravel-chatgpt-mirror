@@ -30,7 +30,10 @@ class RefreshTokensCommand extends Command
         foreach ($tokens as $token) {
             if ($force || $token->needsRefresh()) {
                 try {
-                    $refresher->refresh($token);
+                    if (!$refresher->refresh($token)) {
+                        $this->warn("  ✗ Token #{$token->id} refresh failed.");
+                        continue;
+                    }
                     $this->line("  ✓ Token #{$token->id} ({$token->email}) refreshed successfully.");
                     $refreshed++;
                 } catch (Throwable $e) {

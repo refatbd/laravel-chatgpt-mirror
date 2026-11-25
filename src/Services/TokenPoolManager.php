@@ -56,14 +56,16 @@ class TokenPoolManager implements TokenPoolInterface
     {
         $this->releaseExpiredCooldowns();
 
-        $maxConcurrent = max(1, (int) config('mirror.pool.max_concurrent_per_token', 5));
+        $maxConcurrent = config('mirror.pool.enforce_token_concurrency', true)
+            ? max(1, (int) config('mirror.pool.max_concurrent_per_token', 5)) : null;
         $strategy = (string) config('mirror.pool.strategy', 'least_busy');
 
         $accountScoped = $accountId !== null && $accountId !== '' && $accountId !== 'default';
 
         if ($preferredTokenId !== null && $preferredTokenId !== '') {
             $preferred = MirrorToken::find($preferredTokenId);
-            if ($preferred && (!$accountScoped || $preferred->getEffectiveAccountId() === $accountId) && $preferred->isHealthy() && $preferred->active_requests < $maxConcurrent) {
+            if ($preferred && (!$accountScoped || $preferred->getEffectiveAccountId() === $accountId)
+                && $preferred->isHealthy() && ($maxConcurrent === null || $preferred->active_requests < $maxConcurrent)) {
                 if ($this->ensureTokenFreshness($preferred) && $preferred->tryAcquireSlot($maxConcurrent)) {
                     return $preferred;
                 }
@@ -77,7 +79,7 @@ class TokenPoolManager implements TokenPoolInterface
                 $q->whereNull('cooldown_until')
                     ->orWhere('cooldown_until', '<=', Carbon::now());
             })
-            ->where('active_requests', '<', $maxConcurrent);
+            ->when($maxConcurrent !== null, fn ($query) => $query->where('active_requests', '<', $maxConcurrent));
 
         if ($accountScoped) {
             $query->where('account_id', $accountId);

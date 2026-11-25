@@ -2,6 +2,19 @@
 
 All notable changes to `refatbd/laravel-chatgpt-mirror` will be documented in this file.
 
+## [2.2.5] - 2026-11-25
+
+### Added
+- Added a live-reply stream writer hook for host applications that run chat replies in background workers.
+- Added a shared server-side cache for eligible fingerprinted CDN scripts and stylesheets. URL rewriting still runs for each proxy origin.
+- Made the per-token concurrency ceiling optional through `mirror.pool.enforce_token_concurrency`, which defaults to enabled.
+
+### Fixed
+- Kept browser route modules on the proxy origin, handled module retry requests, and prevented CDN error responses from being cached.
+- Returned a retry response for busy workspaces and exposed a request marker when the local token pool rejected a request before it reached upstream.
+- Kept local session, remember-me, and CSRF cookies out of upstream browser requests and supplied a non-secret browser session placeholder.
+- Distinguished explicit token rejection from other refresh failures and corrected the refresh command's success reporting.
+
 ## [2.2.1] - 2026-11-13
 
 ### Added

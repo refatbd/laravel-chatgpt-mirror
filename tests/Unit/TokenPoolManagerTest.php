@@ -5,6 +5,10 @@ declare(strict_types=1);
 namespace Refatbd\LaravelChatGptMirror\Tests\Unit;
 
 use Carbon\Carbon;
+use GuzzleHttp\Client;
+use GuzzleHttp\Handler\MockHandler;
+use GuzzleHttp\HandlerStack;
+use GuzzleHttp\Psr7\Response;
 use Mockery;
 use Refatbd\LaravelChatGptMirror\Models\MirrorToken;
 use Refatbd\LaravelChatGptMirror\Services\TokenPoolManager;
@@ -13,6 +17,66 @@ use Refatbd\LaravelChatGptMirror\Tests\TestCase;
 
 class TokenPoolManagerTest extends TestCase
 {
+    public function test_refresh_keeps_the_account_active_on_upstream_forbidden_response(): void
+    {
+        $token = MirrorToken::create([
+            'name' => 'Retryable Token',
+            'session_token' => 'retryable-session',
+            'status' => 'active',
+        ]);
+
+        $http = new Client([
+            'handler' => HandlerStack::create(new MockHandler([
+                new Response(403, ['Content-Type' => 'application/json'], '{"error":"Unavailable"}'),
+                new Response(401, ['Content-Type' => 'application/json'], '{}'),
+            ])),
+            'http_errors' => false,
+        ]);
+        $refresher = new class($http) extends TokenRefresher
+        {
+            public function __construct(Client $http)
+            {
+                $this->http = $http;
+            }
+        };
+
+        $this->assertFalse($refresher->refresh($token));
+        $this->assertSame('active', $token->refresh()->status);
+        $this->assertSame('Upstream session refresh failed with HTTP 403', $token->last_error);
+
+        $this->assertFalse($refresher->refresh($token));
+        $this->assertSame('expired', $token->refresh()->status);
+    }
+
+    public function test_a_successful_session_refresh_cannot_reactivate_a_revoked_access_token(): void
+    {
+        $token = MirrorToken::create([
+            'name' => 'Revoked Token',
+            'session_token' => 'revoked-session',
+            'status' => 'active',
+        ]);
+
+        $http = new Client([
+            'handler' => HandlerStack::create(new MockHandler([
+                new Response(200, ['Content-Type' => 'application/json'], '{"accessToken":"revoked-access"}'),
+                new Response(401, ['Content-Type' => 'application/json'], '{"detail":{"code":"token_revoked"}}'),
+            ])),
+            'http_errors' => false,
+        ]);
+        $refresher = new class($http) extends TokenRefresher
+        {
+            public function __construct(Client $http)
+            {
+                $this->http = $http;
+            }
+        };
+
+        $this->assertFalse($refresher->refresh($token));
+        $this->assertSame(401, $refresher->lastVerificationStatus());
+        $this->assertSame('expired', $token->refresh()->status);
+        $this->assertNull($token->access_token);
+    }
+
     public function test_least_busy_strategy_picks_token_with_fewest_active_requests(): void
     {
         $refresher = Mockery::mock(TokenRefresher::class);
@@ -57,6 +121,28 @@ class TokenPoolManagerTest extends TestCase
         // Release token
         $manager->release($acquired, true);
         $this->assertEquals(0, $acquired->fresh()->active_requests);
+    }
+
+    public function test_request_ceiling_can_be_disabled_without_skipping_token_health(): void
+    {
+        config(['mirror.pool.max_concurrent_per_token' => 1]);
+        $token = MirrorToken::create([
+            'name' => 'Capacity test token',
+            'session_token' => 'fixture-session-token',
+            'access_token' => 'fixture-access-token',
+            'access_token_expires_at' => Carbon::now()->addHour(),
+            'status' => 'active',
+            'active_requests' => 1,
+        ]);
+        $pool = new TokenPoolManager(Mockery::mock(TokenRefresher::class));
+
+        $this->assertNull($pool->acquire());
+        config(['mirror.pool.enforce_token_concurrency' => false]);
+        $this->assertSame($token->id, $pool->acquire()?->id);
+        $this->assertSame(2, $token->refresh()->active_requests);
+
+        $token->update(['status' => 'cooldown', 'cooldown_until' => Carbon::now()->addMinute()]);
+        $this->assertNull($pool->acquire());
     }
 
     public function test_it_skips_tokens_in_cooldown(): void

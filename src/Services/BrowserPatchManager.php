@@ -129,6 +129,7 @@ class BrowserPatchManager
         $jsonOrigin = json_encode(rtrim($localOrigin, '/'), JSON_UNESCAPED_SLASHES);
         $jsonBasePath = json_encode($normalizedBase, JSON_UNESCAPED_SLASHES);
         $jsonExtraOrigin = json_encode(rtrim($extraUpstreamOrigin, '/'), JSON_UNESCAPED_SLASHES);
+        $proxyCdnAssets = config('mirror.browser.proxy_cdn_assets', false) ? 'true' : 'false';
         $backendPrefix = json_encode('/' . trim((string) config('mirror.routes.backend_prefix', 'backend-api'), '/') . '/', JSON_UNESCAPED_SLASHES);
 
         return <<<HTML
@@ -151,7 +152,9 @@ class BrowserPatchManager
         u = localOrigin + u.slice(extraUpstream.length);
       }
       u = u.replace(/^https:\/\/(?:[a-z0-9-]+\.)*(?:chat\.openai\.com|chatgpt\.com)/i, localOrigin);
-      u = u.replace(/^https:\/\/cdn\.oaistatic\.com/i, localOrigin + '/cdn');
+      if ({$proxyCdnAssets} || /\.(?:m?js|css|json)(?:[?#]|$)/i.test(u)) {
+        u = u.replace(/^https:\/\/cdn\.oaistatic\.com\/assets\//i, localOrigin + '/cdn/v2/assets/');
+      }
       u = u.replace(/^wss:\/\/(?:[a-z0-9-]+\.)*(?:chat\.openai\.com|chatgpt\.com)/i, localWs);
       if (basePath) {
         if (u.indexOf('/backend-api/') === 0 || u.indexOf('/api/') === 0 || u.indexOf('/public-api/') === 0 || u.indexOf('/cdn/') === 0) {
@@ -294,11 +297,12 @@ class BrowserPatchManager
       });
     }
 
-    // Remove the script element so Next.js / React hydration does not observe DOM mismatch.
+  } catch (_err) {} finally {
+    // Remove the script element so React hydration does not observe a DOM mismatch.
     if (document.currentScript && document.currentScript.parentNode) {
       document.currentScript.parentNode.removeChild(document.currentScript);
     }
-  } catch (_err) {}
+  }
 })();
 </script>
 HTML;

@@ -229,7 +229,7 @@ class MirrorToken extends Model
      * Atomically claim one in-flight concurrency slot only if healthy & below maxConcurrent.
      * Prevents multi-worker PHP-FPM / Octane race conditions exceeding max_concurrent_per_token.
      */
-    public function tryAcquireSlot(int $maxConcurrent): bool
+    public function tryAcquireSlot(?int $maxConcurrent): bool
     {
         $now = Carbon::now();
 
@@ -239,7 +239,7 @@ class MirrorToken extends Model
                 $q->whereNull('cooldown_until')
                     ->orWhere('cooldown_until', '<=', $now);
             })
-            ->where('active_requests', '<', $maxConcurrent)
+            ->when($maxConcurrent !== null, fn ($query) => $query->where('active_requests', '<', $maxConcurrent))
             ->update([
                 'active_requests' => DB::raw('active_requests + 1'),
                 'status' => 'active',

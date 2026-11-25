@@ -122,6 +122,9 @@ class TokenRefresher
 
             // Confirm via /backend-api/me to resolve accurate accountId/email when available.
             $me = $this->fetchMe($accessToken, $accountId ? (string) $accountId : null);
+            if ($this->lastVerificationExplicitReject) {
+                return null;
+            }
             if (is_array($me)) {
                 $email = $email ?: (isset($me['email']) ? (string) $me['email'] : null);
                 $name = $name ?: (isset($me['name']) ? (string) $me['name'] : null);
@@ -166,6 +169,8 @@ class TokenRefresher
      */
     public function refresh(MirrorToken $token): bool
     {
+        $this->lastVerificationStatus = null;
+        $this->lastVerificationExplicitReject = false;
         $sessionToken = $token->session_token;
         if (empty($sessionToken)) {
             $token->update([
@@ -183,6 +188,7 @@ class TokenRefresher
             ]);
 
             $status = $response->getStatusCode();
+            $this->lastVerificationStatus = $status;
             $rotated = $this->extractRotatedSessionToken($response->getHeader('Set-Cookie'));
             $body = (string) $response->getBody();
             $data = json_decode($body, true);
@@ -193,12 +199,12 @@ class TokenRefresher
                     'status' => $status,
                 ]);
 
-                if ($status === 401 || $status === 403 || (is_array($data) && empty($data['accessToken']))) {
-                    $token->update([
-                        'status' => 'expired',
-                        'last_error' => "Upstream session refresh failed with HTTP {$status}",
-                    ]);
+                $updates = ['last_error' => "Upstream session refresh failed with HTTP {$status}"];
+                if ($status === 401 || ($status === 200 && is_array($data) && empty($data['accessToken']))) {
+                    $this->lastVerificationExplicitReject = true;
+                    $updates['status'] = 'expired';
                 }
+                $token->update($updates);
 
                 return false;
             }
@@ -207,12 +213,21 @@ class TokenRefresher
             $expiresAt = $this->resolveExpiry($accessToken, $data['expires'] ?? null);
             $user = is_array($data['user'] ?? null) ? $data['user'] : [];
             $account = is_array($data['account'] ?? null) ? $data['account'] : [];
+            $accountId = $account['id'] ?? $user['id'] ?? $token->account_id;
+            $this->fetchMe($accessToken, $accountId ? (string) $accountId : null);
+            if ($this->lastVerificationExplicitReject) {
+                $token->update([
+                    'status' => 'expired',
+                    'last_error' => 'Refreshed access token was rejected by upstream (HTTP 401)',
+                ]);
+                return false;
+            }
 
             $updates = [
                 'access_token' => $accessToken,
                 'access_token_expires_at' => $expiresAt,
                 'email' => $user['email'] ?? $token->email,
-                'account_id' => $account['id'] ?? $user['id'] ?? $token->account_id,
+                'account_id' => $accountId,
                 'plan_type' => $account['planType'] ?? $token->plan_type ?? 'free',
                 'status' => 'active',
                 'consecutive_errors' => 0,
@@ -228,6 +243,7 @@ class TokenRefresher
             $token->update($updates);
             return true;
         } catch (\Throwable $e) {
+            $this->lastVerificationStatus = 0;
             Log::error('Mirror TokenRefresher exception', [
                 'token_id' => $token->id,
                 'error' => $e->getMessage(),
@@ -243,6 +259,8 @@ class TokenRefresher
      */
     public function fetchMe(string $accessToken, ?string $accountId = null): ?array
     {
+        $this->lastVerificationStatus = null;
+        $this->lastVerificationExplicitReject = false;
         try {
             $headers = [
                 'Authorization' => 'Bearer ' . $accessToken,
@@ -252,13 +270,16 @@ class TokenRefresher
             }
 
             $res = $this->http->get('/backend-api/me', ['headers' => $headers]);
-            if ($res->getStatusCode() !== 200) {
+            $this->lastVerificationStatus = $res->getStatusCode();
+            $this->lastVerificationExplicitReject = $this->lastVerificationStatus === 401;
+            if ($this->lastVerificationStatus !== 200) {
                 return null;
             }
 
             $decoded = json_decode((string) $res->getBody(), true);
             return is_array($decoded) ? $decoded : null;
         } catch (\Throwable) {
+            $this->lastVerificationStatus = 0;
             return null;
         }
     }

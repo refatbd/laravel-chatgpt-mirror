@@ -21,10 +21,15 @@ class UrlRewriterAndRichOutputTest extends TestCase
         $out = $rewriter->rewriteText($input, 'http://127.0.0.1:8000', 'text/html');
 
         $this->assertStringContainsString('http:\\/\\/127.0.0.1:8000\\/backend-api', $out);
-        $this->assertStringContainsString('http://127.0.0.1:8000/cdn/assets/app.js', $out);
+        $this->assertStringContainsString('http://127.0.0.1:8000/cdn/v2/assets/app.js', $out);
         $this->assertStringContainsString('ws://127.0.0.1:8000/ws', $out);
         $this->assertStringContainsString('"accessToken":"' . UrlRewriter::BROWSER_TOKEN . '"', $out);
         $this->assertStringNotContainsString('eyJhbGciOiJSUzI1NiJ9', $out);
+
+        $image = '<link href="/cdn/assets/favicon.svg">';
+        $this->assertStringContainsString('https://cdn.oaistatic.com/assets/favicon.svg', $rewriter->rewriteText($image, 'http://127.0.0.1:8000'));
+        config(['mirror.browser.proxy_cdn_assets' => true]);
+        $this->assertStringContainsString('http://127.0.0.1:8000/cdn/v2/assets/favicon.svg', $rewriter->rewriteText(str_replace('href="/', 'href="https://chatgpt.com/', $image), 'http://127.0.0.1:8000'));
     }
 
     public function test_url_rewriter_rewrites_subdomains_like_ab_chatgpt_and_disables_datadog_init(): void

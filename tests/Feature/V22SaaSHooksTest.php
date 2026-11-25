@@ -26,6 +26,46 @@ use Symfony\Component\HttpFoundation\Response;
 
 class V22SaaSHooksTest extends TestCase
 {
+    public function test_fingerprinted_cdn_script_is_fetched_once_and_rewritten_per_host(): void
+    {
+        $history = [];
+        $handler = HandlerStack::create(new MockHandler([
+            new Psr7Response(200, [
+                'Content-Type' => 'application/javascript',
+                'Cache-Control' => 'public, max-age=3600',
+            ], 'const endpoint = "https://chatgpt.com/backend-api/conversations";'),
+        ]));
+        $handler->push(Middleware::history($history));
+        $this->app->instance(Client::class, new Client(['handler' => $handler]));
+        Mirror::resolveWebContextUsing(fn () => ['skip_token_pool' => true]);
+        $name = 'async/cdn-qa.' . bin2hex(random_bytes(5)) . '.js';
+        foreach (['localhost:8100', 'localhost:8101'] as $host) {
+            $request = Request::create("http://{$host}/cdn/v2/assets/{$name}");
+            $response = app(BrowserProxyController::class)->proxy($request, "v2/assets/{$name}");
+            $this->assertSame(200, $response->getStatusCode());
+            $this->assertStringContainsString("http://{$host}/backend-api/conversations", $response->getContent());
+        }
+        $this->assertCount(1, $history);
+    }
+
+    public function test_cdn_module_retry_preserves_other_query_fields_without_caching_an_upstream_error(): void
+    {
+        $history = [];
+        $handler = HandlerStack::create(new MockHandler([
+            new Psr7Response(503, ['Content-Type' => 'application/javascript'], 'temporarily unavailable'),
+        ]));
+        $handler->push(Middleware::history($history));
+        $this->app->instance(Client::class, new Client(['handler' => $handler, 'http_errors' => false]));
+        Mirror::resolveWebContextUsing(fn () => ['skip_token_pool' => true]);
+
+        $request = Request::create('http://localhost/cdn/v2/assets/unique-module.1234abcd.js?v=2&__codex_import_retry=123-1');
+        $response = app(BrowserProxyController::class)->proxy($request, 'v2/assets/unique-module.1234abcd.js');
+
+        $this->assertSame(503, $response->getStatusCode());
+        $this->assertStringContainsString('no-store', $response->headers->get('Cache-Control'));
+        $this->assertSame('https://cdn.oaistatic.com/assets/unique-module.1234abcd.js?v=2', (string) $history[0]['request']->getUri());
+    }
+
     public function test_saturated_workspace_exposes_a_retryable_busy_response(): void
     {
         Mirror::resolveWebContextUsing(fn () => ['meta' => ['pool_status' => 'busy']]);
@@ -35,6 +75,31 @@ class V22SaaSHooksTest extends TestCase
             ->assertHeader('Retry-After', '1')
             ->assertHeader('X-UniGPT-Pool-Status', 'busy')
             ->assertJsonPath('code', 'unigpt_pool_busy');
+    }
+
+    public function test_saturated_workspace_exposes_a_retry_page_for_browser_navigation(): void
+    {
+        Mirror::resolveWebContextUsing(fn () => ['meta' => [
+            'fail_on_missing_token' => true,
+            'pool_status' => 'busy',
+            'pool_busy_wait_seconds' => 12,
+        ]]);
+
+        $controller = app(BrowserProxyController::class);
+        $request = Request::create('http://localhost/c/sample', server: ['HTTP_ACCEPT' => 'text/html']);
+        $page = $controller->proxy($request, 'c/sample');
+
+        $this->assertSame(503, $page->getStatusCode());
+        $this->assertSame('1', $page->headers->get('Retry-After'));
+        $this->assertSame('busy', $page->headers->get('X-UniGPT-Pool-Status'));
+        $this->assertStringContainsString('data-wait="12"', $page->getContent());
+        $this->assertStringContainsString('Try again', $page->getContent());
+
+        $request->headers->set('Accept', 'application/json');
+        $json = $controller->proxy($request, 'c/sample');
+
+        $this->assertSame(503, $json->getStatusCode());
+        $this->assertSame('unigpt_pool_busy', json_decode($json->getContent(), true)['code']);
     }
 
     public function test_stream_releases_its_slot_when_the_start_observer_throws(): void
@@ -388,6 +453,32 @@ class V22SaaSHooksTest extends TestCase
         $location = $res->headers->get('Location');
         $this->assertStringStartsWith('http://localhost/backend-api/estuary/content', $location);
         $this->assertStringNotContainsString('https://chatgpt.com', $location);
+    }
+
+    public function test_browser_proxy_keeps_local_session_credentials_out_of_upstream_requests(): void
+    {
+        config(['session.cookie' => 'test_app_session']);
+        $token = new MirrorToken(['session_token' => 'server-session']);
+        Mirror::resolveWebContextUsing(fn () => ['token' => $token]);
+
+        $mock = new MockHandler([new Psr7Response(200, ['Content-Type' => 'text/html'], '<html></html>')]);
+        $controller = new BrowserProxyController(
+            app(BrowserPatchManager::class),
+            app(UrlRewriter::class),
+            app(TokenPoolManager::class),
+            app(SecurityService::class),
+            app(MirrorCache::class),
+            new Client(['handler' => HandlerStack::create($mock), 'base_uri' => 'https://chatgpt.com']),
+        );
+
+        $request = Request::create('http://localhost/chat', server: [
+            'HTTP_COOKIE' => 'unigpt_proxy_session=local; test_app_session=local; XSRF-TOKEN=local; '
+                . 'remember_web_hash=local; mirror_control=local; __Secure-next-auth.session-token.0=stale; oai-did=fixture',
+            'HTTP_REFERER' => 'http://localhost/_unigpt/sso?token=local',
+        ]);
+        $this->assertSame(200, $controller->proxy($request, 'chat')->getStatusCode());
+        $this->assertSame('__Secure-next-auth.session-token=server-session; oai-did=fixture', $mock->getLastRequest()->getHeaderLine('Cookie'));
+        $this->assertSame('https://chatgpt.com/', $mock->getLastRequest()->getHeaderLine('Referer'));
     }
 
     public function test_browser_proxy_preserves_static_prefixes_for_images_and_assets(): void

@@ -11,7 +11,8 @@ namespace Refatbd\LaravelChatGptMirror\Services;
  */
 class UrlRewriter
 {
-    public const BROWSER_TOKEN = 'mirror-proxied-session';
+    // A non-secret placeholder the browser can decode locally.
+    public const BROWSER_TOKEN = 'eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJleHAiOjQxMDI0NDQ4MDAsInN1YiI6Im1pcnJvci51c2VyIn0.';
 
     public function rewriteText(
         string $body,
@@ -39,15 +40,24 @@ class UrlRewriter
         $replacements = [
             'https://chatgpt.com' => $origin,
             'https://chat.openai.com' => $origin,
-            'https://cdn.oaistatic.com' => $origin . '/cdn',
             'wss://chatgpt.com' => $wsOrigin,
             'wss://ws.chatgpt.com' => $wsOrigin,
             'https:\\/\\/chatgpt.com' => $escapedPlainOrigin,
             'https:\\/\\/chat.openai.com' => $escapedPlainOrigin,
-            'https:\\/\\/cdn.oaistatic.com' => $escapedPlainOrigin . '\\/cdn',
             'wss:\\/\\/chatgpt.com' => $escapedWsOrigin,
             'wss:\\/\\/ws.chatgpt.com' => $escapedWsOrigin,
         ];
+
+        // The application resolves root-relative route imports against the module's own origin.
+        // Keep the executable module graph on the proxy, including URLs from older web shells.
+        $replacements['https://cdn.oaistatic.com/assets/'] = $origin . '/cdn/v2/assets/';
+        $replacements['https://chatgpt.com/cdn/assets/'] = $origin . '/cdn/v2/assets/';
+        $replacements['https:\\/\\/cdn.oaistatic.com\\/assets\\/'] = $escapedPlainOrigin . '\\/cdn\\/v2\\/assets\\/';
+        $replacements['https:\\/\\/chatgpt.com\\/cdn\\/assets\\/'] = $escapedPlainOrigin . '\\/cdn\\/v2\\/assets\\/';
+        foreach (['"', "'"] as $quote) {
+            $replacements[$quote . '/cdn/assets/'] = $quote . '/cdn/v2/assets/';
+            $replacements[$quote . '\\/cdn\\/assets\\/'] = $quote . '\\/cdn\\/v2\\/assets\\/';
+        }
 
         $extraOrigin = $extraUpstreamOrigin !== null ? rtrim(trim($extraUpstreamOrigin), '/') : '';
         if ($extraOrigin !== '' && $extraOrigin !== $localRoot) {
@@ -63,6 +73,13 @@ class UrlRewriter
         }
 
         $rewritten = strtr($body, $replacements);
+        if (!config('mirror.browser.proxy_cdn_assets', false)) {
+            $rewritten = preg_replace(
+                '#(?<![\w/])(?:' . preg_quote($origin, '#') . ')?/cdn/v2/assets/([\w.-]+\.(?:woff2?|ttf|otf|png|jpe?g|gif|svg|ico|webp))(?=[?"\'\s<>)]|$)#i',
+                'https://cdn.oaistatic.com/assets/$1',
+                $rewritten,
+            ) ?? $rewritten;
+        }
 
         // Rewrite any remaining ChatGPT subdomains (e.g. ab.chatgpt.com, ws.chatgpt.com, tcr9i.chat.openai.com) matching defcron-mirror
         $chatGptHostsPattern = '(?:[a-z0-9-]+\.)*(?:chatgpt\.com|chat\.openai\.com)';

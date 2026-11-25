@@ -31,6 +31,11 @@ return [
     */
     'upstream' => env('MIRROR_UPSTREAM', 'https://chatgpt.com'),
 
+    'browser' => [
+        // Browser scripts stay same-origin. Public images and fonts may go directly to the CDN.
+        'proxy_cdn_assets' => env('MIRROR_BROWSER_PROXY_CDN_ASSETS', false),
+    ],
+
     /*
     |--------------------------------------------------------------------------
     | API Security
