@@ -319,7 +319,8 @@ class ConversationService
         $latest = MirrorMessage::where('conversation_public_id', $publicId)
             ->orderByDesc('created_at')
             ->first();
-        $now = now();
+        // The message table stores timestamps at second precision.
+        $now = now()->startOfSecond();
         $userTs = ($latest && $latest->created_at && $latest->created_at->greaterThanOrEqualTo($now))
             ? $latest->created_at->copy()->addSecond()
             : $now;

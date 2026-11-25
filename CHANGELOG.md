@@ -2,6 +2,11 @@
 
 All notable changes to `refatbd/laravel-chatgpt-mirror` will be documented in this file.
 
+## [2.2.6] - 2026-11-25
+
+### Fixed
+- Preserve conversation message order when a follow-up arrives in the same database timestamp second as the previous reply.
+
 ## [2.2.5] - 2026-11-25
 
 ### Added
